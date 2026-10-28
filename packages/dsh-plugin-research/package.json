@@ -1,0 +1,9 @@
+{
+  "name": "autoresearch-dsh-tools",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "cordis.patch.yml"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
