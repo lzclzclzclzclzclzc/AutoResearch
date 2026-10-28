@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "source_id": {
+      "title": "Source Id",
+      "type": "string"
+    },
+    "claim": {
+      "title": "Claim",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "observed",
+        "inference",
+        "unverified",
+        "failed",
+        "negative"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "source_id",
+    "claim",
+    "status"
+  ],
+  "title": "Evidence",
+  "type": "object"
+}

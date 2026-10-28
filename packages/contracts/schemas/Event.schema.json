@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearch durable event envelope v1",
+  "type": "object",
+  "required": ["schema_version", "event_id", "seq", "type", "research_id", "occurred_at", "payload"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 1 },
+    "type": { "type": "string", "pattern": "^[a-z_]+\\.[a-z_.]+$" },
+    "research_id": { "type": "string", "minLength": 1 },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" },
+    "line_id": { "type": ["string", "null"] },
+    "group_id": { "type": ["string", "null"] },
+    "agent_id": { "type": ["string", "null"] },
+    "execution_id": { "type": ["string", "null"] },
+    "conversation_id": { "type": ["string", "null"] },
+    "cycle_id": { "type": ["string", "null"] },
+    "graph_node_id": { "type": ["string", "null"] },
+    "edge_id": { "type": ["string", "null"] },
+    "causation_id": { "type": ["string", "null"] },
+    "correlation_id": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

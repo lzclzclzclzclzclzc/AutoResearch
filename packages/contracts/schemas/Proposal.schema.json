@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "observed",
+            "inference",
+            "unverified",
+            "failed",
+            "negative"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "claim",
+        "status"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "content_markdown": {
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "candidate": {
+      "additionalProperties": true,
+      "title": "Candidate",
+      "type": "object"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      },
+      "title": "Evidence",
+      "type": "array"
+    }
+  },
+  "required": [
+    "content_markdown",
+    "candidate"
+  ],
+  "title": "Proposal",
+  "type": "object"
+}

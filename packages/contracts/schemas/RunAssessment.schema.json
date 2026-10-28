@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "content_markdown": {
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "action": {
+      "enum": [
+        "package",
+        "repair_implementation",
+        "request_spec_revision"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
+    },
+    "proposed_changes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Proposed Changes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "content_markdown",
+    "action",
+    "rationale"
+  ],
+  "title": "RunAssessment",
+  "type": "object"
+}

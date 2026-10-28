@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "content_markdown": {
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "spec_hash": {
+      "title": "Spec Hash",
+      "type": "string"
+    },
+    "files": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Files",
+      "type": "object"
+    },
+    "entrypoint": {
+      "title": "Entrypoint",
+      "type": "string"
+    },
+    "arguments": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Arguments",
+      "type": "array"
+    },
+    "actual_config": {
+      "additionalProperties": true,
+      "title": "Actual Config",
+      "type": "object"
+    },
+    "cpu_cores": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Cpu Cores",
+      "type": "integer"
+    },
+    "memory_mb": {
+      "default": 256,
+      "minimum": 64,
+      "title": "Memory Mb",
+      "type": "integer"
+    },
+    "gpu_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Gpu Count",
+      "type": "integer"
+    },
+    "estimated_seconds": {
+      "default": 60,
+      "minimum": 1,
+      "title": "Estimated Seconds",
+      "type": "integer"
+    },
+    "dependencies": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Dependencies",
+      "type": "array"
+    }
+  },
+  "required": [
+    "content_markdown",
+    "spec_hash",
+    "files",
+    "entrypoint",
+    "actual_config"
+  ],
+  "title": "Implementation",
+  "type": "object"
+}
