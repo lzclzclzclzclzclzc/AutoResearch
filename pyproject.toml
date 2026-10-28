@@ -1,0 +1,31 @@
+[project]
+name = "autoresearch-local"
+version = "0.1.0"
+description = "Local evidence-preserving multi-agent research workbench"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.115.12",
+  "pydantic==2.12.3",
+  "uvicorn==0.34.2",
+  "httpx==0.28.1",
+  "psutil==7.0.0",
+  "langgraph==1.0.2",
+  "langgraph-checkpoint-sqlite==3.0.0",
+  "aiosqlite==0.21.0",
+]
+
+[project.optional-dependencies]
+dsh = ["deepseek-harness-sdk==0.2.1rc2", "deepseek-harness-runtime-bin==0.2.1rc2"]
+test = ["pytest==8.3.5", "pytest-asyncio==0.26.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.setuptools.packages.find]
+include = ["backend*", "apps*", "packages*"]
+exclude = ["apps.web*"]
+
+[tool.setuptools.package-data]
+packages = ["dsh-plugin-research/*.js", "dsh-plugin-research/*.json", "dsh-plugin-research/*.yml", "contracts/schemas/*.json"]
