@@ -67,6 +67,18 @@ async def dispatch_pending_handoffs(store, control, limit=25):
         return {"retry_pending": True}
 
 
+async def recover_running_tasks(store, control):
+    for task in store.list("task"):
+        if task.get("status") == "running":
+            project = store.project(task["research_id"])
+            allowed = await asyncio.to_thread(control.allows_progress, project["id"], project["control_generation"])
+            # Initial supervision reconciles registration before checking the
+            # execution gate; its saved clock alone is not a Control identity.
+            recoverable = allowed or task["kind"] == "supervisor"
+            store.patch("task", task["id"], status="pending" if recoverable else "blocked", owner=None,
+                        error=None if recoverable else {"code": "recovery_quarantined", "message": "控制服务不允许自动恢复"})
+
+
 async def run_worker(data_dir, control_url, runner_url):
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     from backend.graphs.engine import ResearchEngine
@@ -103,12 +115,7 @@ async def run_worker(data_dir, control_url, runner_url):
                     else:
                         confirmed = False
             store.patch("execution", execution["id"], status="interrupted" if confirmed else "unknown")
-    for task in store.list("task"):
-        if task.get("status") == "running":
-            project = store.project(task["research_id"])
-            allowed = await asyncio.to_thread(control.allows_progress, project["id"], project["control_generation"])
-            store.patch("task", task["id"], status="pending" if allowed else "blocked", owner=None,
-                        error=None if allowed else {"code": "recovery_quarantined", "message": "控制服务不允许自动恢复"})
+    await recover_running_tasks(store, control)
 
     async with AsyncSqliteSaver.from_conn_string(str(Path(data_dir).resolve() / "checkpoints.sqlite")) as saver:
         engine = ResearchEngine(store, control, runner, credentials, saver)

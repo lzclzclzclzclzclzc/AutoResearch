@@ -537,7 +537,16 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         p = s.project(research_id)
         s.assert_progress(p)
         if p.get("started_at") and not app.state.control.allows_progress(research_id, p["control_generation"]):
-            raise StoreError("control_denied", "独立控制服务不允许继续推进", 409)
+            supervisor = s.get("task", f"{research_id}:supervisor")
+            if (body.kind in {"retry", "recover"} and supervisor
+                    and supervisor.get("status") in {"pending", "running", "failed", "blocked"}):
+                # Only unfinished initial supervision can repair a missing
+                # registration. Control retains all stop/restart tombstones.
+                control_status = app.state.control.status(research_id)
+                if control_status.get("state") == "unknown" and not control_status.get("stop_id"):
+                    app.state.control.register_project(research_id, p["deadline_at"], p["control_generation"])
+            if not app.state.control.allows_progress(research_id, p["control_generation"]):
+                raise StoreError("control_denied", "独立控制服务不允许继续推进", 409)
         if body.kind == "pause":
             s.update_project(research_id, status="pausing")
         elif body.kind in {"resume", "retry", "recover"}:

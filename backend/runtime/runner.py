@@ -193,26 +193,40 @@ class ResourceService:
             now = time.time()  # authoritative time after acquiring write lock
             project = self._project(c, rid, generation)
             self._frozen_spec(c, payload)
+            self._expire(c, now)
             existing = c.execute("SELECT data FROM runtime_allocations WHERE request_id=?", (request_id,)).fetchone()
             if existing:
                 allocation = json.loads(existing[0])
                 for key in required:
                     if allocation[key] != payload[key]:
                         raise ResourceConflict("Idempotency key was reused with changed allocation content")
-                if allocation["state"] != "queued":
+                for key, value in (("cpu_cores", cores), ("memory_bytes", memory),
+                                   ("gpu_count", gpu_count), ("gpu_memory_bytes", gpu_memory)):
+                    if allocation[key] != value:
+                        raise ResourceConflict("Idempotency key was reused with changed resource quantities")
+                if (allocation["state"] == "expired" and allocation.get("bound_run_id") is None
+                        and not allocation.get("stop_reason") and not allocation.get("terminal_proof")
+                        and allocation.get("grant_expires_at", float("inf")) <= now):
+                    # Renew only a timed-out, never-admitted lease. Rotate both
+                    # fences so an old start payload can never use the new grant.
+                    allocation.update(state="queued", grant_revision=allocation["grant_revision"] + 1,
+                        fencing_token=uuid.uuid4().hex, gpu_uuids=[])
+                    for key in ("granted_at", "grant_expires_at", "released_at"):
+                        allocation.pop(key, None)
+                elif allocation["state"] != "queued":
                     return allocation
             else:
                 allocation = {**payload, "allocation_id": uuid.uuid4().hex, "resource_request_id": request_id,
                     "grant_revision": 1, "fencing_token": uuid.uuid4().hex, "state": "queued",
                     "requested_at": now, "control_generation": generation, "deadline_at": timestamp(project["deadline_at"]),
                     "cpu_cores": cores, "memory_bytes": memory, "gpu_count": gpu_count, "gpu_memory_bytes": gpu_memory,
+                    "requested_gpu_uuids": list(payload.get("gpu_uuids", [])),
                     "bound_run_id": None}
-            self._expire(c, now)
             held = self._held(c)
             used_cpu = sum(a["cpu_cores"] for a in held)
             used_memory = sum(a["memory_bytes"] for a in held)
             used_gpu = {gpu for a in held for gpu in a.get("gpu_uuids", [])}
-            requested_gpus = payload.get("gpu_uuids", [])
+            requested_gpus = allocation.get("requested_gpu_uuids", payload.get("gpu_uuids", []))
             allowed_gpus={g["uuid"] for g in self.capacity.get("gpus",[])}
             free_gpus=[g for g in physical.get("gpus",[]) if g["uuid"] in allowed_gpus and g["uuid"] not in used_gpu
                 and g.get("occupancy_known",False) and not g.get("process_ids")]
@@ -234,9 +248,16 @@ class ResourceService:
             for other in waiting:
                 if other["allocation_id"] == allocation["allocation_id"]:
                     continue
+                try:
+                    self._project(c, other["research_id"], other["control_generation"])
+                except ResourceConflict:
+                    # A paused/blocked/obsolete request keeps its queue position
+                    # for recovery but cannot hold up currently runnable work.
+                    continue
                 other_score = float(other.get("priority", 0)) + (now - other["requested_at"]) / 30
+                other_requested = other.get("requested_gpu_uuids", other.get("gpu_uuids", []))
                 other_devices=[g for g in free_gpus if g["memory_free_bytes"]>=other.get("gpu_memory_bytes",0)
-                    and (not other.get("gpu_uuids") or g["uuid"] in other["gpu_uuids"])]
+                    and (not other_requested or g["uuid"] in other_requested)]
                 if (other_score > score and used_cpu + other["cpu_cores"] <= self.capacity["cpu_cores"]
                     and used_memory + other["memory_bytes"] <= self.capacity["memory_total_bytes"]
                     and len(other_devices)>=other.get("gpu_count",0)):

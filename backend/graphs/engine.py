@@ -226,16 +226,19 @@ class ResearchEngine:
     async def supervisor(self, task):
         research_id = task["research_id"]
         p = self.store.project(research_id)
+        try:
+            control_status = await asyncio.to_thread(self.control.status, research_id)
+        except Exception as error:
+            raise RuntimeBlocked("control_unavailable", "独立控制服务不可用，拒绝开始研究") from error
+        if control_status.get("stop_id"):
+            await asyncio.to_thread(self.store.sync_stop, research_id, control_status)
+            raise ResearchStopped("研究在调度前已经终止")
+        self.store.assert_progress(p)
         if not p["started_at"]:
-            try:
-                control_status = await asyncio.to_thread(self.control.status, research_id)
-            except Exception as error:
-                raise RuntimeBlocked("control_unavailable", "独立控制服务不可用，拒绝开始研究") from error
-            if control_status.get("stop_id"):
-                await asyncio.to_thread(self.store.sync_stop, research_id, control_status)
-                raise ResearchStopped("研究在首次调度前已经终止")
             p = self.store.start_project(research_id)
-            await asyncio.to_thread(self.control.register_project, research_id, p["deadline_at"], p["control_generation"])
+        # The business clock may have committed before registration reached
+        # Control. Reconcile idempotently with the original frozen deadline.
+        await asyncio.to_thread(self.control.register_project, research_id, p["deadline_at"], p["control_generation"])
         await self.guard(research_id)
         if p["mode"] == "live" and not self.live.availability()["available"]:
             raise RuntimeBlocked("dsh_sdk_missing", self.live.availability()["message"])
@@ -387,12 +390,20 @@ class ResearchEngine:
             advice = await self.organizer_graph.run({"research_id": state["research_id"], "id": request["resource_request_id"],
                 "payload": request})
         request["priority"] = advice["priority"]
+        allocation = await self.wait_for_allocation(state, request)
+        return {"allocation_id": allocation["allocation_id"]}
+
+    async def wait_for_allocation(self, state, request):
         while True:
             await self.line_open(state)
             allocation = await asyncio.to_thread(self.runner.request_allocation, request)
             if allocation["state"] == "granted":
                 self.store.emit(state["research_id"], "allocation.granted", allocation, line_id=state["line_id"])
-                return {"allocation_id": allocation["allocation_id"]}
+                return allocation
+            if allocation.get("bound_run_id"):
+                return allocation  # Replay the original start, never renew an admitted run.
+            if allocation["state"] != "queued":
+                raise RuntimeBlocked("allocation_unavailable", "资源申请已关闭，不能重新启动实验")
             self.store.update_line(state["research_id"], state["line_id"], phase="waiting_resources")
             await asyncio.sleep(1)
 
@@ -454,8 +465,12 @@ class ResearchEngine:
 
     async def run_experiment(self, state):
         await self.line_open(state)
-        self.store.update_line(state["research_id"], state["line_id"], phase="running")
         allocation = self.store.get("allocation", state["allocation_id"])
+        if not allocation.get("bound_run_id"):
+            # A checkpoint may outlive the unbound grant's short lease. Recheck
+            # capacity and obtain its current fence before attempting a start.
+            allocation = await self.wait_for_allocation(state, allocation)
+        self.store.update_line(state["research_id"], state["line_id"], phase="running")
         impl = self.store.get("implementation", state["implementation_id"])
         run_id = state["implementation_id"] + ":run-1"
         payload = {**allocation, "experiment_run_id": run_id, "start_operation_id": run_id + ":start", "command": [sys.executable, "-u", impl["entrypoint"], *impl["arguments"]],
