@@ -384,8 +384,7 @@ class ResourceService:
                     raise ResourceConflict("Lightweight execution ID was reused with changed content")
                 return previous
             held = self._held(c)
-            if sum(v["cpu_cores"] for v in held) + job["cpu_cores"] > self.capacity["cpu_cores"]:
-                raise ResourceConflict("轻量 CPU 资源当前繁忙")
+            # Lightweight work shares CPU time; idle cores are not an admission requirement.
             if sum(v["memory_bytes"] for v in held) + job["memory_bytes"] > self.capacity["memory_total_bytes"]:
                 raise ResourceConflict("轻量计算内存当前繁忙")
             c.execute("INSERT INTO runtime_light_jobs VALUES(?,?,?,?)", (job["execution_id"],job["research_id"],job["state"],json.dumps(job)))

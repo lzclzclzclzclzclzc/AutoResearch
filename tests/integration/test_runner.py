@@ -352,3 +352,72 @@ def test_owner_death_stops_light_cpu_by_process_creation_identity(setup_runtime)
         with pytest.raises(Exception):runner.light_cpu.execute({**payload,"execution_id":"late-after-owner-death"})
     finally:
         if owner.poll() is None:owner.kill();owner.wait(timeout=3)
+
+
+def test_light_cpu_runs_normal_python_without_idle_core(setup_runtime):
+    _, _, runner, request = setup_runtime
+    runner.service.capacity['cpu_cores'] = 0
+    result = runner.light_cpu.execute({
+        'research_id': request['research_id'],
+        'agent_id': 'line-01/exploration/member-01', 'role': 'exploration',
+        'code': """import os
+import sys
+import subprocess
+import numpy as np
+import pandas as pd
+class Analysis:
+    def run(self):
+        with open('scratch.txt', 'w') as stream:
+            stream.write('local')
+        child = subprocess.check_output([sys.executable, '-c', 'print(7)'], text=True)
+        frame = pd.DataFrame({'value': np.arange(3)})
+        return {'array': np.arange(3), 'scalar': np.int64(3),
+                'frame': frame, 'mean': frame['value'].mean(),
+                'child': int(child), 'cwd': os.getcwd()}
+result = Analysis().run()
+""", 'control_generation': 1})
+    assert result['state'] == 'completed', result
+    assert result['result']['array'] == [0, 1, 2]
+    assert result['result']['scalar'] == 3
+    assert result['result']['frame'] == [{'value': 0}, {'value': 1}, {'value': 2}]
+    assert result['result']['mean'] == 1.0
+    assert result['result']['child'] == 7
+    assert result['process_tree_exited']
+
+
+def test_light_cpu_reads_supplied_data_and_writes_workspace(setup_runtime, tmp_path):
+    store, _, runner, request = setup_runtime
+    inputs = tmp_path / 'user-data'
+    inputs.mkdir()
+    source = inputs / 'values.csv'
+    original = 'value\n2\n4\n'
+    source.write_text(original, encoding='utf-8')
+    store.update_project(request['research_id'], workspace_path=str(inputs))
+    result = runner.light_cpu.execute({
+        'research_id': request['research_id'],
+        'agent_id': 'line-01/exploration/member-01', 'role': 'exploration',
+        'control_generation': 1,
+        'code': """from pathlib import Path
+from dataclasses import dataclass
+import csv, importlib
+assert __name__ == '__main__'
+assert Path(__file__).parent == Path(workspace_dir)
+rows = list(csv.DictReader(open(Path(data_dir) / 'values.csv')))
+@dataclass
+class Analysis:
+    total: int
+value = Analysis(sum(int(row['value']) for row in rows))
+Path('helper.py').write_text('def transform(value): return value * 2')
+helper = importlib.import_module('helper')
+Path(workspace_dir, 'output.txt').write_text(str(helper.transform(value.total)))
+result = {'sum': value.total, 'doubled': int(Path('output.txt').read_text()),
+          'data_dir': data_dir, 'workspace_dir': workspace_dir}
+"""})
+    assert result['state'] == 'completed', result
+    assert result['result']['sum'] == 6
+    assert result['result']['doubled'] == 12
+    assert result['result']['data_dir'] == str(inputs.resolve())
+    assert result['result']['workspace_dir'] == result['workspace_dir']
+    assert source.read_text(encoding='utf-8') == original
+    assert not (inputs / 'output.txt').exists()
+    assert result['process_tree_exited']

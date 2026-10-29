@@ -1,15 +1,14 @@
 """Registered numeric CPU analysis over immutable evidence.
 
-This is a deliberately restricted Python language, not a general Python shell.
-The Windows Job/resource ledger supplies containment; AST validation narrows tool
-capabilities. It is not presented as a hostile-code security boundary.
+Ordinary Python runs in a supervised child with resource and stop controls.
+Workspace/data access rules are separate from code capabilities. This process
+supervision is not a filesystem security boundary.
 """
 from __future__ import annotations
 
 import ast
 import csv
 import hashlib
-import importlib
 import json
 import os
 import shutil
@@ -26,57 +25,19 @@ from .processes import ManagedProcess,identity_alive,terminate_identity,sanitize
 from .scientific_json import loads as scientific_loads,numeric_status
 
 ROLES={"exploration","critic","implementation","verify"}
-MODULES={
- "math": {"sqrt","log","log2","log10","exp","pow","sin","cos","tan","floor","ceil","fabs","fsum","isfinite","isnan","isclose","factorial","comb","prod","dist","hypot","pi","e","inf","nan"},
- "statistics": {"mean","fmean","geometric_mean","harmonic_mean","median","median_low","median_high","mode","multimode","pstdev","pvariance","stdev","variance","quantiles","correlation","covariance","linear_regression"},
- "json": {"loads","dumps"},
- "csv": {"reader","DictReader"},
- "collections": {"Counter","defaultdict","deque"},
- "itertools": {"chain","combinations","combinations_with_replacement","permutations","product","groupby","accumulate","islice","zip_longest","repeat","count","takewhile","dropwhile","filterfalse"},
- "random": {"Random","seed","random","uniform","randint","randrange","choice","choices","sample","shuffle","gauss","normalvariate"},
-}
-BUILTINS={"abs","all","any","bool","dict","enumerate","filter","float","int","len","list","map","max","min","pow","print","range","reversed","round","set","sorted","str","sum","tuple","zip","Exception","ValueError","TypeError","ZeroDivisionError"}
-FORBIDDEN=(ast.ClassDef,ast.AsyncFunctionDef,ast.Await,ast.With,ast.AsyncWith,ast.Global,ast.Nonlocal,ast.Delete)
+# Include the import footprint of NumPy/pandas in the supervised process tree.
+LIGHT_CPU_MEMORY_BYTES = 512 * 1024 * 1024
 
 
-def validate_numeric_code(code: str) -> tuple[ast.Module,dict[str,str],dict[str,tuple[str,str]]]:
-    tree=ast.parse(code,"<light-cpu>","exec")
-    aliases:dict[str,str]={}
-    members:dict[str,tuple[str,str]]={}
-    for node in ast.walk(tree):
-        if isinstance(node,FORBIDDEN):
-            raise ValueError("轻量 CPU 工具只允许数值分析，禁止该 Python 语法")
-        if isinstance(node,ast.Name) and node.id.startswith("_"):
-            raise ValueError("禁止访问内部名称")
-        if isinstance(node,ast.Import):
-            for imported in node.names:
-                if imported.name not in MODULES or (imported.asname or imported.name).startswith("_"):
-                    raise ValueError("轻量 CPU 禁止导入文件、进程、网络、GPU 或训练库")
-                aliases[imported.asname or imported.name]=imported.name
-        if isinstance(node,ast.ImportFrom):
-            if node.level or node.module not in MODULES:
-                raise ValueError("禁止该模块")
-            for imported in node.names:
-                if imported.name not in MODULES[node.module] or (imported.asname or imported.name).startswith("_"):
-                    raise ValueError("禁止该模块成员")
-                members[imported.asname or imported.name]=(node.module,imported.name)
-    functions={node.name for node in ast.walk(tree) if isinstance(node,ast.FunctionDef)}
-    for node in ast.walk(tree):
-        if isinstance(node,ast.Attribute):
-            if not isinstance(node.ctx,ast.Load) or not isinstance(node.value,ast.Name) or node.value.id not in aliases or node.attr not in MODULES[aliases[node.value.id]]:
-                raise ValueError("只允许白名单数值模块成员；禁止对象属性遍历")
-        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name):
-            if node.func.id not in BUILTINS|members.keys()|functions:
-                raise ValueError("禁止调用未经授权的函数")
-        if isinstance(node,ast.Call) and not isinstance(node.func,(ast.Name,ast.Attribute)):
-            raise ValueError("禁止动态函数调用")
-    # Imports are provided by trusted setup, without granting user code __import__.
-    class RemoveImports(ast.NodeTransformer):
-        def visit_Import(self,node):return ast.Pass()
-        def visit_ImportFrom(self,node):return ast.Pass()
-    tree=RemoveImports().visit(tree)
-    ast.fix_missing_locations(tree)
-    return tree,aliases,members
+def validate_numeric_code(code: str) -> tuple[ast.Module, dict, dict]:
+    """Validate Python syntax without rewriting code or restricting capabilities.
+
+    The return shape is retained for existing callers; imports execute normally.
+    Workspace rules are specified separately from Python language capabilities.
+    """
+    tree = ast.parse(code, "<light-cpu>", "exec")
+    compile(tree, "<light-cpu>", "exec")
+    return tree, {}, {}
 
 
 class LightCpuService:
@@ -124,8 +85,7 @@ class LightCpuService:
         if role=="verify" and not ids:
             raise ValueError("Verify 只能分析已有证据，至少提供一个 evidence_id")
         code=str(payload.get("code",""))
-        tree,aliases,members=validate_numeric_code(code)
-        normalized=ast.unparse(tree)
+        validate_numeric_code(code)
         generation=int(payload.get("control_generation",1))
         parent=payload.get("parent_execution_id")
         if (payload.get("parent_pid") is not None or payload.get("parent_create_time") is not None) and not parent:
@@ -146,7 +106,7 @@ class LightCpuService:
                 if old["content_hash"]!=content_hash:raise ValueError("执行 ID 不能用于不同内容")
                 return old
             job={"execution_id":execution_id,"research_id":rid,"agent_id":agent,"role":role,"content_hash":content_hash,
-                "state":"starting","light_cpu":True,"cpu_cores":1,"memory_bytes":268435456,"gpu_uuids":[],
+                "state":"starting","light_cpu":True,"cpu_cores":1,"memory_bytes":LIGHT_CPU_MEMORY_BYTES,"gpu_uuids":[],
                 "control_generation":generation,"control_epoch":control_state["control_epoch"],"deadline_at":timestamp(project["deadline_at"]),
                 "parent_execution_id":parent,
                 "parent_pid":payload.get("parent_pid"),"parent_create_time":payload.get("parent_create_time"),
@@ -176,22 +136,41 @@ class LightCpuService:
                 text=copied.read_text(encoding="utf-8")
                 content=scientific_loads(text) if path.suffix.lower()==".json" else list(csv.DictReader(text.splitlines(),delimiter="\t" if path.suffix.lower()==".tsv" else ",")) if path.suffix.lower() in (".csv",".tsv") else text
                 evidence[eid]={"name":metadata["name"],"sha256":actual,"data":content}
-            context={"code":normalized,"aliases":aliases,"members":members,"evidence":evidence,"builtins":sorted(BUILTINS)}
+            data_dir = str(Path(project["workspace_path"]).expanduser().resolve()) if project.get("workspace_path") else None
+            context={"evidence":evidence,"workspace_dir":str(directory),"data_dir":data_dir}
+            job.update(workspace_dir=str(directory),data_dir=data_dir)
             (directory/"inputs.json").write_text(json.dumps(context,ensure_ascii=False),encoding="utf-8")
-            wrapper="""import json,builtins,importlib,sys
+            (directory/"analysis.py").write_text(code,encoding="utf-8")
+            wrapper="""import json,runpy,sys
 from pathlib import Path
 context=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-scope={'__builtins__':{name:getattr(builtins,name) for name in context['builtins']},'evidence':context['evidence'],'result':None}
-for alias,module in context['aliases'].items():scope[alias]=importlib.import_module(module)
-for alias,pair in context['members'].items():scope[alias]=getattr(importlib.import_module(pair[0]),pair[1])
-exec(compile(context['code'],'<light-cpu>','exec'),scope,scope)
-Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_ascii=False),encoding='utf-8')
+scope=runpy.run_path(str(Path(__file__).with_name('analysis.py')), init_globals={
+    'evidence':context['evidence'], 'workspace_dir':context['workspace_dir'],
+    'data_dir':context['data_dir'], 'result':None}, run_name='__main__')
+def scientific_default(value):
+    root = type(value).__module__.split('.')[0]
+    if root == 'numpy':
+        return value.tolist() if hasattr(value, 'tolist') else value.item()
+    if root == 'pandas':
+        if type(value).__name__ == 'DataFrame':
+            return value.to_dict(orient='records')
+        if hasattr(value, 'tolist'):
+            return value.tolist()
+        if type(value).__name__ in ('NAType', 'NaTType'):
+            return None
+        if hasattr(value, 'isoformat'):
+            return value.isoformat()
+    raise TypeError('Unsupported result type: ' + type(value).__name__)
+Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_ascii=False,default=scientific_default),encoding='utf-8')
 """
             script=directory/"run_numeric.py"
             script.write_text(wrapper,encoding="utf-8")
             job.update(log_path=str(directory/"stdout.log"),result_path=str(directory/"result.json"),evidence_ids=ids)
             self.control.register_process(rid,execution_id,kind="light_cpu",control_epoch=job["control_epoch"],control_generation=generation,supervisor_id=self.instance_id)
-            process=ManagedProcess([sys.executable,"-I",str(script),str(directory/"inputs.json"),job["result_path"]],directory,job["log_path"],sanitized_environment(),1,job["memory_bytes"],defer_creation=True)
+            # Keep BLAS from allocating a machine-wide worker pool for a 1-core job.
+            environment = sanitized_environment({"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
+            environment["TMP"] = environment["TEMP"] = str(directory)
+            process=ManagedProcess([sys.executable,str(script),str(directory/"inputs.json"),job["result_path"]],directory,job["log_path"],environment,1,job["memory_bytes"],defer_creation=True)
             if not self._parent_alive(job):raise ControlUnavailable("父 Agent 执行已退出，禁止创建计算")
             if not self.control.allows_progress(rid,generation,job["control_epoch"]):raise ControlUnavailable("控制门禁已关闭")
             with self.creation_lock:

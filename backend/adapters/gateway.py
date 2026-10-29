@@ -11,6 +11,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from packages.contracts.research import digest
 from backend.adapters.inputs import InputAccessError, ResearchInputs
 from backend.persistence.resilience import is_storage_busy
+from backend.runtime.light_cpu import validate_numeric_code
+
+
+class ResearchToolArgumentError(ValueError):
+    """Only deliberately public validation errors may be returned to a model."""
 
 
 def visible_markdown(raw: str) -> str:
@@ -89,7 +94,7 @@ class ToolGateway:
                     unavailable = isinstance(error, ControlUnavailable) and error.code == "control_unavailable"
                     status = 503 if busy or unavailable else 403 if isinstance(error, PermissionError) else 422
                     body = json.dumps({"code": "storage_busy" if busy else "local_service_unavailable" if unavailable else "research_input_unavailable" if isinstance(error, InputAccessError) else "tool_rejected",
-                        "message": "研究记录暂时忙，使用同一请求重试" if busy else "本机控制服务暂时不可用，稍后重试" if unavailable else error.public_message if isinstance(error, InputAccessError) else "科研工具请求未获授权或参数无效",
+                        "message": "研究记录暂时忙，使用同一请求重试" if busy else "本机控制服务暂时不可用，稍后重试" if unavailable else error.public_message if isinstance(error, InputAccessError) else str(error) if isinstance(error, ResearchToolArgumentError) else "科研工具请求未获授权或参数无效",
                         "retryable": busy or unavailable}, ensure_ascii=False).encode()
                 try:
                     self.send_response(status)
@@ -206,6 +211,11 @@ class ToolGateway:
         if name == "run_light_cpu":
             if role not in {"exploration", "critic", "implementation", "verify"}:
                 raise PermissionError("Role cannot run computations")
+            try:
+                validate_numeric_code(args["code"])
+            except (SyntaxError, ValueError) as error:
+                raise ResearchToolArgumentError("轻量计算 Python 语法错误：" + str(error)[:400]
+                    + "。支持普通 Python，不限制导入、函数、属性或调用；文件操作须遵守工作区可写、用户数据目录只读的约束。请修正语法后重试。") from error
             return self.runner.run_light_cpu({"research_id": research_id, "agent_id": agent_id, "role": role,
                 "line_id": context.get("line_id"), "code": args["code"], "evidence_ids": args.get("evidence_ids", []),
                 "control_generation": context["control_generation"], "parent_execution_id": context["execution_id"],

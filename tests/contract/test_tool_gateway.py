@@ -55,6 +55,22 @@ def test_role_and_stop_gates_cannot_be_bypassed(gateway):
         gateway.call(token, {"name": "read_shared_memory", "arguments": {}})
 
 
+def test_light_cpu_http_rejection_explains_code_rule_instead_of_claiming_no_permission(gateway):
+    import httpx
+    server = ToolGateway(gateway.store, gateway.control, None)
+    server.project = gateway.project
+    token = capability(server, role="exploration")
+    try:
+        response = httpx.post(server.url, headers={"Authorization": "Bearer " + token}, json={
+            "name": "run_light_cpu", "arguments": {"code": "result ="}})
+        assert response.status_code == 422
+        assert "轻量计算 Python 语法错误" in response.json()["message"]
+        assert "支持普通 Python" in response.json()["message"]
+        assert not response.json()["retryable"]
+    finally:
+        server.close()
+
+
 def test_control_transport_loss_is_retryable_http_but_stop_is_not(gateway, monkeypatch):
     import httpx
     from backend.runtime.control import ControlUnavailable

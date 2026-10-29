@@ -2,27 +2,23 @@ import pytest
 from backend.runtime.light_cpu import validate_numeric_code
 
 
-@pytest.mark.parametrize("code",[
-    "import os; os.system('echo forbidden')",
-    "import socket",
-    "import torch",
-    "result = open('secret.txt').read()",
-    "result = (1).__class__.__mro__",
-    "result = getattr(math, 'sin')",
-    "exec('print(1)')",
-    "import math; math.sin = print",
-    "import json; result=json.__dict__",
+@pytest.mark.parametrize("code", [
+    "import os; os.system('echo allowed')", "import socket", "import torch",
+    "result = open('data.txt').read()", "result = (1).__class__.__mro__",
+    "import math; result = getattr(math, 'sin')(0)", "exec('result=1')",
+    "import math; math.sin = print", "import json; result=json.__dict__",
+    "import numpy as np; import pandas as pd; result=pd.DataFrame(np.eye(2))",
+    "class Sample:\n    def value(self):\n        import os\n        return os.getcwd()\nresult=Sample().value()",
 ])
-def test_numeric_subset_rejects_general_python_capabilities(code):
-    with pytest.raises(ValueError):
+def test_python_capabilities_are_not_restricted(code):
+    tree, _, _ = validate_numeric_code(code)
+    compile(tree, '<test>', 'exec')
+
+
+@pytest.mark.parametrize("code", ["result =", "return 1", "break"])
+def test_invalid_python_is_rejected(code):
+    with pytest.raises(SyntaxError):
         validate_numeric_code(code)
-
-
-def test_numeric_subset_accepts_evidence_aggregation():
-    tree,aliases,members=validate_numeric_code("import statistics as stats\nfrom math import sqrt\nresult={'mean':stats.mean([1,2,3]),'root':sqrt(4)}")
-    assert aliases=={"stats":"statistics"}
-    assert members=={"sqrt":("math","sqrt")}
-    assert tree
 
 
 def test_scientific_json_preserves_nonfinite_lexemes_as_explicit_markers():
@@ -36,3 +32,14 @@ def test_scientific_json_preserves_nonfinite_lexemes_as_explicit_markers():
     assert value["normal"]==1.25
     assert numeric_status(value)=="non_finite"
     json.dumps(value,allow_nan=False)
+
+
+def test_workspace_rule_covers_all_compute_roles_without_code_whitelist():
+    from packages.prompts.roles import role_prompt
+    from packages.contracts.research import Role
+    for role in (Role.EXPLORATION, Role.CRITIC, Role.IMPLEMENTATION, Role.VERIFY):
+        prompt = role_prompt(role)
+        assert '工作区约束适用于所有角色' in prompt
+        assert '用户提供的只读数据目录' in prompt
+        assert 'workspace_dir' in prompt and 'data_dir' in prompt
+        assert '不设导入、函数、属性、语法或调用白名单' in prompt
