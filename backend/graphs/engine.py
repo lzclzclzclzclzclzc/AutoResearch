@@ -18,6 +18,7 @@ from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
+from backend.persistence.store import StoreError
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
     Role, RunAssessment, StageReport, Verification, assert_spec_unchanged, digest, validate_issue_transition)
 from packages.prompts.roles import VERSION, role_prompt
@@ -571,6 +572,31 @@ class ResearchEngine:
         return await self.boss({**task, "kind": "boss", "payload": {"initial": True}})
 
     async def boss(self, task):
+        # Each conflict gets a new durable deliberation identity. Old decisions,
+        # memory baselines and unapplied effects remain historical facts.
+        while True:
+            revision = self.store.get("boss_reconsideration", task["id"])
+            if revision:
+                task = revision["replacement_task"]
+                continue
+            try:
+                return await self._boss(task)
+            except (RuntimeBlocked, StoreError) as error:
+                if error.code != "memory_version_conflict":
+                    raise
+                project = await self.guard(task["research_id"])
+                with self.store.connect(True) as c:
+                    revision = self.store._get(c, "boss_reconsideration", task["id"])
+                    if not revision:
+                        replacement = {**task, "id": task["id"] + f":memory-review:{project['memory_version']}",
+                            "payload": {**task["payload"], "memory_conflict_of": task["id"],
+                                "memory_conflict": str(error)}}
+                        self.store._put(c, "boss_reconsideration", task["id"],
+                            {"replacement_task": replacement}, task["research_id"])
+                        self.store._emit(c, task["research_id"], "boss.reconsideration_requested",
+                            {"task_id": task["id"], "replacement_id": replacement["id"], "reason": error.code})
+
+    async def _boss(self, task):
         research_id, payload = task["research_id"], task["payload"]
         async with self.boss_locks.setdefault((research_id, task["id"]), asyncio.Lock()):
             p = await self.guard(research_id)

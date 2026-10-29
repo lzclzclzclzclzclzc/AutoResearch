@@ -10,7 +10,7 @@ from backend.runtime.control import ControlSupervisor
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("same_node", [False, True])
-async def test_concurrent_boss_memory_merges_disjoint_updates_and_rejects_overwrites(tmp_path, same_node):
+async def test_concurrent_boss_memory_merges_disjoint_updates_and_redeliberates_conflicts(tmp_path, same_node):
     store = Store(tmp_path)
     project = store.start_project(store.create_project({"topic": "concurrent Boss", "mode": "demo",
         "client_request_id": "boss-memory", "team": {"boss_members": 1}})["id"])
@@ -47,19 +47,23 @@ async def test_concurrent_boss_memory_merges_disjoint_updates_and_rejects_overwr
                     for line in ("line-01", "line-02")]
                 async with asyncio.timeout(10):
                     results = await asyncio.gather(*(engine.boss(task) for task in tasks), return_exceptions=True)
-                assert arrived == [[], []]
+                assert arrived[:2] == [[], []]
                 failures = [result for result in results if isinstance(result, BaseException)]
+                assert not failures, failures
                 if same_node:
-                    assert len(failures) == 1
-                    assert failures[0].code == "memory_version_conflict"
-                    winner = results.index(next(result for result in results if isinstance(result, dict)))
                     node = store.list("memory_node", project["id"])[0]
-                    assert node["boss_decision_id"] == tasks[winner]["id"]
-                    assert store.project(project["id"])["memory_version"] == 1
-                    loser = tasks[1 - winner]
-                    with pytest.raises(Exception) as blocked:
-                        await engine.boss(loser)
-                    assert blocked.value.code == "memory_version_conflict"
+                    assert ":memory-review:" in node["boss_decision_id"]
+                    assert len(arrived) == 3 and arrived[-1]
+                    assert store.project(project["id"])["memory_version"] == 2
+                    revision = store.list("boss_reconsideration", project["id"])[0]
+                    # Replay across an engine restart follows the same durable
+                    # replacement, rather than repeating either memory write.
+                    loser = next(t for t in tasks if t["id"] == revision["id"])
+                    restarted = ResearchEngine(store, control, None, None, saver)
+                    try:
+                        await restarted.boss(loser)
+                    finally:
+                        await restarted.close()
                     assert store.list("memory_node", project["id"]) == [node]
                 else:
                     assert not failures, failures
