@@ -1,0 +1,66 @@
+import pytest
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from backend.adapters.dsh import RuntimeBlocked
+from backend.graphs.engine import ResearchEngine
+from backend.persistence.store import Store
+from backend.runtime.control import ControlSupervisor
+from packages.contracts.research import Vote
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["boss", "exploration", "critic"])
+@pytest.mark.parametrize("failure", ["unknown", "member_without_candidate", "other_group", "repeated"])
+async def test_invalid_vote_is_repaired_before_recording_or_counting(tmp_path, role, failure):
+    store = Store(tmp_path)
+    project = store.start_project(store.create_project({"client_request_id": "votes", "topic": "votes", "mode": "demo",
+        "team": {"boss_members": 2, "m1": 2, "m2": 2}, "max_runtime_seconds": 120})["id"])
+    control = ControlSupervisor(tmp_path / "control")
+    control.register_project(project["id"], project["deadline_at"])
+    try:
+        async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
+            engine = ResearchEngine(store, control, None, None, saver)
+            try:
+                line_id = None if role == "boss" else "line-01"
+                member, peer = engine.members(project, role, line_id)
+                invalid = peer if failure == "member_without_candidate" else "line-02/exploration/member-01" if failure == "other_group" else "nonexistent-candidate"
+                valid = {"content_markdown": "corrected vote", "candidate_id": member, "rationale": "current proposal"}
+                bad = {**valid, "content_markdown": "invalid vote", "candidate_id": invalid}
+                # These are deliberately schema-valid, so only contextual checks can catch the error.
+                Vote.model_validate(bad)
+                calls = []
+                async def produce(**kwargs):
+                    calls.append(kwargs)
+                    return dict(bad if len(calls) == 1 or failure == "repeated" else valid)
+                engine.demo._produce_turn = produce
+                state = {"research_id": project["id"], "discussion_id": "vote-discussion", "role": role,
+                    "line_id": line_id, "members": [member, peer], "member": member, "phase": "vote", "round": 3,
+                    "context": {}, "history_snapshot": [], "candidates": {member: {"method": "current"}},
+                    "records": {f"vote:3:{peer}": valid}}
+                if failure == "repeated":
+                    with pytest.raises(RuntimeBlocked) as error:
+                        await engine.discussions.member_turn(state)
+                    assert error.value.code == "invalid_output"
+                    assert "current candidate" in str(error.value.__cause__)
+                    assert not store.messages(state["discussion_id"])["items"]
+                    assert f"vote:3:{member}" not in state["records"]
+                else:
+                    update = await engine.discussions.member_turn(state)
+                    assert update["records"] == {f"vote:3:{member}": valid}
+                    complete = {**state, **update, "records": {**state["records"], **update["records"]}}
+                    assert await engine.discussions.collect(complete) == {"winner": member}
+                    messages = store.messages(state["discussion_id"])["items"]
+                    assert len(messages) == 1 and messages[0]["structured"] == valid
+                    # Replaying adapter-cached outputs still goes through the contextual validator.
+                    assert (await engine.discussions.member_turn(state))["records"] == update["records"]
+                    assert len(store.messages(state["discussion_id"])["items"]) == 1
+                assert len(calls) == 2
+                assert [call["turn_id"] for call in calls] == ["vote:3", "vote:3:repair"]
+                assert all(call["agent_id"] == member and call["schema"] is Vote for call in calls)
+                assert "allowed IDs: " + member in calls[1]["prompt"]
+                assert "上次输出校验失败" in calls[1]["prompt"]
+                assert not any(event["type"] in {"vote.recorded", "group.decision_created"} for event in store.events(project["id"]))
+            finally:
+                await engine.close()
+    finally:
+        control.close()

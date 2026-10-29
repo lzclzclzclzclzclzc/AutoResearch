@@ -237,6 +237,15 @@ def assert_spec_unchanged(spec: ExperimentSpec, implementation: Implementation) 
         raise ValueError("spec_revision_required: actual scientific configuration differs from frozen fixed fields")
 
 
+def validate_vote(vote: dict, voter_id: str, members: list[str], candidates: set[str]) -> None:
+    if voter_id not in members:
+        raise ValueError("An unregistered member voted")
+    eligible = candidates.intersection(members)
+    if vote["candidate_id"] not in eligible:
+        raise ValueError("Vote candidate_id must name a current candidate in this group; allowed IDs: "
+                         + ", ".join(sorted(eligible)))
+
+
 def majority(votes: dict[str, str], members: list[str], candidates: set[str]) -> str | None:
     """Absent members never reduce the required majority."""
     if set(votes) - set(members):

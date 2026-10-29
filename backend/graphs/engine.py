@@ -86,9 +86,25 @@ class ResearchEngine:
         async with self.agent_turn_locks.setdefault((research_id, agent_id), asyncio.Lock()):
             return await self._turn(research_id, agent_id, *args, **kwargs)
 
+    def validate_output(self, research_id, agent_id, schema, result, context, output_validator=None):
+        """Accept structured output only after schema and contextual business checks."""
+        result = schema.model_validate(result).model_dump()
+        previous = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"}
+                    for i in context.get("issues", []) if i.get("raised_by") == agent_id}
+        seen = set()
+        for issue in result.get("issues", []):
+            if issue["issue_id"] in seen:
+                raise ValueError("Each issue_id may occur only once in a response")
+            seen.add(issue["issue_id"])
+            validate_issue_transition(previous.get(issue["issue_id"]), issue,
+                lambda source: self.store.source_exists(research_id, source))
+        if output_validator is not None:
+            output_validator(result)
+        return result
+
     async def _turn(self, research_id, agent_id, role, task_id, turn_id, schema, context,
                    conversation_id=None, line_id=None, message_kind="discussion", recipients=None, edge_id=None,
-                   publish_message=True, reply_to=None):
+                   publish_message=True, reply_to=None, output_validator=None):
         project = await self.guard(research_id)
         context = dict(context)
         if line_id and "direction_epoch" not in context:
@@ -122,14 +138,7 @@ class ResearchEngine:
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
                         "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message,
                         "max_output_tokens": token_limit})
-                previous = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"} for i in context.get("issues", []) if i.get("raised_by") == agent_id}
-                seen = set()
-                for issue in result.get("issues", []):
-                    if issue["issue_id"] in seen:
-                        raise ValueError("Each issue_id may occur only once in a response")
-                    seen.add(issue["issue_id"])
-                    validate_issue_transition(previous.get(issue["issue_id"]), issue,
-                        lambda source: self.store.source_exists(research_id, source))
+                result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
                 break
             except (ConnectionError, TimeoutError) as error:
                 await self.guard(research_id)
@@ -160,7 +169,7 @@ class ResearchEngine:
             except (ValueError, json.JSONDecodeError) as error:
                 signature = str(error)[:500]
                 if signature == last_error:
-                    raise RuntimeBlocked("invalid_output", "相同格式错误未取得进展，任务已阻塞") from error
+                    raise RuntimeBlocked("invalid_output", "相同输出校验错误未取得进展，任务已阻塞") from error
                 last_error = signature
                 prompt += "\n上次输出校验失败，请更正并完整返回 JSON：" + signature
                 turn_id = turn_id + ":repair"

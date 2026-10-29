@@ -8,7 +8,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from backend.adapters.dsh import RuntimeBlocked
-from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, Willingness, digest, majority, validate_issue_transition
+from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, Willingness, digest, majority, validate_issue_transition, validate_vote
 
 
 def merge_records(left, right):
@@ -151,6 +151,11 @@ class GroupDiscussionGraph:
         if state["role"] == "boss":
             schema = BossProposal if phase == "proposal" else BossReview if phase == "review" else Vote
         candidates = state.get("candidates", {})
+        # Bind validation to this round's actual candidates, not merely all member IDs.
+        vote_candidates, vote_members = set(candidates), list(state["members"])
+        def validate_member_output(output):
+            if phase == "vote":
+                validate_vote(output, member, vote_members, vote_candidates)
         context = {**state["context"], "instruction": {
             "proposal": "提出完整候选方案与依据。直接说观点，不列出已读消息。",
             "review": "回应最新观点并解决阻断项。可通过 revised_candidate 完整修订自己的候选方案；保持 issue_id，解决项需理由和依据。证据不足可以收窄任务或请求证据，不能虚构结果。",
@@ -158,7 +163,8 @@ class GroupDiscussionGraph:
             "proposals": {m: {"candidate": candidate} for m, candidate in candidates.items()},
             "issues": self.issues(state), "conversation_snapshot": state["history_snapshot"], "focused": state.get("focused", False)}
         output = await self.engine.turn(state["research_id"], member, state["role"], state["discussion_id"],
-            f"{phase}:{state['round']}", schema, context, conversation_id=state["discussion_id"], line_id=state.get("line_id"))
+            f"{phase}:{state['round']}", schema, context, conversation_id=state["discussion_id"], line_id=state.get("line_id"),
+            output_validator=validate_member_output)
         candidates = dict(candidates)
         if phase == "proposal":
             candidates[member] = output["candidate"]
@@ -190,7 +196,7 @@ class GroupDiscussionGraph:
                 problems = "；".join(i["issue_id"] + "：" + i["description"][:180] for i in self.blockers(state))
                 raise RuntimeBlocked("design_deadlock", "修订讨论后仍无进展，需要补充证据或调整任务。" + problems)
             return {"phase": "review", "round": round_no + 1, "prior_review_hash": fingerprint}
-        winner = majority({m: v["candidate_id"] for m, v in current.items()}, members, set(members))
+        winner = majority({m: v["candidate_id"] for m, v in current.items()}, members, set(state["candidates"]))
         if winner:
             return {"winner": winner}
         if state.get("focused"):
