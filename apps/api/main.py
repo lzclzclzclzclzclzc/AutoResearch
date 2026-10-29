@@ -614,9 +614,7 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             if body.kind == "resume" and p["status"] not in {"paused", "pausing"}:
                 raise StoreError("not_paused", "当前研究未暂停")
             s.update_project(research_id, status="running" if p["started_at"] else "created", blocked_reason=None)
-            for task in s.list("task", research_id):
-                if task["status"] in {"failed", "blocked"}:
-                    s.patch("task", task["id"], status="pending")
+            s.retry_failed_tasks(research_id)
             s.emit(research_id, "research.resumed", {"deadline_at": p.get("deadline_at")})
         elif body.kind == "rebind_credential":
             provider_id = body.provider_config_id or p["provider_config_id"]

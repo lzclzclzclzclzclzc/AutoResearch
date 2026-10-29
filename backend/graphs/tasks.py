@@ -10,6 +10,9 @@ from langgraph.types import Command
 current_task = ContextVar("research_current_task", default=None)
 
 
+def recovery_suffix():
+    generation = (current_task.get() or {}).get("recovery_generation", 0)
+    return f":recovery-{generation}" if generation else ""
 
 
 class TaskSuspended(Exception):

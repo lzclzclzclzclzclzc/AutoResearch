@@ -16,7 +16,7 @@ from backend.adapters.demo import DemoRuntimeAdapter
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
-from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved
+from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
     Role, RunAssessment, StageReport, Verification, assert_spec_unchanged, digest, validate_issue_transition)
@@ -150,6 +150,10 @@ class ResearchEngine:
         chain_id = kwargs.pop("recovery_chain_id", None)
         original_bound = inspect.signature(self._turn).bind(research_id, agent_id, *args, **kwargs)
         original_bound.apply_defaults()
+        if recovery_suffix():
+            original_bound.arguments["turn_id"] += recovery_suffix()
+            original_bound.arguments["context"] = {**original_bound.arguments["context"],
+                "recovery_generation": (current_task.get() or {})["recovery_generation"]}
         original_values = dict(original_bound.arguments)
         failure_id = "turn-failure-" + digest([research_id, agent_id, original_values["task_id"], original_values["turn_id"],
             original_values["schema"].model_json_schema(), original_values["context"]])
@@ -576,11 +580,11 @@ class ResearchEngine:
                 "memory_index": self.store.list("memory_node", research_id), "deadline_at": p["deadline_at"]}
             # A checkpointed discussion may return its old decision on retry.
             # Keep its memory baseline too, including checkpoints predating this record.
-            memory_context_id = task["id"]
+            memory_context_id = task["id"] + recovery_suffix()
             memory_context = self.store.get("boss_memory_context", memory_context_id)
             if memory_context is None:
                 snapshot = await self.discussions.graph.aget_state({"configurable": {
-                    "thread_id": f"research/{research_id}/discussion/{task['id']}:discussion:serial-v2"}})
+                    "thread_id": f"research/{research_id}/discussion/{task['id']}:discussion{recovery_suffix()}:serial-v2"}})
                 memory_index = snapshot.values.get("context", {}).get("memory_index", context["memory_index"])
                 memory_context = self.store.put("boss_memory_context", memory_context_id, {"memory_index": memory_index}, research_id)
             context["memory_index"] = memory_context["memory_index"]

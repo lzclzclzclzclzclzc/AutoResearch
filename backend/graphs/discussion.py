@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from backend.adapters.dsh import RuntimeBlocked
-from backend.graphs.tasks import ScopeResolved, TaskSuspended, current_task
+from backend.graphs.tasks import ScopeResolved, TaskSuspended, current_task, recovery_suffix
 from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, Willingness, digest, majority, validate_issue_transition, validate_vote
 
 
@@ -364,7 +364,7 @@ class GroupDiscussionGraph:
 
     async def run(self, research_id, discussion_id, role, members, context, line_id=None):
         async with self.locks.setdefault((research_id, role, line_id), asyncio.Lock()):
-            discussion_id += ":serial-v2"
+            discussion_id += recovery_suffix() + ":serial-v2"
             config = {"configurable": {"thread_id": f"research/{research_id}/discussion/{discussion_id}"}, "recursion_limit": 100000}
             snapshot = await self.graph.aget_state(config)
             has_interrupt = any(t.interrupts for t in snapshot.tasks)

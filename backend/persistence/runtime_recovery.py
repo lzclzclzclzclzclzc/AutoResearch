@@ -3,6 +3,21 @@ from datetime import datetime, timedelta, timezone
 
 
 class RuntimeRecoveryStoreMixin:
+    def retry_failed_tasks(self, research_id):
+        """Explicit human retry creates a new scene only for external blockers."""
+        with self.connect(True) as c:
+            self.assert_progress(self._project(c, research_id))
+            for task in self.list("task", research_id):
+                if task["status"] not in {"failed", "blocked"}:
+                    continue
+                changes = {"status": "pending", "owner": None, "error": None,
+                    "last_error": task.get("error")}
+                if (task.get("error") or {}).get("code") == "arbitration_needs_external_input":
+                    changes.update(recovery_generation=task.get("recovery_generation", 0) + 1,
+                        recovery_marker=None, dependency_recovery_id=None, recovery_outcome=None)
+                    self._emit(c, research_id, "task.external_input_retry", {"task_id": task["id"],
+                        "recovery_generation": changes["recovery_generation"]})
+                self._put(c, "task", task["id"], {**task, **changes}, research_id)
 
     def effective_boss_task_id(self, task_id):
         while revision := self.get("boss_reconsideration", task_id):

@@ -80,6 +80,24 @@ def test_local_session_and_csrf_reject_foreign_requests(tmp_path):
     assert c.get("/api/session", headers={"Origin": "https://evil.example"}).status_code == 403
 
 
+def test_external_input_retry_creates_one_new_recovery_generation(tmp_path):
+    c, app = client(tmp_path)
+    result = c.post("/api/research", json={"title": "恢复测试", "topic": "external input",
+        "mode": "demo", "client_request_id": "external-project"})
+    assert result.status_code == 201, result.text
+    rid = result.json()["research_id"]
+    store = app.state.store
+    p = store.start_project(rid)
+    task = store.pending_tasks()[0]
+    store.finish_task(task["id"], error={"code": "arbitration_needs_external_input", "message": "missing input"})
+    store.update_project(rid, status="blocked", blocked_reason="all_lines_blocked")
+    command = {"kind": "retry", "client_request_id": "retry-external"}
+    first = c.post(f"/api/research/{rid}/commands", json=command)
+    assert first.status_code == 202, first.text
+    assert c.post(f"/api/research/{rid}/commands", json=command).json() == first.json()
+    task = store.get("task", task["id"])
+    assert task["status"] == "pending" and task["recovery_generation"] == 1
+    assert store.project(rid)["deadline_at"] == p["deadline_at"]
 
 
 def test_manual_name_and_history_configuration_are_independent_and_frozen(tmp_path):

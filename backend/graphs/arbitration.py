@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS
 from backend.persistence.store import TERMINAL, now
-from backend.graphs.tasks import ScopeResolved, current_task
+from backend.graphs.tasks import ScopeResolved, current_task, recovery_suffix
 from packages.contracts.research import DecompositionPlan, GodDecision, Role, digest
 
 
@@ -82,6 +82,8 @@ class ArbitrationService:
             if task and task.get("status") == "running":
                 self.store.patch("task", source_task_id, execution_phase="arbitrating")
         sections = clean_context(context)
+        if recovery_suffix():
+            sections["recovery_generation"] = root_task["recovery_generation"]
         schema = target_schema.model_json_schema() if target_schema else {}
         sections = {**sections, "target_schema": schema}
         snapshot_hash = digest(sections)
@@ -98,6 +100,8 @@ class ArbitrationService:
         actions = allowed_actions or (["decompose_task", "request_revision", "needs_external_input"]
             if reason_code == "model_output_truncated" else ["repair_output", "request_revision", "needs_external_input"])
         chain_id = recovery_chain_id or "chain-" + digest([research_id, source_task_id, scope_id, origin_node])[:40]
+        if recovery_suffix() and not chain_id.endswith(recovery_suffix()):
+            chain_id += recovery_suffix()
         request = {"arbitration_id": arbitration_id, "schema_version": 1, "policy_version": 1,
             "research_id": research_id, "source_task_id": source_task_id, "scope_kind": scope_kind,
             "scope_id": scope_id, "origin_node": origin_node, "origin_checkpoint": context.get("origin_checkpoint"),

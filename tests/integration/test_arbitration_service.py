@@ -130,6 +130,39 @@ async def test_recovery_after_decided_never_calls_model_again(fixture):
     assert len(engine.calls) == 1
 
 
+async def test_explicit_external_retry_gets_new_arbitration_without_rewriting_old_request(fixture):
+    from backend.graphs.tasks import current_task
+    store, project = fixture
+    supplied = False
+    async def callback(request, context, attempt):
+        if supplied:
+            return choose(request, context)
+        return {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"],
+            "action": "needs_external_input", "content_markdown": "missing input", "rationale": "needs data",
+            "missing_items": ["dataset"], "why_unavailable": "not supplied", "operation": "supply and retry"}
+    engine = Engine(store, callback)
+    service = ArbitrationService(engine)
+    root = store.add_task(project["id"], "paper", {}, "root-task")
+    token = current_task.set(root)
+    try:
+        with pytest.raises(RuntimeBlocked, match="missing input"):
+            await service.resolve(**arguments(project))
+    finally:
+        current_task.reset(token)
+    before = store.list("arbitration_request", project["id"])[0]
+    store.finish_task(root["id"], error={"code": "arbitration_needs_external_input"})
+    supplied = True
+    store.retry_failed_tasks(project["id"])
+    token = current_task.set(store.get("task", root["id"]))
+    try:
+        decision = await service.resolve(**arguments(project))
+    finally:
+        current_task.reset(token)
+    assert decision["arbitration_id"] != before["id"]
+    assert store.get("arbitration_request", before["id"])["status"] == "needs_external_input"
+    after = store.get("arbitration_request", decision["arbitration_id"])
+    assert after["snapshot_hash"] != before["snapshot_hash"] and after["recovery_chain_id"] != before["recovery_chain_id"]
+    assert len(engine.calls) == 2
 
 
 async def test_god_cannot_select_through_must_fix_blockers(fixture):
