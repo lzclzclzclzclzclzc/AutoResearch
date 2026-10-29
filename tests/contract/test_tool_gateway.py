@@ -55,6 +55,8 @@ def test_role_and_stop_gates_cannot_be_bypassed(gateway):
         gateway.call(token, {"name": "read_shared_memory", "arguments": {}})
 
 
+
+
 def test_stream_cursor_replay_never_duplicates_the_cumulative_buffer(gateway):
     token = capability(gateway, role="exploration")
     gateway.store.create_conversation(gateway.project["id"], "conversation", title="Stream cursor fixture")
@@ -83,3 +85,64 @@ def test_private_scheduling_cannot_publish_chat_or_call_research_tools(gateway):
     with pytest.raises(PermissionError, match="Private scheduling"):
         gateway.call(token, {"name": "send_research_message", "call_id": "private",
             "arguments": {"recipient_ids": ["boss"], "content_markdown": "unwanted score"}})
+
+
+def test_god_reads_only_its_frozen_snapshot_with_explicit_pagination(gateway):
+    from packages.contracts.research import digest
+    rid = gateway.project["id"]
+    sections = {"discussion": "原始讨论" * 6000, "candidates": {"a": {"method": "one"}}}
+    snapshot_hash = digest(sections)
+    gateway.store.put("arbitration_snapshot", "snapshot", {"sections": sections, "snapshot_hash": snapshot_hash}, rid)
+    gateway.store.put("arbitration_request", "arb", {"snapshot_id": "snapshot", "snapshot_hash": snapshot_hash}, rid)
+    token = gateway.register(research_id=rid, role="god", agent_id="god/arb", control_generation=1,
+        execution_id="god-run", task_id="arb:judge", conversation_id=rid + ":god:arb",
+        arbitration_id="arb", snapshot_hash=snapshot_hash)
+    first = gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion", "offset": 0}})
+    second = gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion", "offset": first["next_offset"]}})
+    assert first["text"] + second["text"] == sections["discussion"]
+    assert first["sha256"] == second["sha256"] and first["total_length"] == len(sections["discussion"])
+    for name in ("read_shared_memory", "read_research_evidence", "send_research_message", "run_light_cpu", "read_research_input"):
+        with pytest.raises(PermissionError, match="only read"):
+            gateway.call(token, {"name": name, "arguments": {}})
+    with pytest.raises(PermissionError):
+        gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "other-project"}})
+    gateway.capabilities[token]["snapshot_hash"] = "tampered"
+    with pytest.raises(PermissionError, match="binding mismatch"):
+        gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion"}})
+    with pytest.raises(PermissionError, match="Only God"):
+        gateway.call(capability(gateway, role="boss"), {"name": "read_arbitration_context", "arguments": {"section": "discussion"}})
+
+
+def test_gateway_busy_response_preserves_cursor_and_hides_database_exception(gateway, monkeypatch):
+    import json
+    import urllib.request
+    import urllib.error
+    from backend.persistence.store import StoreError
+    server = ToolGateway(gateway.store, gateway.control, None)
+    token = server.register(research_id=gateway.project["id"], role="exploration", agent_id="line-01/exploration",
+        control_generation=1, execution_id="busy-stream", task_id="stream", conversation_id="busy-conversation")
+    original = gateway.store.emit
+    attempts = []
+    def emit(*args, **kwargs):
+        if not attempts:
+            attempts.append(1)
+            raise StoreError("storage_busy", "PRIVATE_DATABASE_DETAILS", 503)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gateway.store, "emit", emit)
+    body = json.dumps({"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 1,
+        "chunk": {"type": "usage", "output_tokens": 1}}}).encode()
+    request = urllib.request.Request(server.url, body, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(request, timeout=5)
+        response = failure.value
+        value = response.read().decode()
+        assert response.code == 503 and json.loads(value)["code"] == "storage_busy"
+        assert json.loads(value)["retryable"] and "PRIVATE" not in value
+        with urllib.request.urlopen(request, timeout=5) as result:
+            accepted = json.load(result)
+        with urllib.request.urlopen(request, timeout=5) as result:
+            assert json.load(result) == accepted
+        assert len([e for e in gateway.store.events(gateway.project["id"]) if e["type"] == "agent.stream_event"]) == 1
+    finally:
+        server.close()

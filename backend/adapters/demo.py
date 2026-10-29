@@ -48,9 +48,7 @@ class DemoRuntimeAdapter:
             agent_id=agent_id, execution_id=key, task_id=arguments["task_id"])
         try:
             output = await self._produce_turn(**arguments)
-            self.store.patch("execution", key, status="completed", output=output, completed_at=now())
-            self.store.emit(research_id, "agent.completed", {"mode": "demo", "real_model": False, "execution_attempt_id": key},
-                agent_id=agent_id, execution_id=key, task_id=arguments["task_id"])
+            self.store.complete_model_turn(key, output, payload={"mode": "demo", "real_model": False, "execution_attempt_id": key})
             return output
         except BaseException as error:
             from backend.adapters.dsh import ResearchStopped
@@ -74,7 +72,26 @@ class DemoRuntimeAdapter:
         def boss_decision():
             initial = context.get("initial", False)
             return {"content_markdown": content, "action": "assign" if initial else "finish_line", "assignments": [{"line_id": line["line_id"], "objective": "演示 CPU 线性回归完整工作流", "priority": 0} for line in context.get("lines", [])] if initial else [], "memory_updates": [] if initial else [{"node_id": "research/demo/"+context.get("line_id", "line"), "parent_id": "research/demo", "title": "CPU 工作流演示", "content_markdown": "真实 CPU 演示流程已执行；非用户题目的科研结论", "status": "passed", "source_ids": [context.get("submission_id", "")], "conditions": "仅合成数据演示"}], "request_report": not initial, "rationale": "完成演示生命周期"}
-        if name == "Willingness":
+        if name == "GodDecision":
+            request, snapshot = context["arbitration_request"], context["snapshot"]
+            value = {"arbitration_id": request["arbitration_id"], "snapshot_hash": request["snapshot_hash"],
+                "content_markdown": content, "rationale": "演示固定脚本：只处理当前冻结现场，不生成成员投票或实验事实。",
+                "evidence_refs": [], "limitations": ["固定脚本演示，非真实模型仲裁"], "unresolved_issue_ids": []}
+            actions = request["allowed_actions"]
+            if "select_candidate" in actions and snapshot.get("candidates") and not snapshot.get("blockers"):
+                value.update(action="select_candidate", selected_candidate_id=sorted(snapshot["candidates"])[0], minority_views=[])
+            elif "repair_output" in actions and snapshot.get("winner") and snapshot.get("candidates"):
+                winner = snapshot["winner"]
+                value.update(action="repair_output", target_schema_hash=request["target_schema_hash"], source_fields=["/winner", "/candidates"],
+                    output={"content_markdown": content, "selected_candidate_id": winner,
+                        "decision": snapshot["candidates"][winner] if snapshot.get("role") == "boss" else {},
+                        "minority_views": [], "issues": snapshot.get("issues", [])})
+            else:
+                missing = [i.get("issue_id", "未知阻断项") + ": " + i.get("description", "") for i in snapshot.get("blockers", [])]
+                value.update(action="needs_external_input", missing_items=missing or ["演示脚本不包含此原合同的真实修复结果"],
+                    why_unavailable="固定演示不能捏造证据或代替真实模型修复任意任务", operation="切换到真实研究并检查原任务所需资料")
+                value["content_markdown"] += "\n缺少条件：" + "；".join(value["missing_items"]) + "\n操作：" + value["operation"]
+        elif name == "Willingness":
             value = {"score": int(digest([agent_id, task_id, turn_id])[:8], 16) % 101}
         elif name == "MessageReply":
             value = {"content_markdown": content + "\n已收到实际投递的消息；此回复仅用于通信演示。"}

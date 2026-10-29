@@ -77,3 +77,15 @@ def test_child_json_keeps_chinese_when_sdk_changes_stdout_encoding(monkeypatch):
     encoded = wire.getvalue()
     assert encoded.isascii()
     assert json.loads(encoded)["message"] == "模型接口地址不存在（HTTP 404）"
+
+
+@pytest.mark.parametrize("message,code", [
+    ("AUTORESEARCH_STREAM_RECORDER_UNAVAILABLE", "stream_recorder_unavailable"),
+    ("Research stream recorder is unavailable or stopped", "stream_recorder_unavailable"),
+    ("AUTORESEARCH_STREAM_RECORDER_STOPPED", "stream_recorder_stopped"),
+    ("AUTORESEARCH_STREAM_RECORDER_REJECTED", "stream_recorder_rejected"),
+])
+def test_local_recorder_failures_are_not_misclassified_as_provider_errors(message, code):
+    result = classify_model_failure([turn_error("UNKNOWN", message=message)])
+    assert result["code"] == code
+    assert result["http_status"] is None

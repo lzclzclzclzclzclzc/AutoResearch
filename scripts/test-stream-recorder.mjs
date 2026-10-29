@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { apply } from '../packages/dsh-plugin-research/index.js';
 
-async function recorded(chunks, options = {}, privateTurn = false) {
+async function recorded(chunks, options = {}, privateTurn = false, respond) {
   const previous = { fetch: globalThis.fetch, env: { ...process.env } };
   const records = [], output = [];
   let handler;
@@ -10,7 +10,7 @@ async function recorded(chunks, options = {}, privateTurn = false) {
   process.env.AUTORESEARCH_TOOL_CAPABILITY = 'test-capability';
   process.env.AUTORESEARCH_ROLE = 'exploration';
   process.env.AUTORESEARCH_PRIVATE_TURN = privateTurn ? '1' : '0';
-  globalThis.fetch = async (_url, request) => { records.push(JSON.parse(request.body).arguments); return { ok: true }; };
+  globalThis.fetch = async (_url, request) => { records.push(JSON.parse(request.body).arguments); return respond ? respond(records.length, request) : { ok: true }; };
   apply({ on: (_event, value) => { handler = value; }, tools: { register() {}, guard() {} } });
   try {
     const source = typeof chunks === 'function' ? chunks : async function* () { yield* chunks; };
@@ -55,4 +55,35 @@ test('records complete text around tool boundaries, leaving partial tool argumen
   assert.deepEqual(output, chunks);
   assert.equal(records.filter(row => row.chunk.type === 'text-delta').map(row => row.chunk.text).join(''), 'before tool');
   assert.ok(!records.some(row => row.chunk.type === 'tool-call-delta'));
+});
+
+test('storage busy and lost acknowledgements replay exactly one cursor and preserve the provider stream', async () => {
+  const chunks = [{ type: 'text-delta', text: '{"content_markdown":"hello"}' }, { type: 'finish' }];
+  const { records, output } = await recorded(chunks, {}, false, async attempt => {
+    if (attempt === 1) return { ok: false, status: 503 };
+    if (attempt === 2) throw new TypeError('lost acknowledgement');
+    return { ok: true };
+  });
+  assert.deepEqual(output, chunks);
+  assert.deepEqual(records[0], records[1]);
+  assert.deepEqual(records[1], records[2]);
+  assert.deepEqual(records.map(row => row.cursor), [1, 1, 1, 2]);
+});
+
+test('a revoked capability fails once without re-flushing the same text as a new cursor', async () => {
+  let calls = 0;
+  await assert.rejects(recorded([{ type: 'text-delta', text: 'stopped' }], {}, false, async () => {
+    calls++; return { ok: false, status: 403 };
+  }), /AUTORESEARCH_STREAM_RECORDER_STOPPED/);
+  assert.equal(calls, 1);
+});
+
+test('stop interrupts recorder backoff before another request starts', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  await assert.rejects(recorded([{ type: 'text-delta', text: 'pending' }], { signal: controller.signal }, false, async () => {
+    calls++; setTimeout(() => controller.abort(new Error('human stop')), 10);
+    return { ok: false, status: 503 };
+  }), /human stop/);
+  assert.equal(calls, 1);
 });

@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from packages.contracts.research import digest
 from backend.adapters.inputs import InputAccessError, ResearchInputs
+from backend.persistence.resilience import is_storage_busy
 
 
 def visible_markdown(raw: str) -> str:
@@ -83,14 +84,18 @@ class ToolGateway:
                     result = gateway.call(capability, payload)
                     body, status = json.dumps(result, ensure_ascii=False).encode(), 200
                 except Exception as error:
-                    status = 403 if isinstance(error, PermissionError) else 422
-                    body = json.dumps({"code": "research_input_unavailable" if isinstance(error, InputAccessError) else "tool_rejected",
-                        "message": error.public_message if isinstance(error, InputAccessError) else "科研工具请求未获授权或参数无效"}, ensure_ascii=False).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
+                    busy = is_storage_busy(error)
+                    status = 503 if busy else 403 if isinstance(error, PermissionError) else 422
+                    body = json.dumps({"code": "storage_busy" if busy else "research_input_unavailable" if isinstance(error, InputAccessError) else "tool_rejected",
+                        "message": "研究记录暂时忙，使用同一请求重试" if busy else error.public_message if isinstance(error, InputAccessError) else "科研工具请求未获授权或参数无效",
+                        "retryable": busy}, ensure_ascii=False).encode()
                 try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    if status == 503:
+                        self.send_header("Retry-After", "1")
+                    self.end_headers()
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -132,6 +137,32 @@ class ToolGateway:
             return self.record_stream(context, args)
         if context.get("suppress_chat"):
             raise PermissionError("Private scheduling scores cannot use research tools")
+        if role == "god":
+            # God has a separate allowlist: ordinary role exclusions are unsafe
+            # for a new role, especially evidence, memory and messaging tools.
+            if name != "read_arbitration_context":
+                raise PermissionError("God can only read its bound arbitration snapshot")
+            request = self.store.get("arbitration_request", context.get("arbitration_id", ""))
+            if not request or request["research_id"] != research_id or request["snapshot_hash"] != context.get("snapshot_hash"):
+                raise PermissionError("Arbitration snapshot binding mismatch")
+            snapshot = self.store.get("arbitration_snapshot", request["snapshot_id"])
+            if not snapshot or snapshot["research_id"] != research_id:
+                raise PermissionError("Missing arbitration snapshot")
+            sections = snapshot.get("sections", snapshot.get("context", {}))
+            section = args.get("section")
+            if section not in sections:
+                raise PermissionError("Section is outside the frozen arbitration context")
+            offset = args.get("offset", 0)
+            if type(offset) is not int or offset < 0:
+                raise ValueError("Snapshot offset must be a nonnegative integer")
+            value = sections[section]
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+            page = text[offset:offset + 16384]
+            return {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"],
+                "section": section, "sha256": hashlib.sha256(text.encode()).hexdigest(), "offset": offset,
+                "next_offset": offset + len(page), "total_length": len(text), "text": page}
+        if name == "read_arbitration_context":
+            raise PermissionError("Only God may read a bound arbitration snapshot")
         if name in {"list_research_inputs", "read_research_input"}:
             if role not in {"exploration", "critic", "implementation", "verify", "boss"}:
                 raise PermissionError("This role cannot read mutable human inputs")

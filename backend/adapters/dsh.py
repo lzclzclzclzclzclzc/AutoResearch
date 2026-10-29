@@ -8,6 +8,7 @@ import sys
 import shutil
 import subprocess
 from functools import lru_cache
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import psutil
 from packages.contracts.research import digest
 from backend.adapters.provider_endpoints import messages_base_url
 from backend.adapters.token_limits import output_tokens, truncated_output_error
+from backend.persistence.resilience import is_storage_busy
 
 
 class RuntimeBlocked(RuntimeError):
@@ -148,6 +150,50 @@ class DshRuntimeAdapter:
                 "home": str(home), "workspace": str(workspace), "has_history": False}, research_id)
         return session
 
+    @asynccontextmanager
+    async def _admission(self, research_id, generation, runtime_context, *gates):
+        acquired = []
+        try:
+            for gate in gates:
+                waiting = asyncio.create_task(gate.acquire())
+                announced = False
+                try:
+                    while not waiting.done():
+                        self._assert_arbitration_open(runtime_context)
+                        if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
+                            raise ResearchStopped("等待模型容量期间研究已停止")
+                        if runtime_context.get("arbitration_id") and not announced:
+                            self.store.emit(research_id, "arbitration.capacity_wait", {
+                                "arbitration_id": runtime_context["arbitration_id"], "execution_phase": "waiting_capacity"})
+                            announced = True
+                        await asyncio.wait({waiting}, timeout=0.2)
+                    await waiting
+                    acquired.append(gate)
+                finally:
+                    if not waiting.done():
+                        waiting.cancel()
+                        await asyncio.gather(waiting, return_exceptions=True)
+                    elif gate not in acquired and not waiting.cancelled() and waiting.exception() is None:
+                        gate.release()
+            project = await asyncio.to_thread(self.store.project, research_id)
+            self._assert_arbitration_open(runtime_context)
+            if project["status"] in {"pausing", "paused", "blocked"}:
+                raise RuntimeBlocked("research_paused", "研究暂停期间不启动新的模型回合")
+            if runtime_context.get("arbitration_id"):
+                self.store.emit(research_id, "arbitration.capacity_acquired", {
+                    "arbitration_id": runtime_context["arbitration_id"], "execution_phase": "judging"})
+            yield
+        finally:
+            for gate in reversed(acquired):
+                gate.release()
+
+    def _assert_arbitration_open(self, runtime_context):
+        aid = (runtime_context or {}).get("arbitration_id")
+        if aid:
+            request = self.store.get("arbitration_request", aid)
+            if not request or request["status"] in {"cancelled", "stale", "exhausted", "needs_external_input"}:
+                raise ResearchStopped("该 God 仲裁范围已经取消或失效")
+
     async def execute_turn(self, *, research_id, agent_id, role, task_id, turn_id,
                            prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None):
         available = self.availability()
@@ -161,7 +207,8 @@ class DshRuntimeAdapter:
         logical_key = digest([research_id, agent_id, task_id, turn_id])
         concurrency = project["config_snapshot"]["team"].get("model_concurrency", 4)
         project_semaphore = self.project_semaphores.setdefault(research_id, asyncio.Semaphore(concurrency))
-        async with self.locks.setdefault(session["id"], asyncio.Lock()), self.semaphore, project_semaphore:
+        async with self._admission(research_id, generation, runtime_context or {},
+                self.locks.setdefault(session["id"], asyncio.Lock()), self.semaphore, project_semaphore):
             if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                 raise ResearchStopped("研究已停止或控制服务不可用")
             previous = self.store.get("execution", logical_key)
@@ -249,11 +296,13 @@ class DshRuntimeAdapter:
                     try:
                         line = await asyncio.wait_for(message_reader.readline(), 0.4)
                     except asyncio.TimeoutError:
+                        self._assert_arbitration_open(runtime_context)
                         if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                             raise ResearchStopped("研究已终止")
                         continue
                     if not line:
                         break
+                    self._assert_arbitration_open(runtime_context)
                     offset += 1
                     try:
                         from backend.services.credentials import redact
@@ -291,11 +340,10 @@ class DshRuntimeAdapter:
                     raise RuntimeBlocked(failure["code"], failure["message"])
                 result = schema.model_validate_json(final["final_response"]).model_dump()
                 message_id = self.gateway.last_message(capability) if capability else None
-                self.store.patch("execution", logical_key, status="completed", output=result,
-                    finish_reason=final.get("finish_reason"), message_id=message_id, actual_model=final.get("actual_model", "unknown"), completed_at=datetime.now(timezone.utc).isoformat())
-                self.store.patch("dsh_session", session["id"], has_history=True)
-                self.store.emit(research_id, "agent.completed", {"mode": "live", "execution_attempt_id": execution_id,
-                    "finish_reason": final.get("finish_reason")}, agent_id=agent_id, execution_id=execution_id, task_id=task_id)
+                self.store.complete_model_turn(logical_key, result, session_id=session["id"],
+                    fields={"finish_reason": final.get("finish_reason"), "message_id": message_id,
+                        "actual_model": final.get("actual_model", "unknown")},
+                    payload={"mode": "live", "execution_attempt_id": execution_id, "finish_reason": final.get("finish_reason")})
                 turn_completed = True
                 return result
             except BaseException as error:
@@ -304,17 +352,29 @@ class DshRuntimeAdapter:
                 safe_error = {"code": getattr(error, "code", type(error).__name__),
                     "message": str(error) if isinstance(error, RuntimeBlocked) else "研究已停止，执行已取消。" if cancelled else "DSH 运行失败，请检查本地运行时。",
                     "http_status": getattr(error, "http_status", None), "provider_error_code": getattr(error, "provider_error_code", None)}
-                self.store.patch("execution", logical_key, status="unknown" if not exit_confirmed else "interrupted" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "failed",
-                                 error_code=safe_error["code"], error_message=safe_error["message"], error=safe_error,
-                                 http_status=safe_error["http_status"], provider_error_code=safe_error["provider_error_code"], completed_at=datetime.now(timezone.utc).isoformat())
-                self.store.emit(research_id, "agent.cancelled" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "agent.failed",
-                    {"mode": "live", "execution_attempt_id": execution_id, **safe_error,
-                     "exit_confirmed": exit_confirmed}, agent_id=agent_id, execution_id=execution_id, task_id=task_id)
+                try:
+                    self.store.patch("execution", logical_key, status="unknown" if not exit_confirmed else "interrupted" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "failed",
+                                     error_code=safe_error["code"], error_message=safe_error["message"], error=safe_error,
+                                     http_status=safe_error["http_status"], provider_error_code=safe_error["provider_error_code"], completed_at=datetime.now(timezone.utc).isoformat())
+                    self.store.emit(research_id, "agent.cancelled" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "agent.failed",
+                        {"mode": "live", "execution_attempt_id": execution_id, **safe_error,
+                         "exit_confirmed": exit_confirmed}, agent_id=agent_id, execution_id=execution_id, task_id=task_id)
+                except Exception as persistence_error:
+                    if not is_storage_busy(persistence_error):
+                        raise
+                    # The independent exit receipt below remains writable while
+                    # business SQLite is busy; recovery reconciles the old row.
+                    print(json.dumps({"event": "agent.failure_persistence_deferred", "code": "storage_busy",
+                        "execution_id": execution_id, "exit_confirmed": exit_confirmed}), flush=True)
                 raise
             finally:
                 self.processes.pop(execution_id, None)
                 if capability and self.gateway:
-                    self.gateway.revoke(capability, interrupted=not turn_completed)
+                    try:
+                        self.gateway.revoke(capability, interrupted=not turn_completed)
+                    except Exception as cleanup_error:
+                        if not is_storage_busy(cleanup_error):
+                            raise
                 if self.runner and hasattr(self.runner, "cancel_light_execution"):
                     try:
                         await asyncio.to_thread(self.runner.cancel_light_execution, execution_id)

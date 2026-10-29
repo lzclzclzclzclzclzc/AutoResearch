@@ -4,6 +4,13 @@
 export const name = 'autoresearch-research-tools'
 export const inject = ['tools']
 
+const delay = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason || new Error('Aborted'))
+  const abort = () => { clearTimeout(timer); reject(signal.reason || new Error('Aborted')) }
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, ms)
+  signal?.addEventListener('abort', abort, { once: true })
+})
+
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false })
 const string = { type: 'string' }
 const strings = { type: 'array', items: string }
@@ -20,13 +27,27 @@ export function apply(ctx) {
   ctx.on('llm/stream', async function* (options, next) {
     const streamId = ++streamCount
     let cursor = 0
-    let pending = '', lastFlush = 0, started = false
+    let pending = '', lastFlush = 0, started = false, recordingFailed = false
     const record = async chunk => {
-      const response = await fetch(endpoint, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ name: 'record_stream_event', arguments: { stream_id: streamId, cursor: ++cursor, chunk } }), signal: options.signal,
-      })
-      if (!response.ok) throw new Error('Research stream recorder is unavailable or stopped')
+      // Lost acknowledgements replay this exact cursor/body; the gateway deduplicates it.
+      const body = JSON.stringify({ name: 'record_stream_event', arguments: { stream_id: streamId, cursor: ++cursor, chunk } })
+      for (let attempt = 0; ; attempt++) {
+        let response
+        try {
+          response = await fetch(endpoint, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body, signal: options.signal,
+          })
+        } catch (error) {
+          if (options.signal?.aborted) throw error
+          if (attempt >= 5) throw new Error('AUTORESEARCH_STREAM_RECORDER_UNAVAILABLE')
+        }
+        if (response?.ok) return
+        if (response && ![408, 429, 500, 502, 503, 504].includes(response.status))
+          throw new Error(response.status === 403 ? 'AUTORESEARCH_STREAM_RECORDER_STOPPED' : 'AUTORESEARCH_STREAM_RECORDER_REJECTED')
+        if (attempt >= 5) throw new Error('AUTORESEARCH_STREAM_RECORDER_UNAVAILABLE')
+        await delay(Math.min(100 * 2 ** attempt, 1000), options.signal)
+      }
     }
     const flush = async () => {
       if (!pending) return
@@ -46,11 +67,16 @@ export function apply(ctx) {
         }
         yield chunk
       }
+    } catch (error) {
+      recordingFailed = true
+      throw error
     } finally {
-      if (!options.signal?.aborted) await flush()
+      if (!options.signal?.aborted && !recordingFailed) await flush()
     }
   })
-  const definitions = [
+  const definitions = role === 'god' ? [
+    ['read_arbitration_context', 'Read only a section of this arbitration immutable snapshot. Returns offset, total length and SHA-256. Continue using next_offset; no other project or mutable source is accessible.', object({ section: string, offset: { type: 'integer', minimum: 0 } }, ['section'])],
+  ] : [
     ['read_research_evidence', 'Read a registered, integrity-checked evidence artifact from this research line; paginate with offset.', object({ artifact_id: string, offset: { type: 'integer' } }, ['artifact_id'])],
     ['read_shared_memory', 'Read a Boss-managed shared memory node and its direct children. Empty node_id reads the root index.', object({ node_id: string })],
     ['send_research_message', 'Deliver a message to registered permitted recipients with durable per-member inboxes and a recoverable communication reply. It does not assign scientific tasks or create group votes.', object({ recipient_ids: strings, content_markdown: string }, ['recipient_ids', 'content_markdown'])],
@@ -62,7 +88,7 @@ export function apply(ctx) {
   if (['exploration', 'critic', 'implementation', 'verify'].includes(role)) definitions.push(
     ['run_light_cpu', 'Run numeric-only lightweight CPU analysis before the research deadline. Evidence is preloaded as evidence; Verify must reference existing artifacts. No filesystem, network, process, formal training, or shared memory writes.', object({ code: string, evidence_ids: strings }, ['code'])],
   )
-  const allowed = new Set(['web_search', 'web_fetch', 'todo_write', ...definitions.map(([name]) => name)])
+  const allowed = new Set([...(role === 'god' ? [] : ['web_search', 'web_fetch', 'todo_write']), ...definitions.map(([name]) => name)])
   // Monotonic guard also denies new tools accidentally added to future profiles.
   ctx.tools.guard(execution => allowed.has(execution.name) ? undefined : 'This tool is outside the registered research role policy')
   for (const [name, description, parameters] of definitions) {

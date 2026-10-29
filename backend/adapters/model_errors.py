@@ -55,7 +55,15 @@ def classify_model_failure(events) -> dict:
     if status is None and http_code:
         status = int(http_code.group(1))
 
-    if status == 404:
+    # Exact messages originate in our bound plugin, never arbitrary provider text.
+    recorder_error = failure.get("message")
+    if recorder_error in {"AUTORESEARCH_STREAM_RECORDER_UNAVAILABLE", "Research stream recorder is unavailable or stopped"}:
+        code, message = "stream_recorder_unavailable", "本机流式记录暂时不可用，执行退出对账后自动恢复。"
+    elif recorder_error == "AUTORESEARCH_STREAM_RECORDER_STOPPED":
+        code, message = "stream_recorder_stopped", "科研记录授权已停止，拒绝启动替代执行。"
+    elif recorder_error == "AUTORESEARCH_STREAM_RECORDER_REJECTED":
+        code, message = "stream_recorder_rejected", "流式记录协议校验失败，已保留执行现场。"
+    elif status == 404:
         code, message = "model_endpoint_error", "模型接口地址不存在（HTTP 404），请检查模型服务地址和接口路径。"
     elif status in {400, 413} or provider_code in {"INVALID_REQUEST", "CONTEXT_WINDOW_EXCEEDED", "INVALID_REPLAY_STATE", "UNSUPPORTED_CONTENT", "UNSUPPORTED_REASONING_EFFORT", "REQUEST_EXTENSION", "NO_ADAPTER"}:
         code, message = "model_request_invalid", "模型请求或配置无效，请检查模型、接口协议和请求设置。"
