@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from backend.adapters.provider_endpoints import DEFAULT_MESSAGES_BASE_URL, messages_base_url, messages_url
+from backend.adapters.token_limits import CONNECTION_OUTPUT_TOKENS
 from backend.persistence import Store, StoreError, canonical, new_id, now
 from backend.persistence.store import DEFAULT_TEAM, TERMINAL, build_topology
 from backend.services.credentials import CredentialService, redact
@@ -305,7 +306,7 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
                 response = await client.post(messages_url(p.get("base_url")),
                     headers={"x-api-key": secret, "anthropic-version": "2023-06-01"},
                     json={"model": p["model"], "messages": [{"role": "user", "content": "Reply OK."}],
-                        "max_tokens": 16, "stream": False, "thinking": {"type": "disabled"}})
+                        "max_tokens": CONNECTION_OUTPUT_TOKENS, "stream": False, "thinking": {"type": "disabled"}})
                 result["http_status"] = response.status_code
                 result["credential_valid"] = True if response.is_success else False if response.status_code in {401, 403} else None
                 if response.is_success:
@@ -320,6 +321,9 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
                         if isinstance(returned_model, str):
                             result["returned_model"] = redact(returned_model, secret)[:200]
                         result["message"] = "Messages 最小模型调用成功；工具与流式合同尚未验证"
+                    elif isinstance(data, dict) and data.get("type") == "message" and data.get("stop_reason") == "max_tokens":
+                        result["error_code"] = "model_response_truncated"
+                        result["message"] = "服务已响应，但输出达到 token 上限前未生成有效文本；本次测试未通过，请增加测试输出额度后重试"
                     else:
                         result["message"] = "Messages 响应格式无效：需要 type=message 且包含非空 text 内容；连接测试未通过"
                 elif response.status_code == 404:

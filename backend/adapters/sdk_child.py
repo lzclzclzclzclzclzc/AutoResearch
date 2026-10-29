@@ -15,6 +15,7 @@ from pathlib import Path
 import psutil
 
 from backend.adapters.model_errors import classify_model_failure
+from backend.adapters.token_limits import SEARCH_OUTPUT_TOKENS, output_tokens, truncated_output_error
 
 
 # Disable unsafe entry points in the full sdk tree, including paths which can
@@ -28,7 +29,8 @@ DISABLED_ROWS = ["tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-fs-sear
 
 
 def policy_text():
-    return "\n".join(f"- id: {row}\n  disabled: true" for row in DISABLED_ROWS) + "\n"
+    return ("\n".join(f"- id: {row}\n  disabled: true" for row in DISABLED_ROWS)
+        + f"\n- id: web-search-deepseek\n  config:\n    maxTokens: {SEARCH_OUTPUT_TOKENS}\n")
 
 
 def emit(value):
@@ -93,7 +95,8 @@ def main():
                 dsh_bin=payload.get("dsh_bin"),
                 patches=(str(patch.resolve()),), provider="deepseek-official", model=payload["model"],
                 base_url=payload["base_url"], api_key=secret, request_timeout_seconds=payload["timeout"],
-                **({"reasoning_effort": "off", "max_tokens": 64} if payload.get("auxiliary") else {}),
+                max_tokens=output_tokens(payload.get("auxiliary", False), payload.get("max_output_tokens")),
+                **({"reasoning_effort": "off"} if payload.get("auxiliary") else {}),
                 env={"AUTORESEARCH_TOOL_GATEWAY": payload.get("gateway_url", ""),
                      "AUTORESEARCH_TOOL_CAPABILITY": payload.get("gateway_token", ""), "AUTORESEARCH_ROLE": payload.get("role", ""),
                      "AUTORESEARCH_HAS_INPUTS": "1" if payload.get("has_inputs") else "0",
@@ -103,7 +106,10 @@ def main():
             def notification(item):
                 emit({"type": "notification", "method": item.method, "payload": item.payload})
             result = session.run(payload["prompt"], on_notification=notification)
-            if result.finish_reason not in {"completed", "max-tokens"}:
+            if result.finish_reason == "max-tokens":
+                emit({"type": "error", **truncated_output_error()})
+                return 1
+            if result.finish_reason != "completed":
                 emit({"type": "error", **classify_model_failure(result.events)})
                 return 1
             emit({"type": "result", "final_response": result.final_response,

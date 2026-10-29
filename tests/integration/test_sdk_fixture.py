@@ -255,7 +255,8 @@ async def test_official_sdk_message_tool_reaches_receiver_context_and_delivers_r
             assert "LOCAL RECEIVER FIXTURE" in reply["content_markdown"]
             wire = json.dumps(requests[3], ensure_ascii=False)
             assert "received_messages" in wire and "LOCAL_PROTOCOL_QUESTION" in wire
-            assert '"max_tokens": 64' in json.dumps(requests[2])
+            assert requests[2]["max_tokens"] == 16384
+            assert requests[0]["max_tokens"] == requests[3]["max_tokens"] == 65536
             inbox = store.consume_agent_inbox(p["id"], sender, "receive-native-reply", control, 1)
             assert inbox[0]["message"]["content_markdown"] == reply["content_markdown"]
             await graph.run(jobs[0])

@@ -237,7 +237,7 @@ class ToolGateway:
                 if stream.get("message_id"):
                     reason = chunk.get("reason", {}).get("kind")
                     self.store.complete_stream_message(stream["message_id"], stream["visible"],
-                        status="interrupted" if reason in {"error", "aborted"} else "complete")
+                        status="interrupted" if reason in {"error", "aborted", "max-tokens", "max_tokens", "length"} else "complete")
                 stream["finished"] = True
             if chunk.get("type") != "text-delta":
                 event = self.store.emit(context["research_id"], "agent.stream_event",

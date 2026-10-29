@@ -16,6 +16,7 @@ import psutil
 
 from packages.contracts.research import digest
 from backend.adapters.provider_endpoints import messages_base_url
+from backend.adapters.token_limits import output_tokens, truncated_output_error
 
 
 class RuntimeBlocked(RuntimeError):
@@ -178,7 +179,9 @@ class DshRuntimeAdapter:
                 raise RuntimeBlocked("credential_missing", "请先在设置中保存 DeepSeek API Key")
             attempt = (previous or {}).get("attempt", 0) + 1
             execution_id = f"{logical_key}-{attempt}"
+            token_limit = output_tokens(bool((runtime_context or {}).get("suppress_chat")), (runtime_context or {}).get("max_output_tokens"))
             record = {"status": "registered", "attempt": attempt, "execution_attempt_id": execution_id,
+                "max_output_tokens": token_limit,
                 "conversation_id": (runtime_context or {}).get("conversation_id"),
                 "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id, "session_id": session["session_id"],
                 "control_generation": generation, "created_at": datetime.now(timezone.utc).isoformat(), **available}
@@ -211,7 +214,7 @@ class DshRuntimeAdapter:
                 payload = {"api_key": secret, "home": session["home"], "workspace": session["workspace"],
                     "session_id": session["session_id"], "resume": session.get("has_history", False) or interrupted_history,
                     "prompt": prompt, "parent_pid": os.getpid(), "parent_create_time": psutil.Process().create_time(), "deadline_at": project["deadline_at"],
-                    "timeout": max(1, (deadline - datetime.now(timezone.utc)).total_seconds()),
+                    "timeout": max(1, (deadline - datetime.now(timezone.utc)).total_seconds()), "max_output_tokens": token_limit,
                     "model": (model or {}).get("model", (model or {}).get("model_id", "deepseek-flash")),
                     "base_url": messages_base_url((model or {}).get("base_url"))}
                 payload["dsh_bin"] = available.get("dsh_bin")
@@ -283,6 +286,9 @@ class DshRuntimeAdapter:
                 if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                     raise ResearchStopped("迟到结果只归档，不推进研究")
                 self.store.patch("dsh_session", session["id"], has_history=True)
+                if final.get("finish_reason") == "max-tokens":
+                    failure = truncated_output_error()
+                    raise RuntimeBlocked(failure["code"], failure["message"])
                 result = schema.model_validate_json(final["final_response"]).model_dump()
                 message_id = self.gateway.last_message(capability) if capability else None
                 self.store.patch("execution", logical_key, status="completed", output=result,

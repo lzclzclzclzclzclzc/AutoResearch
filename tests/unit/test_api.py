@@ -241,7 +241,7 @@ def test_provider_test_uses_real_messages_request_and_redacts_response(tmp_path,
     assert headers["x-api-key"] == synthetic and headers["anthropic-version"] == "2023-06-01"
     assert "authorization" not in headers and headers["content-type"] == "application/json"
     assert received[0]["body"] == {"model": "deepseek-flash", "messages": [{"role": "user", "content": "Reply OK."}],
-        "max_tokens": 16, "stream": False, "thinking": {"type": "disabled"}}
+        "max_tokens": 4096, "stream": False, "thinking": {"type": "disabled"}}
     assert c.post("/api/settings/providers/deepseek-default/test", json=request).json() == result
     assert len(received) == 1
     assert app.state.store.get("provider", "deepseek-default")["test_status"] == "passed"
@@ -280,6 +280,7 @@ def test_chat_success_cannot_hide_missing_messages_endpoint(tmp_path, monkeypatc
     {"type": "message", "content": [{"type": "tool_use", "name": "echo"}]},
     {"type": "message", "content": [{"type": "text", "text": "  "}]},
     {"type": "other", "content": [{"type": "text", "text": "OK"}]},
+    {"type": "message", "content": [{"type": "text", "text": ""}], "stop_reason": "max_tokens"},
 ])
 def test_provider_test_rejects_non_messages_success_body(tmp_path, monkeypatch, messages_service, invalid):
     base, routes, received = messages_service
@@ -292,7 +293,12 @@ def test_provider_test_rejects_non_messages_success_body(tmp_path, monkeypatch, 
     tested = c.post("/api/settings/providers/deepseek-default/test", json={"client_request_id": "invalid-contract"})
     assert tested.status_code == 200, tested.text
     assert tested.json()["model_available"] is False
-    assert "响应格式无效" in tested.json()["message"]
+    if invalid.get("stop_reason") == "max_tokens":
+        assert tested.json()["error_code"] == "model_response_truncated"
+        assert "token 上限" in tested.json()["message"]
+        assert "响应格式无效" not in tested.json()["message"]
+    else:
+        assert "响应格式无效" in tested.json()["message"]
     assert app.state.store.get("provider", "deepseek-default")["test_status"] == "failed"
 
 

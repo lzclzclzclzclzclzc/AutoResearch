@@ -12,6 +12,7 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.adapters.demo import DemoRuntimeAdapter
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
+from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
@@ -112,13 +113,15 @@ class ResearchEngine:
         prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象:\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
         delay, last_error = 1.0, None
+        token_limit = output_tokens(not publish_message)
         while True:
             try:
                 result = await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
                     task_id=task_id, turn_id=turn_id, prompt=prompt, schema=schema, direction_epoch=context.get("direction_epoch", 1),
                     model=project["config_snapshot"]["provider"], context=context,
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
-                        "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message})
+                        "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message,
+                        "max_output_tokens": token_limit})
                 previous = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"} for i in context.get("issues", []) if i.get("raised_by") == agent_id}
                 seen = set()
                 for issue in result.get("issues", []):
@@ -134,6 +137,16 @@ class ResearchEngine:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
             except RuntimeBlocked as error:
+                if error.code == "model_output_truncated":
+                    await self.guard(research_id)
+                    if token_limit >= MAX_OUTPUT_TOKENS:
+                        raise RuntimeBlocked("model_output_truncated", f"模型输出在 {token_limit} token 上限下仍被截断，任务已阻塞；请拆分任务或调整模型。") from error
+                    token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
+                    self.store.emit(research_id, "agent.retry_wait", {"code": error.code, "max_output_tokens": token_limit,
+                        "message": "输出被截断，已提高额度重新请求完整结果"}, agent_id=agent_id)
+                    prompt += "\n上次输出达到 token 上限，现已增加额度。沿用已完成的工具结果，不重复执行已完成的操作；直接返回完整 JSON 对象。"
+                    turn_id += f":more-output:{token_limit}"
+                    continue
                 if error.code not in {"rate_limited", "model_transport_error", "model_timeout"}:
                     raise
                 await self.guard(research_id)

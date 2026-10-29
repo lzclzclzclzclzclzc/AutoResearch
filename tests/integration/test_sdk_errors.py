@@ -15,7 +15,8 @@ from packages.contracts.research import Proposal
 
 @pytest.mark.skipif(not runtime_availability().get("available"), reason="Optional matching official SDK/runtime unavailable")
 @pytest.mark.asyncio
-async def test_native_sdk_http_404_is_a_readable_persisted_endpoint_failure(tmp_path):
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_native_sdk_http_404_is_a_readable_persisted_endpoint_failure(tmp_path, truncated):
     dummy_secret = "native-local-http-error-dummy-secret"
     requests = []
     class Credentials:
@@ -27,6 +28,22 @@ async def test_native_sdk_http_404_is_a_readable_persisted_endpoint_failure(tmp_
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
             requests.append(self.path)
+            if truncated:
+                chunks = [
+                    {"type": "message_start", "message": {"id": "truncated", "type": "message", "role": "assistant", "model": "deepseek-flash", "content": [], "usage": {"input_tokens": 10, "output_tokens": 0}}},
+                    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '{"content_markdown":"partial","candidate":{},"evidence":[]}'}},
+                    {"type": "content_block_stop", "index": 0},
+                    {"type": "message_delta", "delta": {"stop_reason": "max_tokens", "stop_sequence": None}, "usage": {"output_tokens": 65536}},
+                    {"type": "message_stop"},
+                ]
+                data = "".join("event: " + item["type"] + "\ndata: " + json.dumps(item) + "\n\n" for item in chunks).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             body = json.dumps({"type": "error", "error": {"type": "not_found_error",
                 "message": "RAW_UPSTREAM_DETAIL " + dummy_secret}}).encode("utf-8")
             self.send_response(404)
@@ -52,6 +69,15 @@ async def test_native_sdk_http_404_is_a_readable_persisted_endpoint_failure(tmp_
                 model={"model": "deepseek-flash", "base_url": f"http://127.0.0.1:{server.server_port}"},
                 runtime_context={"conversation_id": "http-error-fixture"}), timeout=40)
         failure = caught.value
+        if truncated:
+            assert failure.code == "model_output_truncated" and "截断" in str(failure)
+            execution = store.list("execution", project["id"])[0]
+            assert execution["status"] == "failed" and execution["error_code"] == "model_output_truncated"
+            assert execution["max_output_tokens"] == 65536
+            assert not any(event["type"] == "agent.completed" for event in store.events(project["id"]))
+            message = store.messages("http-error-fixture")["items"][0]
+            assert message["status"] == "interrupted"
+            return
         assert failure.code == "model_endpoint_error" and failure.http_status == 404
         assert failure.provider_error_code == "HTTP_404" and "模型接口地址" in str(failure)
         assert "404" in str(failure) and "RAW_UPSTREAM_DETAIL" not in str(failure) and dummy_secret not in str(failure)
