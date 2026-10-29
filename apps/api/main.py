@@ -18,6 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from apps.api.arbitration_views import request_detail, request_list
 from backend.adapters.provider_endpoints import DEFAULT_MESSAGES_BASE_URL, messages_base_url, messages_url
 from backend.adapters.token_limits import CONNECTION_OUTPUT_TOKENS
 from backend.persistence import Store, StoreError, canonical, new_id, now
@@ -100,9 +101,12 @@ class Export(Input):
 
 def _public(value):
     if isinstance(value, dict):
-        return {k: _public(v) for k, v in value.items() if k not in {"api_key", "secret", "credential_ref", "authorization"}}
+        return {k: _public(v) for k, v in value.items() if k.lower() not in {
+            "api_key", "secret", "credential_ref", "authorization", "capability", "gateway_capability", "csrf_token"}}
     if isinstance(value, list):
         return [_public(x) for x in value]
+    if isinstance(value, str):
+        return redact(value)
     return value
 
 
@@ -398,7 +402,38 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
 
     @app.get("/api/research/{research_id}/snapshot")
     def snapshot(research_id: str):
-        return _public(store().snapshot(research_id))
+        s = store()
+        result = s.snapshot(research_id)
+        result["arbitrations"] = request_list(s, research_id, result["snapshot_seq"])
+        topology = result.setdefault("topology", {})
+        nodes = topology.setdefault("nodes", [])
+        if not any(node["id"] == "god" for node in nodes):
+            nodes.append({"id": "god", "type": "role", "data": {"role": "god", "label": "God", "status": "idle"}})
+        return _public(result)
+
+    @app.get("/api/research/{research_id}/arbitrations")
+    def arbitrations(research_id: str, scope_kind: str | None = None, scope_id: str | None = None,
+                     status: str | None = None, after: str | None = Query(default=None, max_length=300),
+                     limit: int = Query(default=50, ge=1, le=200), at_seq: int | None = Query(default=None, ge=0)):
+        s = store()
+        s.project(research_id)
+        rows = sorted(request_list(s, research_id, at_seq), key=lambda row: row["arbitration_id"])
+        rows = [row for row in rows if (not scope_kind or row.get("scope_kind") == scope_kind)
+                and (not scope_id or row.get("scope_id") == scope_id) and (not status or row["status"] == status)
+                and (not after or row["arbitration_id"] > after)]
+        return _public({"items": rows[:limit], "next_cursor": rows[limit - 1]["arbitration_id"] if len(rows) > limit else None})
+
+    @app.get("/api/research/{research_id}/arbitrations/{arbitration_id}")
+    def arbitration_detail(research_id: str, arbitration_id: str, at_seq: int | None = Query(default=None, ge=0)):
+        s = store()
+        s.project(research_id)
+        request = s.get("arbitration_request", arbitration_id)
+        if not request or request.get("research_id") != research_id:
+            raise StoreError("arbitration_not_found", "该研究中找不到仲裁请求", 404)
+        detail = request_detail(s, research_id, request, at_seq)
+        if detail is None:
+            raise StoreError("arbitration_not_found", "当前回放位置尚无该仲裁请求", 404)
+        return _public(detail)
 
     @app.get("/api/research/{research_id}/timeline")
     def timeline(research_id: str, after: int = 0, limit: int = 200, detail: bool = False):
@@ -448,7 +483,8 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
     @app.get("/api/research/{research_id}/conversations")
-    def conversations(research_id: str, agent_id: str | None = None, group_id: str | None = None, kind: str | None = None, line_id: str | None = None):
+    def conversations(research_id: str, agent_id: str | None = None, group_id: str | None = None, kind: str | None = None, line_id: str | None = None,
+                      at_seq: int | None = Query(default=None, ge=0)):
         s = store()
         s.project(research_id)
         items = s.list("conversation", research_id)
@@ -472,11 +508,20 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
                               substr(:identity,1,length(json_extract(r.value,'$.id'))+1)=json_extract(r.value,'$.id')||'/'))
                     )""", {"research": research_id, "identity": identity})}
             items = [x for x in items if x["conversation_id"] in ids or identity in x.get("group_ids", [])
-                     or any((p.get("id") if isinstance(p, dict) else p) == identity for p in x.get("participants", []))]
+                     or any((p.get("id", "") if isinstance(p, dict) else p) == identity or
+                            (p.get("id", "") if isinstance(p, dict) else p).startswith(identity + "/")
+                            for p in x.get("participants", []))]
+        if at_seq is not None:
+            with s.connect() as c:
+                row = c.execute("SELECT data FROM events WHERE research_id=? AND seq<=? ORDER BY seq DESC LIMIT 1", (research_id, at_seq)).fetchone()
+            cutoff = json.loads(row[0])["occurred_at"] if row else s.project(research_id)["created_at"]
+            visible_arbitrations = {row["conversation_id"] for row in request_list(s, research_id, at_seq)}
+            items = [item for item in items if item.get("created_at", "") <= cutoff and
+                     (":god:" not in item["conversation_id"] or item["conversation_id"] in visible_arbitrations)]
         for item in items:
-            latest = s.messages(item["conversation_id"], limit=1)["items"]
+            latest = s.messages(item["conversation_id"], limit=1, at_seq=at_seq)["items"]
             item["last_message"] = latest[-1] if latest else None
-        return {"items": items}
+        return _public({"items": items})
 
     @app.get("/api/conversations/{conversation_id:path}/messages")
     def conversation_messages(conversation_id: str, before: int | None = None, limit: int = 50, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):
@@ -501,7 +546,8 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
     def agent_executions(research_id: str, agent_id: str):
         s = store()
         s.project(research_id)
-        return {"items": s.list("execution", research_id, agent_id=agent_id) + s.list("agent_execution", research_id, agent_id=agent_id)}
+        executions = s.list("execution", research_id) + s.list("agent_execution", research_id)
+        return _public({"items": [x for x in executions if x.get("agent_id") == agent_id or x.get("agent_id", "").startswith(agent_id + "/")]})
 
     @app.get("/api/research/{research_id}/edges/{edge_id:path}/messages")
     def edge_messages(research_id: str, edge_id: str, before: int | None = None, limit: int = 100, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):

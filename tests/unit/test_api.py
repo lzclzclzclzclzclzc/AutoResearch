@@ -80,6 +80,8 @@ def test_local_session_and_csrf_reject_foreign_requests(tmp_path):
     assert c.get("/api/session", headers={"Origin": "https://evil.example"}).status_code == 403
 
 
+
+
 def test_manual_name_and_history_configuration_are_independent_and_frozen(tmp_path):
     c, app = client(tmp_path)
     body = {"title": "  论文基线对照  ", "topic": "很长的研究指令，与任务名称不同", "description": "约束",

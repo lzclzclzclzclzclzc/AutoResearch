@@ -25,6 +25,15 @@
 .record-delete-confirm strong{overflow-wrap:anywhere}
 .record-delete-confirm p{margin:6px 0 0;color:var(--muted);font-size:13px}
 #history-config{width:100%;text-overflow:ellipsis}
+.arbitration-details{padding:16px 18px;overflow:auto;flex:1;font-size:12px;line-height:1.7}
+.arbitration-details>p{margin:0 0 12px}.arbitration-details h3{font-size:13px;margin:16px 0 8px}.arbitration-details h4{font-size:12px;margin:12px 0 4px}
+.arbitration-details details{margin-top:12px}.arbitration-details summary{cursor:pointer}.arbitration-details ul{padding-left:18px}
+.arbitration-list{display:flex;flex-direction:column;margin-bottom:16px;border-bottom:1px solid var(--border)}
+.arbitration-list>button{display:flex;flex-direction:column;align-items:flex-start;gap:3px;padding:10px;background:none;border:0;border-top:1px solid var(--border);text-align:left;font-size:12px;overflow-wrap:anywhere}
+.arbitration-list>button.selected{background:var(--active)}.arbitration-list span{font-size:11px;color:var(--muted)}
+.arbitration-facts{margin:0}.arbitration-facts>div{display:grid;grid-template-columns:65px minmax(0,1fr);gap:10px;padding:5px 0}.arbitration-facts dt{color:var(--muted)}.arbitration-facts dd{margin:0;overflow-wrap:anywhere}
+.message-provenance{display:flex;align-items:center;gap:4px;font-size:11px;margin-top:8px;color:var(--muted)}
+.node-dot.arbitrating{background:var(--accent)}
 @media(max-width:640px){.record-delete-confirm{align-items:stretch;flex-direction:column}.record-delete-confirm .record-actions{justify-content:flex-start}}
 @media(max-width:767px){.project-row{grid-template-columns:minmax(0,1fr) 84px 66px}.project-row>.record-actions{grid-column:3;grid-row:1}}
 @media(min-width:768px){.project-row{grid-template-columns:minmax(160px,1fr) 100px 120px 150px 66px}}

@@ -45,6 +45,8 @@ export const label = (value?: string) => ({
   exploring: '探索中', criticizing: '审查中', implementing: '实现中', awaiting_boss: '等待 Boss',
   exploration:'探索中',critic:'审查中',implementation:'实现中',organizer:'资源安排中',verify:'验证中',waiting_boss:'等待 Boss',waiting_resources:'等待资源',
   verification_pending: '待验证', passed: '通过', rejected: '未通过', pending: '待处理',
+  arbitrating:'God 正在仲裁',waiting_subtasks:'正在执行拆分任务',waiting_recovery:'等待自动恢复',
+  retry_wait:'暂时故障，自动重试中',waiting_dependencies:'等待内部依赖，由 Boss 协调',all_lines_blocked:'所有未完成研究线均已阻塞',
   live: '真实运行', demo: '演示模式', stopped: '执行已停止', quarantined: '已隔离',
   unknown:'状态待核验',registered:'已登记',reconciling:'正在对账',early_stopped:'提前停止',execution_failed:'执行失败',
   no_improvement:'无提升',negative:'负结果',inconclusive:'尚无定论',improvement:'有提升',
