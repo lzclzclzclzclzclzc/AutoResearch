@@ -75,11 +75,14 @@ async def test_blockers_get_revision_opportunity_before_vote_and_cannot_be_omitt
             else:
                 with pytest.raises(RuntimeBlocked, match="fix-validation") as error:
                     await engine.discussions.run(*args)
-                assert error.value.code == "design_deadlock"
+                assert error.value.code == "arbitration_needs_external_input"
+                request = store.list("arbitration_request", p["id"])[0]
+                assert request["reason_code"] == "design_deadlock"
+                assert request["status"] == "needs_external_input"
                 assert not any(c[0] == "Vote" for c in calls)
             assert maximum == 1
             messages = store.messages("test-discussion:serial-v2", limit=200)["items"]
-            assert len(messages) == len([c for c in calls if c[0] != "Willingness"])
+            assert len(messages) == len([c for c in calls if c[0] not in {"Willingness", "GodDecision"}])
             assert all('"score"' not in m["content_markdown"] for m in messages)
             assert any(observed_context) and all(m["speaker"] for ctx in observed_context for m in ctx)
             selections = store.list("discussion_selection", p["id"])

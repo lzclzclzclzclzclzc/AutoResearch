@@ -28,15 +28,20 @@ async def test_truncated_turn_gets_more_room_without_becoming_a_json_repair(tmp_
         async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
             engine = ResearchEngine(store, control, None, None, saver)
             engine.demo = Adapter()
+            escalations = []
+            async def recover(*args, **kwargs):
+                assert not engine.agent_turn_locks[(project["id"], "boss/member-01")].locked()
+                escalations.append(kwargs)
+                return {"score": 75} if private else {"content_markdown": "complete reply"}
+            engine.arbitration.repair_turn = recover
             args = (project["id"], "boss/member-01", "boss", "limits", "first", Willingness if private else MessageReply, {})
             try:
+                result = await engine.turn(*args, publish_message=not private)
+                assert result == ({"score": 75} if private else {"content_markdown": "complete reply"})
+                assert len(escalations) == int(always_truncated)
                 if always_truncated:
-                    with pytest.raises(RuntimeBlocked, match="131072") as error:
-                        await engine.turn(*args, publish_message=not private)
-                    assert error.value.code == "model_output_truncated"
-                else:
-                    result = await engine.turn(*args, publish_message=not private)
-                    assert result == ({"score": 75} if private else {"content_markdown": "complete reply"})
+                    assert escalations[0]["reason_code"] == "model_output_truncated"
+                    assert escalations[0]["diagnostic"]["max_output_tokens"] == 131072
                 limits = [call["runtime_context"]["max_output_tokens"] for call in calls]
                 assert limits == ([16384, 32768, 65536, 131072] if always_truncated else [16384, 32768] if private else [65536, 131072])
                 assert len({call["turn_id"] for call in calls}) == len(calls)
