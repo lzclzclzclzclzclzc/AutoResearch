@@ -19,6 +19,10 @@ def messages_base_url(base_url: str | None = None) -> str:
             and parts.port in {None, 443} and parts.path in {"", "/v1"}
             and not parts.username and not parts.password and not parts.query and not parts.fragment):
         return urlunsplit((parts.scheme, parts.netloc, "/anthropic", "", ""))
+    if (parts.scheme == "https" and parts.hostname in {"autodl.art", "www.autodl.art"}
+            and parts.port in {None, 443} and parts.path == "/api/v1"
+            and not parts.username and not parts.password and not parts.query and not parts.fragment):
+        return urlunsplit((parts.scheme, parts.netloc, "/api/v1/anthropic", "", ""))
     return value
 
 

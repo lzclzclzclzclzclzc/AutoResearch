@@ -19,3 +19,10 @@ def test_saved_official_chat_roots_resolve_to_messages_api(saved):
 ])
 def test_custom_prefixes_and_explicit_versions_are_not_rewritten(base, expected):
     assert messages_url(base) == expected
+
+
+@pytest.mark.parametrize("hostname", ["autodl.art", "www.autodl.art"])
+def test_autodl_openai_root_uses_its_messages_endpoint(hostname):
+    assert messages_url(f"https://{hostname}/api/v1/") == f"https://{hostname}/api/v1/anthropic/v1/messages"
+    assert messages_base_url(f"https://{hostname}/api/v1/anthropic") == f"https://{hostname}/api/v1/anthropic"
+    assert messages_url(f"https://{hostname}/api/v1/anthropic/v1") == f"https://{hostname}/api/v1/anthropic/v1/messages"
