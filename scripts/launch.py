@@ -19,6 +19,32 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+class WorkerWatchdog:
+    """Restart only an exited Worker; its exclusive lock and recovery fence admission."""
+    def __init__(self):
+        self.retry_at = None
+        self.delay = 1
+        self.started_at = time.monotonic()
+
+    def check(self, process, restart, current_time=None):
+        current_time = time.monotonic() if current_time is None else current_time
+        if process is None:
+            return False
+        if process.poll() is None:
+            if current_time - self.started_at >= 60:
+                self.delay = 1
+            return False
+        if self.retry_at is None:
+            self.retry_at = current_time + self.delay
+            self.delay = min(30, self.delay * 2)
+        if current_time < self.retry_at:
+            return False
+        restart()
+        self.retry_at = None
+        self.started_at = current_time
+        return True
+
+
 def request(url, token, body=None, timeout=1.5):
     req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
         headers={"Content-Type": "application/json", "X-AutoResearch-Token": token})
@@ -69,7 +95,8 @@ def main():
         "AUTORESEARCH_SESSION_TOKEN": token, "AUTORESEARCH_DATA_DIR": str(directory),
         "AUTORESEARCH_CONTROL_URL": control_url, "AUTORESEARCH_RUNNER_URL": runner_url,
         "LANGCHAIN_TRACING_V2": "false", "LANGSMITH_TRACING": "false"}
-    children, logs = {}, []
+    children, logs = {}, {}
+    worker_watchdog = WorkerWatchdog()
     shutdown = False
     def signal_stop(*_):
         nonlocal shutdown
@@ -78,12 +105,18 @@ def main():
     signal.signal(signal.SIGTERM, signal_stop)
 
     def spawn(name, argv):
+        if name in logs:
+            logs[name].close()
         log = (directory / f"{name}.log").open("ab", buffering=0)
-        logs.append(log)
+        logs[name] = log
         children[name] = subprocess.Popen([sys.executable, *argv], cwd=ROOT, env=env,
             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         return children[name]
+
+    def spawn_worker():
+        return spawn("worker", ["-m", "backend.runtime.worker", "--data-dir", str(directory),
+            "--control-url", control_url, "--runner-url", runner_url])
 
     def ready(name, url):
         until = time.monotonic() + 25
@@ -108,7 +141,7 @@ def main():
             try:
                 spawn("runner", ["-m", "backend.runtime.runner", "--data-dir", str(directory), "--port", str(args.runner_port), "--control-url", control_url])
                 ready("runner", f"{runner_url}/health")
-                spawn("worker", ["-m", "backend.runtime.worker", "--data-dir", str(directory), "--control-url", control_url, "--runner-url", runner_url])
+                spawn_worker()
             except RuntimeError as error:
                 print(f"运行组件未就绪：{error}；停止与诊断入口继续提供服务。", flush=True)
             print(f"AutoResearch: {api_url}\n按 Ctrl+C 停止服务与在途研究。", flush=True)
@@ -121,6 +154,8 @@ def main():
                 if children["api"].poll() is not None:
                     print("API 退出；独立控制仍可清理研究。正在关闭本次服务。", flush=True)
                     break
+                if worker_watchdog.check(children.get("worker"), spawn_worker):
+                    print("Worker 已退出，正在恢复执行状态并重新调度；详情见 worker.log。", flush=True)
                 time.sleep(.5)
         finally:
             # This only uses control's in-memory registry, never business SQLite.
@@ -141,7 +176,7 @@ def main():
                         terminate_identity(process.pid, psutil.Process(process.pid).create_time())
                     except (OSError, psutil.Error):
                         pass
-            for log in logs:
+            for log in logs.values():
                 log.close()
 
 

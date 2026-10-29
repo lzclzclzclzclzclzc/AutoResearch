@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import inspect
 import os
 import signal
 import sys
@@ -176,33 +177,30 @@ async def migrate_arbitrable_tasks(engine, graphs, dry_run=False):
     return proposals
 
 
+async def retry_startup(operation, stop=None):
+    """Retry initialization under the Worker lock, before any task admission."""
+    delay = .4
+    while True:
+        if stop and stop.is_set():
+            raise asyncio.CancelledError
+        try:
+            result = operation()
+            return await result if inspect.isawaitable(result) else result
+        except Exception as error:
+            if not retryable_failure(error):
+                raise
+            print(json.dumps({"event": "worker_startup_retry", "code": getattr(error, "code", type(error).__name__)}), flush=True)
+            if stop:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(delay)
+            delay = min(5, delay * 2)
 
 
-
-
-async def run_worker(data_dir, control_url, runner_url):
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    from backend.graphs.engine import ResearchEngine
-    from backend.graphs.tasks import BossDecisionGraph, PaperGraph, ResearchSupervisorGraph, CommunicationGraph, DecompositionPartGraph, RecoveryRoleGraph
-    from backend.runtime.control import ControlClient, ControlUnavailable
-    from backend.runtime.runner import RunnerClient
-    from backend.services.credentials import CredentialService
-
-    store = Store(data_dir)
-    control, runner = ControlClient(control_url), RunnerClient(runner_url)
-    credentials = CredentialService(data_dir, store)
-    await asyncio.to_thread(store.recover_confirmed_operations, control)
-    owner = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    stop = asyncio.Event()
-    def shutdown(*_):
-        stop.set()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, shutdown)
-    active = {}
-    last_confirmation_recovery = time.monotonic()
-    handoff_drain, last_handoff_drain = None, 0
-    # A previous SDK owner cannot survive unnoticed. Its children also have an
-    # owner-death watchdog; unknown process identities keep execution blocked.
+async def reconcile_worker_executions(store):
     for execution in store.list("execution"):
         if execution.get("status") in {"registered", "running", "unknown"}:
             pid = execution.get("pid")
@@ -216,8 +214,34 @@ async def run_worker(data_dir, control_url, runner_url):
                     else:
                         confirmed = False
             store.patch("execution", execution["id"], status="interrupted" if confirmed else "unknown")
-    await recover_arbitration_leases(store, control)
-    await recover_running_tasks(store, control)
+
+
+async def run_worker(data_dir, control_url, runner_url):
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from backend.graphs.engine import ResearchEngine
+    from backend.graphs.tasks import BossDecisionGraph, PaperGraph, ResearchSupervisorGraph, CommunicationGraph, DecompositionPartGraph, RecoveryRoleGraph
+    from backend.runtime.control import ControlClient, ControlUnavailable
+    from backend.runtime.runner import RunnerClient
+    from backend.services.credentials import CredentialService
+
+    stop = asyncio.Event()
+    def shutdown(*_):
+        stop.set()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, shutdown)
+    store = await retry_startup(lambda: asyncio.to_thread(Store, data_dir), stop)
+    control, runner = ControlClient(control_url), RunnerClient(runner_url)
+    credentials = CredentialService(data_dir, store)
+    await retry_startup(lambda: asyncio.to_thread(store.recover_confirmed_operations, control), stop)
+    owner = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    active = {}
+    last_confirmation_recovery = time.monotonic()
+    handoff_drain, last_handoff_drain = None, 0
+    # A previous SDK owner cannot survive unnoticed. Its children also have an
+    # owner-death watchdog; unknown process identities keep execution blocked.
+    await retry_startup(lambda: reconcile_worker_executions(store), stop)
+    await retry_startup(lambda: recover_arbitration_leases(store, control), stop)
+    await retry_startup(lambda: recover_running_tasks(store, control), stop)
 
     async with AsyncSqliteSaver.from_conn_string(str(Path(data_dir).resolve() / "checkpoints.sqlite")) as saver:
         engine = ResearchEngine(store, control, runner, credentials, saver)
@@ -226,9 +250,9 @@ async def run_worker(data_dir, control_url, runner_url):
                   "communication": CommunicationGraph(engine.communication, saver),
                   "decomposition_part": DecompositionPartGraph(engine.decompositions.execute_part, saver),
                   "recovery_role": RecoveryRoleGraph(engine.decompositions.execute_evidence, saver)}
-        await migrate_arbitrable_tasks(engine, graphs)
-        await recover_infrastructure_tasks(store, control)
-        await engine.dependencies.recover_legacy()
+        await retry_startup(lambda: migrate_arbitrable_tasks(engine, graphs), stop)
+        await retry_startup(lambda: recover_infrastructure_tasks(store, control), stop)
+        await retry_startup(lambda: engine.dependencies.recover_legacy(), stop)
         capacity = max(1, int(os.environ.get("AUTORESEARCH_WORKER_CONCURRENCY", "32")))
         deferred_retries = {}
         async def execute_once(task):
