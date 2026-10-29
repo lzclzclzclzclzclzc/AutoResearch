@@ -7,6 +7,7 @@ import mimetypes
 import os
 import shutil
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -14,6 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from backend.persistence.event_views import ACTIVITY_FILTER, project_tool_calls
+from backend.persistence.arbitration_store import ArbitrationStoreMixin
+from backend.persistence.resilience import is_storage_busy
+from backend.persistence.runtime_recovery import RuntimeRecoveryStoreMixin
+
+
+_writer_locks = {}
+_writer_locks_guard = threading.Lock()
 
 
 def utcnow() -> datetime:
@@ -48,12 +56,14 @@ DEFAULT_TEAM = {"n": 2, "m1": 2, "m2": 2, "k": 3, "boss_members": 3,
                 "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1}
 
 
-class Store:
+class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
     def __init__(self, data_dir: str | Path = "data"):
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "artifacts").mkdir(exist_ok=True)
         self.path = self.data_dir / "business.sqlite"
+        with _writer_locks_guard:
+            self._write_lock = _writer_locks.setdefault(os.path.normcase(str(self.path)), threading.RLock())
         with self.connect() as c:
             c.executescript("""
             PRAGMA journal_mode=WAL;
@@ -99,6 +109,8 @@ class Store:
                 result TEXT NOT NULL, PRIMARY KEY(scope,request_id));
             """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(research_id,json_extract(data,'$.type'),seq)")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_arbitration_request_key ON documents(json_extract(data,'$.request_key')) WHERE kind='arbitration_request' AND json_extract(data,'$.request_key') IS NOT NULL")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_arbitration_scope ON documents(research_id,json_extract(data,'$.scope_id'),json_extract(data,'$.status')) WHERE kind='arbitration_request'")
             c.execute(f"CREATE INDEX IF NOT EXISTS idx_events_activity ON events(research_id,seq) WHERE {ACTIVITY_FILTER}")
         if not self.get("settings", "team"):
             self.put("settings", "team", {**DEFAULT_TEAM, "version": 1})
@@ -110,22 +122,34 @@ class Store:
 
     @contextmanager
     def connect(self, write: bool = False):
-        c = sqlite3.connect(self.path, timeout=3, isolation_level=None)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA foreign_keys=ON")
-        c.execute("PRAGMA busy_timeout=3000")
+        # The gateway and orchestration threads share a bounded writer queue.
+        # SQLite still arbitrates writers in the API/Runner/other processes.
+        locked, c = False, None
         try:
+            if write:
+                locked = self._write_lock.acquire(timeout=3)
+                if not locked:
+                    raise StoreError("storage_busy", "研究记录正在写入，稍后自动重试", 503)
+            c = sqlite3.connect(self.path, timeout=3, isolation_level=None)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys=ON")
+            c.execute("PRAGMA busy_timeout=3000")
             if write:
                 c.execute("BEGIN IMMEDIATE")
             yield c
             if write:
                 c.commit()
-        except Exception:
-            if write:
+        except Exception as error:
+            if write and c is not None:
                 c.rollback()
+            if is_storage_busy(error) and not isinstance(error, StoreError):
+                raise StoreError("storage_busy", "研究记录正在写入，稍后自动重试", 503) from error
             raise
         finally:
-            c.close()
+            if c is not None:
+                c.close()
+            if locked:
+                self._write_lock.release()
 
     transaction = connect
 
@@ -137,7 +161,8 @@ class Store:
         existing = self._get(c, kind, object_id)
         if existing and research_id and existing.get("research_id") not in {None, research_id}:
             raise StoreError("cross_project_reference", "记录不属于当前研究", 403)
-        if existing and kind in {"submission", "spec", "experiment_spec", "memory_version", "verification", "report_snapshot"}:
+        if existing and kind in {"submission", "spec", "experiment_spec", "memory_version", "verification", "report_snapshot",
+                                 "arbitration_snapshot", "arbitration_decision", "arbitration_effect"}:
             ignore = {"id", "research_id"} if kind in {"spec", "experiment_spec"} else {"version", "id", "research_id"}
             original = {k:v for k,v in existing.items() if k not in ignore}
             supplied = {k:v for k,v in data.items() if k not in ignore}
@@ -774,12 +799,15 @@ class Store:
                 "status": "pending", "created_at": now(), "attempt": 0}, research_id)
 
     def pending_tasks(self, limit=100):
-        return [t for t in self.list("task") if t["status"] == "pending"][:limit]
+        return [t for t in self.list("task") if t["status"] == "pending" or
+                (t["status"] == "retry_wait" and t.get("retry_not_before", "") <= now())][:limit]
 
     def claim_task(self, task_id, owner):
         with self.connect(True) as c:
             t = self._get(c, "task", task_id)
-            if not t or t["status"] != "pending":
+            if not t or t["status"] not in {"pending", "retry_wait"}:
+                return None
+            if t["status"] == "retry_wait" and t.get("retry_not_before", "") > now():
                 return None
             return self._put(c, "task", task_id, {**t, "status": "running", "owner": owner,
                 "claimed_at": now(), "attempt": t.get("attempt", 0)+1}, t["research_id"])
@@ -1504,6 +1532,8 @@ class Store:
                 evidence = [frozen["submission"]["id"]] if isinstance(frozen.get("submission"), dict) and frozen["submission"].get("id") else []
                 self._put(c, "report_snapshot", snapshot_id, {"snapshot": frozen, "evidence_ids": evidence}, research_id)
                 task(snapshot_id, "paper", {"snapshot_id": snapshot_id})
+            self._apply_confirmed_arbitration_finish(c, research_id, decision_task_id, candidate,
+                receipt, operation["id"], dispatch_allowed)
             if dispatch_allowed:
                 for identity in candidate["ending"]:
                     current = self._get(c, "line", f"{research_id}:{identity}")
@@ -1511,8 +1541,10 @@ class Store:
                         "finish_requested": True, "scientific_end_requested": True, "boss_decision_id": decision_task_id}, research_id)
                     self._emit(c, research_id, "line.phase_changed", {"phase": "completed", "direction_epoch": current["direction_epoch"],
                         "cycle_id": current.get("cycle_id"), "finish_requested": True}, line_id=identity, cycle_id=current.get("cycle_id"))
+                    self._cancel_recovery(c, research_id, identity, reason="direction_finished")
                 if candidate["action"] == "finish_project":
                     self._update_project(c, research_id, finish_requested=True, scientific_end_requested=True)
+                    self._cancel_recovery(c, research_id, reason="research_finished")
             result = self._put(c, "boss_effects", decision_task_id, {"status": "applied", "operation_id": operation["id"],
                 "task_ids": created_tasks, "cycle_ids": cycles, "finish_line_ids": candidate["ending"],
                 "dispatch_allowed": dispatch_allowed, "receipt": receipt}, research_id)
@@ -1562,8 +1594,9 @@ class Store:
                 for kind in ("task", "outbox"):
                     for row in c.execute("SELECT id,data FROM documents WHERE kind=? AND research_id=?", (kind, research_id)).fetchall():
                         value = json.loads(row["data"])
-                        if value.get("status") in {"pending", "running"}:
+                        if value.get("status") in {"pending", "running", "waiting_recovery", "retry_wait"}:
                             self._put(c, kind, row["id"], {**value, "status": "cancelled"}, research_id)
+                self._cancel_recovery(c, research_id, reason="research_stopped")
             # Resource allocations must be reconciled before reporting full termination.
             active = [json.loads(r[0]) for r in c.execute("SELECT data FROM documents WHERE kind='allocation' AND research_id=?", (research_id,))]
             light_jobs = [json.loads(r[0]) for r in c.execute("SELECT data FROM documents WHERE kind='light_cpu' AND research_id=?", (research_id,))]

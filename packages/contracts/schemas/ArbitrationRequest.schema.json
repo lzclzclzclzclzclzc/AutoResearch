@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Program-owned recovery identity. Model output cannot change these boundaries.",
+  "properties": {
+    "arbitration_id": {
+      "title": "Arbitration Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "policy_version": {
+      "default": 1,
+      "title": "Policy Version",
+      "type": "integer"
+    },
+    "research_id": {
+      "title": "Research Id",
+      "type": "string"
+    },
+    "source_task_id": {
+      "title": "Source Task Id",
+      "type": "string"
+    },
+    "scope_kind": {
+      "enum": [
+        "discussion",
+        "implementation",
+        "boss_assignment",
+        "turn_output",
+        "decomposition"
+      ],
+      "title": "Scope Kind",
+      "type": "string"
+    },
+    "scope_id": {
+      "title": "Scope Id",
+      "type": "string"
+    },
+    "origin_node": {
+      "title": "Origin Node",
+      "type": "string"
+    },
+    "origin_checkpoint": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Origin Checkpoint"
+    },
+    "reason_code": {
+      "enum": [
+        "decision_blocked",
+        "design_deadlock",
+        "invalid_group_decision",
+        "invalid_boss_assignment",
+        "invalid_output",
+        "model_output_truncated"
+      ],
+      "title": "Reason Code",
+      "type": "string"
+    },
+    "failure_fingerprint": {
+      "title": "Failure Fingerprint",
+      "type": "string"
+    },
+    "scope_revision": {
+      "title": "Scope Revision",
+      "type": "string"
+    },
+    "direction_epoch": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Direction Epoch"
+    },
+    "control_generation": {
+      "title": "Control Generation",
+      "type": "integer"
+    },
+    "snapshot_id": {
+      "title": "Snapshot Id",
+      "type": "string"
+    },
+    "snapshot_hash": {
+      "title": "Snapshot Hash",
+      "type": "string"
+    },
+    "source_event_seq": {
+      "default": 0,
+      "title": "Source Event Seq",
+      "type": "integer"
+    },
+    "target_schema_name": {
+      "title": "Target Schema Name",
+      "type": "string"
+    },
+    "target_schema_hash": {
+      "title": "Target Schema Hash",
+      "type": "string"
+    },
+    "allowed_actions": {
+      "items": {
+        "enum": [
+          "select_candidate",
+          "repair_output",
+          "request_revision",
+          "request_evidence",
+          "decompose_task",
+          "finish_scope",
+          "needs_external_input"
+        ],
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Allowed Actions",
+      "type": "array"
+    },
+    "resume_point": {
+      "enum": [
+        "discussion.collect",
+        "discussion.synthesize",
+        "discussion.apply_resolution",
+        "boss.validate_assignment",
+        "line.implement",
+        "engine.validate_output",
+        "decomposition.merge"
+      ],
+      "title": "Resume Point",
+      "type": "string"
+    },
+    "provider_config_id": {
+      "title": "Provider Config Id",
+      "type": "string"
+    },
+    "credential_version": {
+      "title": "Credential Version",
+      "type": "integer"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "recovery_chain_id": {
+      "title": "Recovery Chain Id",
+      "type": "string"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "judge_deadline_at": {
+      "title": "Judge Deadline At",
+      "type": "string"
+    },
+    "expires_at": {
+      "title": "Expires At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "arbitration_id",
+    "research_id",
+    "source_task_id",
+    "scope_kind",
+    "scope_id",
+    "origin_node",
+    "reason_code",
+    "failure_fingerprint",
+    "scope_revision",
+    "control_generation",
+    "snapshot_id",
+    "snapshot_hash",
+    "target_schema_name",
+    "target_schema_hash",
+    "allowed_actions",
+    "resume_point",
+    "provider_config_id",
+    "credential_version",
+    "model",
+    "recovery_chain_id",
+    "created_at",
+    "judge_deadline_at",
+    "expires_at"
+  ],
+  "title": "ArbitrationRequest",
+  "type": "object"
+}

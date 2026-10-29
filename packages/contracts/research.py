@@ -4,9 +4,9 @@ import hashlib
 import json
 import math
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
 
 def digest(value: Any) -> str:
@@ -33,6 +33,7 @@ class Contract(BaseModel):
 
 
 class Role(StrEnum):
+    GOD = "god"
     EXPLORATION = "exploration"
     CRITIC = "critic"
     IMPLEMENTATION = "implementation"
@@ -228,6 +229,183 @@ class StageReport(Contract):
     content_markdown: str
     evidence_ids: list[str]
     limitations: list[str]
+
+
+ArbitrationAction = Literal["select_candidate", "repair_output", "request_revision", "request_evidence",
+                            "decompose_task", "finish_scope", "needs_external_input"]
+ArbitrationReason = Literal["decision_blocked", "design_deadlock", "invalid_group_decision",
+                            "invalid_boss_assignment", "invalid_output", "model_output_truncated"]
+
+
+class ArbitrationRequest(Contract):
+    """Program-owned recovery identity. Model output cannot change these boundaries."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    arbitration_id: str
+    schema_version: int = 1
+    policy_version: int = 1
+    research_id: str
+    source_task_id: str
+    scope_kind: Literal["discussion", "implementation", "boss_assignment", "turn_output", "decomposition"]
+    scope_id: str
+    origin_node: str
+    origin_checkpoint: str | None = None
+    reason_code: ArbitrationReason
+    failure_fingerprint: str
+    scope_revision: str
+    direction_epoch: int | None = None
+    control_generation: int
+    snapshot_id: str
+    snapshot_hash: str
+    source_event_seq: int = 0
+    target_schema_name: str
+    target_schema_hash: str
+    allowed_actions: list[ArbitrationAction] = Field(min_length=1)
+    resume_point: Literal["discussion.collect", "discussion.synthesize", "discussion.apply_resolution",
+                          "boss.validate_assignment", "line.implement", "engine.validate_output", "decomposition.merge"]
+    provider_config_id: str
+    credential_version: int
+    model: str
+    recovery_chain_id: str
+    created_at: str
+    judge_deadline_at: str
+    expires_at: str
+
+
+class DecompositionPart(Contract):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    part_id: str = Field(min_length=1)
+    target_role: str
+    instructions: str = Field(min_length=1)
+    input_refs: list[str] = Field(default_factory=list)
+    output_schema: dict[str, Any]
+    allowed_write_paths: list[str] = Field(min_length=1)
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class MergePlan(Contract):
+    strategy: Literal["json_fields", "markdown_sections", "files", "file_fragments"]
+    order: list[str] = Field(min_length=1)
+    base_output: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecompositionPlan(Contract):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    target_schema_hash: str
+    parts: list[DecompositionPart] = Field(min_length=1, max_length=8)
+    merge_plan: MergePlan
+    invariants: dict[str, Any] = Field(default_factory=dict)
+    acceptance_checks: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def bounded_dag(self):
+        parts = {p.part_id: p for p in self.parts}
+        if len(parts) != len(self.parts):
+            raise ValueError("Decomposition part IDs must be unique")
+        if len(self.merge_plan.order) != len(parts) or set(self.merge_plan.order) != set(parts):
+            raise ValueError("Merge order must include every part exactly once")
+        visiting, depths = set(), {}
+        def depth(identity):
+            if identity not in parts:
+                raise ValueError("Unknown decomposition dependency")
+            if identity in visiting:
+                raise ValueError("Decomposition dependencies must be acyclic")
+            if identity in depths:
+                return depths[identity]
+            visiting.add(identity)
+            value = 1 + max((depth(other) for other in parts[identity].depends_on), default=0)
+            visiting.remove(identity)
+            if value > 3:
+                raise ValueError("Decomposition dependency depth exceeds 3")
+            depths[identity] = value
+            return value
+        for part in self.parts:
+            if len(set(part.depends_on)) != len(part.depends_on):
+                raise ValueError("Repeated dependency")
+            if part.target_role not in {r.value for r in Role if r != Role.GOD}:
+                raise ValueError("Decomposition must use an existing research role")
+            depth(part.part_id)
+            for path in part.allowed_write_paths:
+                if not path.startswith("/") or ".." in path.split("/") or "\\" in path:
+                    raise ValueError("Write positions must be bounded JSON Pointers")
+                if path.split("/")[1] in {"research_id", "control_generation", "direction_epoch", "spec_id", "spec_hash", "fixed", "deadline_at"}:
+                    raise ValueError("Decomposition cannot overwrite frozen identity or settings")
+        owners = {}
+        for part in self.parts:
+            for path in part.allowed_write_paths:
+                if path in owners:
+                    raise ValueError("Each output position must have a unique owner")
+                if any(path.startswith(p + "/") or p.startswith(path + "/") for p in owners):
+                    raise ValueError("Overlapping output positions are not allowed")
+                owners[path] = part.part_id
+        return self
+
+
+class GodDecisionBase(Contract):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    arbitration_id: str
+    snapshot_hash: str
+    content_markdown: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    unresolved_issue_ids: list[str] = Field(default_factory=list)
+
+
+class SelectCandidateDecision(GodDecisionBase):
+    action: Literal["select_candidate"]
+    selected_candidate_id: str
+    minority_views: list[str] = Field(default_factory=list)
+
+
+class RepairOutputDecision(GodDecisionBase):
+    action: Literal["repair_output"]
+    target_schema_hash: str
+    output: dict[str, Any]
+    source_fields: list[str] = Field(default_factory=list)
+
+
+class RequestRevisionDecision(GodDecisionBase):
+    action: Literal["request_revision"]
+    target_role: str
+    instructions: str = Field(min_length=1)
+    allowed_changes: list[str] = Field(min_length=1)
+    acceptance_checks: list[str] = Field(min_length=1)
+
+
+class RequestEvidenceDecision(GodDecisionBase):
+    action: Literal["request_evidence"]
+    target_role: str
+    question: str = Field(min_length=1)
+    source_refs: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(min_length=1)
+    result_requirements: list[str] = Field(min_length=1)
+    dependency_line_ids: list[str] = Field(default_factory=list)
+
+
+class DecomposeTaskDecision(GodDecisionBase):
+    action: Literal["decompose_task"]
+    plan: DecompositionPlan
+
+
+class FinishScopeDecision(GodDecisionBase):
+    action: Literal["finish_scope"]
+    line_id: str | None = None
+    existing_result_refs: list[str] = Field(default_factory=list)
+
+
+class NeedsExternalInputDecision(GodDecisionBase):
+    action: Literal["needs_external_input"]
+    missing_items: list[str] = Field(min_length=1)
+    why_unavailable: str = Field(min_length=1)
+    operation: str = Field(min_length=1)
+    dependency_line_ids: list[str] = Field(default_factory=list)
+
+
+class GodDecision(RootModel[Annotated[SelectCandidateDecision | RepairOutputDecision | RequestRevisionDecision |
+        RequestEvidenceDecision | DecomposeTaskDecision | FinishScopeDecision | NeedsExternalInputDecision,
+        Field(discriminator="action")]]):
+    """The serialized representation is the flat, discriminated action object."""
+    pass
 
 
 def assert_spec_unchanged(spec: ExperimentSpec, implementation: Implementation) -> None:

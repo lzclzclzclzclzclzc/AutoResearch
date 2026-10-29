@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arbitration_id": {
+      "title": "Arbitration Id",
+      "type": "string"
+    },
+    "snapshot_hash": {
+      "title": "Snapshot Hash",
+      "type": "string"
+    },
+    "content_markdown": {
+      "minLength": 1,
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "rationale": {
+      "minLength": 1,
+      "title": "Rationale",
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Limitations",
+      "type": "array"
+    },
+    "unresolved_issue_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unresolved Issue Ids",
+      "type": "array"
+    },
+    "action": {
+      "const": "request_evidence",
+      "title": "Action",
+      "type": "string"
+    },
+    "target_role": {
+      "title": "Target Role",
+      "type": "string"
+    },
+    "question": {
+      "minLength": 1,
+      "title": "Question",
+      "type": "string"
+    },
+    "source_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Source Refs",
+      "type": "array"
+    },
+    "steps": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Steps",
+      "type": "array"
+    },
+    "result_requirements": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Result Requirements",
+      "type": "array"
+    },
+    "dependency_line_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Dependency Line Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "arbitration_id",
+    "snapshot_hash",
+    "content_markdown",
+    "rationale",
+    "action",
+    "target_role",
+    "question",
+    "steps",
+    "result_requirements"
+  ],
+  "title": "RequestEvidenceDecision",
+  "type": "object"
+}

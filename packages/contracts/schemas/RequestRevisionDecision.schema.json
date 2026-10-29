@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arbitration_id": {
+      "title": "Arbitration Id",
+      "type": "string"
+    },
+    "snapshot_hash": {
+      "title": "Snapshot Hash",
+      "type": "string"
+    },
+    "content_markdown": {
+      "minLength": 1,
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "rationale": {
+      "minLength": 1,
+      "title": "Rationale",
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Limitations",
+      "type": "array"
+    },
+    "unresolved_issue_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unresolved Issue Ids",
+      "type": "array"
+    },
+    "action": {
+      "const": "request_revision",
+      "title": "Action",
+      "type": "string"
+    },
+    "target_role": {
+      "title": "Target Role",
+      "type": "string"
+    },
+    "instructions": {
+      "minLength": 1,
+      "title": "Instructions",
+      "type": "string"
+    },
+    "allowed_changes": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Allowed Changes",
+      "type": "array"
+    },
+    "acceptance_checks": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Acceptance Checks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "arbitration_id",
+    "snapshot_hash",
+    "content_markdown",
+    "rationale",
+    "action",
+    "target_role",
+    "instructions",
+    "allowed_changes",
+    "acceptance_checks"
+  ],
+  "title": "RequestRevisionDecision",
+  "type": "object"
+}

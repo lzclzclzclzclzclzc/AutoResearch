@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arbitration_id": {
+      "title": "Arbitration Id",
+      "type": "string"
+    },
+    "snapshot_hash": {
+      "title": "Snapshot Hash",
+      "type": "string"
+    },
+    "content_markdown": {
+      "minLength": 1,
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "rationale": {
+      "minLength": 1,
+      "title": "Rationale",
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Limitations",
+      "type": "array"
+    },
+    "unresolved_issue_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unresolved Issue Ids",
+      "type": "array"
+    },
+    "action": {
+      "const": "needs_external_input",
+      "title": "Action",
+      "type": "string"
+    },
+    "missing_items": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Missing Items",
+      "type": "array"
+    },
+    "why_unavailable": {
+      "minLength": 1,
+      "title": "Why Unavailable",
+      "type": "string"
+    },
+    "operation": {
+      "minLength": 1,
+      "title": "Operation",
+      "type": "string"
+    },
+    "dependency_line_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Dependency Line Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "arbitration_id",
+    "snapshot_hash",
+    "content_markdown",
+    "rationale",
+    "action",
+    "missing_items",
+    "why_unavailable",
+    "operation"
+  ],
+  "title": "NeedsExternalInputDecision",
+  "type": "object"
+}
