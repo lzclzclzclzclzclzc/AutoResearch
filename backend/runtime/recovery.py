@@ -9,6 +9,9 @@ from backend.persistence.resilience import is_storage_busy
 
 
 def retryable_failure(error):
+    from backend.runtime.control import ControlUnavailable
+    if isinstance(error, ControlUnavailable) and error.code == "control_unavailable":
+        return "local_service_unavailable", "本机控制或执行服务暂时不可用，确认执行状态后自动恢复"
     if is_storage_busy(error):
         return "storage_busy", "数据库写入暂时繁忙，保留检查点并自动重试"
     if getattr(error, "code", None) == "stream_recorder_unavailable":
@@ -18,7 +21,7 @@ def retryable_failure(error):
 
 def legacy_failure(store, task):
     error = task.get("error") or {}
-    if error.get("code") in {"storage_busy", "stream_recorder_unavailable"}:
+    if error.get("code") in {"storage_busy", "stream_recorder_unavailable", "local_service_unavailable"}:
         return error["code"], error.get("message", "基础设施恢复")
     if error.get("code") == "OperationalError":
         path = store.data_dir / "checkpoints.sqlite"
@@ -80,7 +83,7 @@ async def recover_infrastructure_tasks(store, control):
         project = store.project(task["research_id"])
         if project["status"] not in {"running", "blocked"} or project.get("stop_reason"):
             continue
-        if project["status"] == "blocked" and project.get("blocked_reason") != "all_lines_blocked" and (project.get("error") or {}).get("code") not in {"OperationalError", "storage_busy", "model_execution_failed", "stream_recorder_unavailable"}:
+        if project["status"] == "blocked" and project.get("blocked_reason") != "all_lines_blocked" and (project.get("error") or {}).get("code") not in {"OperationalError", "storage_busy", "model_execution_failed", "stream_recorder_unavailable", "local_service_unavailable"}:
             continue
         payload = task.get("payload", {})
         if payload.get("line_id"):

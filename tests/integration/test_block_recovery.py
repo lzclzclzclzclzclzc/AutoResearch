@@ -91,7 +91,7 @@ async def test_internal_dependency_runs_boss_after_parent_releases_slot_and_resu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_point", ["completion", "failure_handler"])
+@pytest.mark.parametrize("failure_point", ["completion", "failure_handler", "control"])
 async def test_worker_retries_failed_completion_without_repeating_completed_model(tmp_path, monkeypatch, failure_point):
     import backend.graphs.engine as engine_module
     import backend.runtime.control as control_module
@@ -107,6 +107,8 @@ async def test_worker_retries_failed_completion_without_repeating_completed_mode
     class Engine(ResearchEngine):
         async def paper(self, task):
             calls.append(task["id"])
+            if failure_point == "control" and len(calls) == 1:
+                raise control_module.ControlUnavailable("one lost admission response")
             result = await self.turn(p["id"], "paper", "paper", task["id"], "reply", MessageReply, {})
             if failure_point == "failure_handler" and len(calls) == 1:
                 raise RuntimeBlocked("fixture_failure", "fixture failure before recovery bookkeeping")
@@ -114,7 +116,7 @@ async def test_worker_retries_failed_completion_without_repeating_completed_mode
     original_finish = Store.finish_task
     failures = []
     def finish(self, task_id, *args, **kwargs):
-        if task_id == root["id"] and not failures:
+        if failure_point != "control" and task_id == root["id"] and not failures:
             failures.append(task_id)
             raise StoreError("storage_busy", "fixture lock", 503)
         return original_finish(self, task_id, *args, **kwargs)
@@ -130,7 +132,7 @@ async def test_worker_retries_failed_completion_without_repeating_completed_mode
                 if worker.done():
                     await worker
                 await asyncio.sleep(.05)
-        assert calls == [root["id"]] * (2 if failure_point == "failure_handler" else 1)
+        assert calls == [root["id"]] * (2 if failure_point in {"failure_handler", "control"} else 1)
         assert store.get("task", root["id"])["infrastructure_retries"] == 1
         assert len(store.list("execution", p["id"])) == 1
         assert any(e["type"] == "task.retry_wait" for e in store.events(p["id"]))

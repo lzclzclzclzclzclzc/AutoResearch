@@ -84,11 +84,13 @@ class ToolGateway:
                     result = gateway.call(capability, payload)
                     body, status = json.dumps(result, ensure_ascii=False).encode(), 200
                 except Exception as error:
+                    from backend.runtime.control import ControlUnavailable
                     busy = is_storage_busy(error)
-                    status = 503 if busy else 403 if isinstance(error, PermissionError) else 422
-                    body = json.dumps({"code": "storage_busy" if busy else "research_input_unavailable" if isinstance(error, InputAccessError) else "tool_rejected",
-                        "message": "研究记录暂时忙，使用同一请求重试" if busy else error.public_message if isinstance(error, InputAccessError) else "科研工具请求未获授权或参数无效",
-                        "retryable": busy}, ensure_ascii=False).encode()
+                    unavailable = isinstance(error, ControlUnavailable) and error.code == "control_unavailable"
+                    status = 503 if busy or unavailable else 403 if isinstance(error, PermissionError) else 422
+                    body = json.dumps({"code": "storage_busy" if busy else "local_service_unavailable" if unavailable else "research_input_unavailable" if isinstance(error, InputAccessError) else "tool_rejected",
+                        "message": "研究记录暂时忙，使用同一请求重试" if busy else "本机控制服务暂时不可用，稍后重试" if unavailable else error.public_message if isinstance(error, InputAccessError) else "科研工具请求未获授权或参数无效",
+                        "retryable": busy or unavailable}, ensure_ascii=False).encode()
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json; charset=utf-8")

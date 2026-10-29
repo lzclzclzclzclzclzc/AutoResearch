@@ -55,6 +55,25 @@ def test_role_and_stop_gates_cannot_be_bypassed(gateway):
         gateway.call(token, {"name": "read_shared_memory", "arguments": {}})
 
 
+def test_control_transport_loss_is_retryable_http_but_stop_is_not(gateway, monkeypatch):
+    import httpx
+    from backend.runtime.control import ControlUnavailable
+    server = ToolGateway(gateway.store, gateway.control, None)
+    server.project = gateway.project
+    token = capability(server, role="exploration")
+    payload = {"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 1,
+        "chunk": {"type": "text-delta", "text": "hello"}}}
+    def unreachable(*args):
+        raise ControlUnavailable("one lost Control response")
+    try:
+        monkeypatch.setattr(server.control, "allows_progress", unreachable)
+        response = httpx.post(server.url, json=payload, headers={"Authorization": "Bearer " + token})
+        assert response.status_code == 503 and response.json()["retryable"]
+        monkeypatch.setattr(server.control, "allows_progress", lambda *args: False)
+        response = httpx.post(server.url, json=payload, headers={"Authorization": "Bearer " + token})
+        assert response.status_code == 403 and not response.json()["retryable"]
+    finally:
+        server.close()
 
 
 def test_stream_cursor_replay_never_duplicates_the_cumulative_buffer(gateway):

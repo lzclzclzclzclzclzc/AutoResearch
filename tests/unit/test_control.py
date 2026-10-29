@@ -204,7 +204,11 @@ def test_corrupt_journal_and_unavailable_client_fail_closed(tmp_path):
         assert control.journal_unknown
         with pytest.raises(ControlUnavailable):
             control.register_project("new", time.time() + 60)
-        assert not ControlClient("http://127.0.0.1:1").allows_progress("new")
+        # Unknown transport state still forbids admission, while remaining
+        # distinguishable from Control's durable denial/termination decision.
+        with pytest.raises(ControlUnavailable) as unavailable:
+            ControlClient("http://127.0.0.1:1").allows_progress("new")
+        assert unavailable.value.code == "control_unavailable"
     finally:
         control.close()
 

@@ -478,6 +478,8 @@ def _request(url: str, body: dict | None = None, token: str | None = None, timeo
             detail = {}
         if detail.get("code") == "control_journal_incomplete":
             raise ControlUnavailable("控制日志存在未确认或损坏记录，启动门禁已关闭；请检查控制服务恢复状态。", "control_journal_incomplete") from exc
+        if 400 <= exc.code < 500 and exc.code not in {408, 429}:
+            raise ControlUnavailable("Local supervisor rejected the operation", "local_operation_rejected") from exc
         raise ControlUnavailable("Local supervisor is unavailable or rejected the operation") from exc
     except (OSError, ValueError) as exc:
         raise ControlUnavailable("Local supervisor is unavailable or rejected the operation") from exc
@@ -497,11 +499,10 @@ class ControlClient:
 
     def allows_progress(self, research_id: str, control_generation: int | None = None,
                         control_epoch: str | None = None) -> bool:
-        try:
-            return bool(self._post("/allows-progress", dict(research_id=research_id,
-                control_generation=control_generation, control_epoch=control_epoch), timeout=1)["allowed"])
-        except ControlUnavailable:
-            return False
+        # Transport failure is unknown admission, not a durable stop decision.
+        # Callers still fail closed, but can recover after Control is reachable.
+        return bool(self._post("/allows-progress", dict(research_id=research_id,
+            control_generation=control_generation, control_epoch=control_epoch), timeout=1)["allowed"])
 
     def status(self, research_id: str | None = None) -> dict:
         from urllib.parse import quote
