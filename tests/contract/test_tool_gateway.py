@@ -65,6 +65,7 @@ def test_stream_cursor_replay_never_duplicates_the_cumulative_buffer(gateway):
     gateway.call(token, {"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 2,
         "chunk": {"type": "text-delta", "text": 'world"}'}}})
     assert gateway.store.messages("conversation")["items"][0]["content_markdown"] == "hello world"
+    assert not any(event["type"] == "agent.output_delta" for event in gateway.store.events(gateway.project["id"]))
     with pytest.raises(ValueError, match="different content"):
         gateway.call(token, {"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 1,
             "chunk": {"type": "text-delta", "text": "changed"}}})
@@ -73,10 +74,12 @@ def test_stream_cursor_replay_never_duplicates_the_cumulative_buffer(gateway):
 def test_private_scheduling_cannot_publish_chat_or_call_research_tools(gateway):
     token = capability(gateway, role="boss")
     gateway.capabilities[token]["suppress_chat"] = True
+    before = gateway.store.events(gateway.project["id"])
     gateway.call(token, {"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 1,
         "chunk": {"type": "text-delta", "text": '{"content_markdown":"must remain private","score":99}'}}})
     assert not gateway.store.messages("conversation")["items"]
     assert gateway.last_message(token) is None
+    assert gateway.store.events(gateway.project["id"]) == before
     with pytest.raises(PermissionError, match="Private scheduling"):
         gateway.call(token, {"name": "send_research_message", "call_id": "private",
             "arguments": {"recipient_ids": ["boss"], "content_markdown": "unwanted score"}})

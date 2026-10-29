@@ -15,19 +15,39 @@ export function apply(ctx) {
   if (!endpoint?.startsWith('http://127.0.0.1:') || !token || !role) throw new Error('Missing bound research tool capability')
   let streamCount = 0
   // SDK 0.2.1rc2 forwards committed Session events but no provider text deltas.
-  // This public waterfall preserves the exact stream without rewriting it.
+  // Yield the exact provider stream, but record text in bounded batches. Stable
+  // Session tool/call and tool/result events carry complete tool arguments.
   ctx.on('llm/stream', async function* (options, next) {
     const streamId = ++streamCount
     let cursor = 0
-    for await (const chunk of next()) {
-      if (!options.purpose && ['text-delta', 'usage', 'finish', 'tool-call-delta'].includes(chunk.type)) {
-        const response = await fetch(endpoint, {
-          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ name: 'record_stream_event', arguments: { stream_id: streamId, cursor: ++cursor, chunk } }), signal: options.signal,
-        })
-        if (!response.ok) throw new Error('Research stream recorder is unavailable or stopped')
+    let pending = '', lastFlush = 0, started = false
+    const record = async chunk => {
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name: 'record_stream_event', arguments: { stream_id: streamId, cursor: ++cursor, chunk } }), signal: options.signal,
+      })
+      if (!response.ok) throw new Error('Research stream recorder is unavailable or stopped')
+    }
+    const flush = async () => {
+      if (!pending) return
+      await record({ type: 'text-delta', text: pending })
+      pending = ''; lastFlush = Date.now(); started = true
+    }
+    try {
+      for await (const chunk of next()) {
+        if (!options.purpose && process.env.AUTORESEARCH_PRIVATE_TURN !== '1') {
+          if (chunk.type === 'text-delta') {
+            pending += chunk.text
+            if (!started || pending.length >= 512 || Date.now() - lastFlush >= 250) await flush()
+          } else {
+            await flush()
+            if (['usage', 'finish'].includes(chunk.type)) await record(chunk)
+          }
+        }
+        yield chunk
       }
-      yield chunk
+    } finally {
+      if (!options.signal?.aborted) await flush()
     }
   })
   const definitions = [

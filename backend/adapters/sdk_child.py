@@ -96,7 +96,8 @@ def main():
                 **({"reasoning_effort": "off", "max_tokens": 64} if payload.get("auxiliary") else {}),
                 env={"AUTORESEARCH_TOOL_GATEWAY": payload.get("gateway_url", ""),
                      "AUTORESEARCH_TOOL_CAPABILITY": payload.get("gateway_token", ""), "AUTORESEARCH_ROLE": payload.get("role", ""),
-                     "AUTORESEARCH_HAS_INPUTS": "1" if payload.get("has_inputs") else "0"},
+                     "AUTORESEARCH_HAS_INPUTS": "1" if payload.get("has_inputs") else "0",
+                     "AUTORESEARCH_PRIVATE_TURN": "1" if payload.get("auxiliary") else "0"},
                 shutdown_timeout_seconds=1.0) as harness:
             session = harness.resume_session(payload["session_id"]) if payload["resume"] else harness.start_session(payload["session_id"])
             def notification(item):

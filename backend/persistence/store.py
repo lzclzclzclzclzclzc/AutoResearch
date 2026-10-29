@@ -13,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from backend.persistence.event_views import ACTIVITY_FILTER, project_tool_calls
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -96,6 +98,8 @@ class Store:
                 scope TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY(scope,request_id));
             """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(research_id,json_extract(data,'$.type'),seq)")
+            c.execute(f"CREATE INDEX IF NOT EXISTS idx_events_activity ON events(research_id,seq) WHERE {ACTIVITY_FILTER}")
         if not self.get("settings", "team"):
             self.put("settings", "team", {**DEFAULT_TEAM, "version": 1})
         if not self.get("provider", "deepseek-default"):
@@ -233,11 +237,31 @@ class Store:
         with self.connect(True) as c:
             return self._emit(c, research_id, type, payload, **refs)
 
-    def events(self, research_id, after=0, limit=500):
+    def events(self, research_id, after=0, limit=500, *, detail=True):
         with self.connect() as c:
             return [json.loads(r[0]) for r in c.execute(
-                "SELECT data FROM events WHERE research_id=? AND seq>? ORDER BY seq LIMIT ?",
+                "SELECT data FROM events WHERE research_id=? AND seq>?" + ("" if detail else f" AND {ACTIVITY_FILTER}") + " ORDER BY seq LIMIT ?",
                 (research_id, after, max(1, min(limit, 2000))))]
+
+    def tool_calls(self, research_id, conversation_id=None, before=None, limit=50, q=None, at_seq=None):
+        limit = max(1, min(int(limit), 200))
+        with self.connect() as c:
+            c.execute("BEGIN")
+            # Old runs did not attach conversation IDs to their SDK events.
+            conversations = {row[0]: row[1] for row in c.execute("""SELECT json_extract(data,'$.execution_id'),conversation_id
+                FROM messages WHERE research_id=? AND json_extract(data,'$.execution_id') IS NOT NULL""", (research_id,))}
+            conversations.update({row[0]: row[1] for row in c.execute("""SELECT json_extract(data,'$.execution_attempt_id'),json_extract(data,'$.conversation_id')
+                FROM documents WHERE kind='execution' AND research_id=? AND json_extract(data,'$.conversation_id') IS NOT NULL""", (research_id,))})
+            rows = c.execute("""SELECT data FROM events WHERE research_id=? AND seq<=?
+                AND json_extract(data,'$.type') IN ('agent.runtime_event','tool.started','tool.completed','tool.failed')
+                AND json_extract(data,'$.payload.notification.payload.event.type') IN ('tool/call','tool/result') ORDER BY seq""",
+                (research_id, at_seq if at_seq is not None else 9223372036854775807))
+            calls = project_tool_calls((json.loads(row[0]) for row in rows), conversations)
+            matches = [call for call in calls if (not conversation_id or call["conversation_id"] == conversation_id)
+                and (before is None or call["event_seq"] < int(before))
+                and (not q or q.casefold() in canonical([call["tool_name"], call["arguments"], call.get("result")]).casefold())]
+            matches.sort(key=lambda call: call["event_seq"], reverse=True)
+            return {"items": matches[:limit][::-1], "next_cursor": str(matches[limit-1]["event_seq"]) if len(matches)>limit else None}
 
     def create_project(self, payload):
         request_id = payload.get("client_request_id")
@@ -322,7 +346,8 @@ class Store:
             project = self._project(c, research_id)
             docs = list(c.execute("SELECT kind,data FROM documents WHERE research_id=? ORDER BY rowid", (research_id,)))
             seq = c.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE research_id=?", (research_id,)).fetchone()[0]
-            recent = [json.loads(r[0]) for r in c.execute("SELECT data FROM events WHERE research_id=? ORDER BY seq DESC LIMIT 50", (research_id,))][::-1]
+            recent = [json.loads(r[0]) for r in c.execute(f"SELECT data FROM events WHERE research_id=? AND {ACTIVITY_FILTER} ORDER BY seq DESC LIMIT 50", (research_id,))][::-1]
+            activity_count = c.execute(f"SELECT COUNT(*) FROM events WHERE research_id=? AND {ACTIVITY_FILTER}", (research_id,)).fetchone()[0]
             creation_events = [json.loads(r[0]) for r in c.execute(
                 "SELECT data FROM events WHERE research_id=? AND json_extract(data,'$.type') IN ('submission.created','verification.completed','report.completed','experiment.started') ORDER BY seq", (research_id,))]
             temporal = {}
@@ -399,7 +424,7 @@ class Store:
                 submissions.append(projection)
             return {"project": project, "topology": topology,
                 "lines": by_kind.get("line", []), "agents": agents,
-                "recent_events": recent, "snapshot_seq": seq, "executions": by_kind.get("execution", []),
+                "recent_events": recent, "snapshot_seq": seq, "activity_event_count": activity_count, "executions": by_kind.get("execution", []),
                 "runs": list(runs.values()), "submissions": submissions,
                 "reports": [{**temporal.get(report["id"], {}), **report} for report in by_kind.get("report", [])], "memory": by_kind.get("memory_node", []),
                 "verification_reports": verifications, "submission_archives": by_kind.get("submission_archive", []),

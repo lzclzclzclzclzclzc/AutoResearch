@@ -200,6 +200,9 @@ class ToolGateway:
 
     def record_stream(self, context, args):
         from backend.services.credentials import redact
+        # Scheduling scores are already retained once in the SDK result trace.
+        if context.get("suppress_chat"):
+            return {"accepted": True, "seq": 0}
         # A wire cursor is accepted once before any cumulative buffer mutation.
         # Replayed chunks cannot corrupt the next snapshot's prefix.
         with context.setdefault("stream_lock", threading.RLock()):
@@ -218,15 +221,17 @@ class ToolGateway:
             if cursor <= previous["last_cursor"] or previous["finished"]:
                 raise ValueError("Out of order or already closed stream")
             stream = {**previous, "seen": dict(previous["seen"])}
+            event_seq = previous.get("event_seq", 0)
             if chunk.get("type") == "text-delta":
                 stream["raw"] = previous["raw"] + chunk.get("text", "")
                 visible = visible_markdown(stream["raw"])
                 if visible and visible != previous["visible"] and not context.get("suppress_chat"):
                     stream["message_id"] = "stream-" + digest([context["execution_id"], stream_id])[:32]
-                    self.store.upsert_stream_message(context["research_id"], stream["message_id"], context["conversation_id"], context["agent_id"], visible,
+                    message = self.store.upsert_stream_message(context["research_id"], stream["message_id"], context["conversation_id"], context["agent_id"], visible,
                         source_event_id=context["execution_id"] + ":stream:" + stream_id,
                         chunk_id=str(cursor), content_version=1, execution_id=context["execution_id"],
                         task_id=context["task_id"], line_id=context.get("line_id"), kind="discussion")
+                    event_seq = message.get("latest_event_seq", message.get("event_seq", 0))
                     stream["visible"] = visible
             elif chunk.get("type") == "finish":
                 if stream.get("message_id"):
@@ -234,14 +239,17 @@ class ToolGateway:
                     self.store.complete_stream_message(stream["message_id"], stream["visible"],
                         status="interrupted" if reason in {"error", "aborted"} else "complete")
                 stream["finished"] = True
-            event = self.store.emit(context["research_id"], "agent.output_delta" if chunk.get("type") == "text-delta" else "agent.stream_event",
-                {"execution_attempt_id": context["execution_id"], "stream_id": args.get("stream_id"), "source_cursor": cursor,
-                 "chunk": chunk, "delta": chunk.get("text", "")}, agent_id=context["agent_id"],
-                conversation_id=context["conversation_id"], task_id=context["task_id"])
-            stream["seen"][cursor] = {"hash": fingerprint, "seq": event["seq"]}
+            if chunk.get("type") != "text-delta":
+                event = self.store.emit(context["research_id"], "agent.stream_event",
+                    {"execution_attempt_id": context["execution_id"], "stream_id": args.get("stream_id"), "source_cursor": cursor,
+                     "chunk": chunk}, agent_id=context["agent_id"],
+                    conversation_id=context["conversation_id"], task_id=context["task_id"])
+                event_seq = event["seq"]
+            stream["event_seq"] = event_seq
+            stream["seen"][cursor] = {"hash": fingerprint, "seq": event_seq}
             stream["last_cursor"] = cursor
             records[stream_id] = stream
-            return {"accepted": True, "seq": event["seq"]}
+            return {"accepted": True, "seq": event_seq}
 
     def close(self):
         self.server.shutdown()

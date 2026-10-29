@@ -179,6 +179,7 @@ class DshRuntimeAdapter:
             attempt = (previous or {}).get("attempt", 0) + 1
             execution_id = f"{logical_key}-{attempt}"
             record = {"status": "registered", "attempt": attempt, "execution_attempt_id": execution_id,
+                "conversation_id": (runtime_context or {}).get("conversation_id"),
                 "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id, "session_id": session["session_id"],
                 "control_generation": generation, "created_at": datetime.now(timezone.utc).isoformat(), **available}
             self.store.put("execution", logical_key, record, research_id)
@@ -256,9 +257,11 @@ class DshRuntimeAdapter:
                         item = json.loads(redact(line.decode("utf-8").replace(capability, "[CAPABILITY]"), secret))
                     except json.JSONDecodeError:
                         continue
-                    # Original SDK notifications are persisted as trace, never invented chat.
-                    self.store.emit(research_id, "agent.runtime_event", {"execution_attempt_id": execution_id,
-                        "source_cursor": offset, "notification": item}, agent_id=agent_id)
+                    # Keep the SDK payload; committed tools also drive the live conversation.
+                    from backend.persistence.event_views import tool_event_type
+                    self.store.emit(research_id, tool_event_type(item), {"execution_attempt_id": execution_id,
+                        "source_cursor": offset, "notification": item}, agent_id=agent_id,
+                        conversation_id=(runtime_context or {}).get("conversation_id"), task_id=task_id)
                     if item.get("type") == "notification" and item.get("method") == "session.event":
                         event_payload = item.get("payload", {})
                         if event_payload.get("sessionId") == session["session_id"] and event_payload.get("event", {}).get("type") == "agent/inbox/spliced":

@@ -397,11 +397,22 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         return _public(store().snapshot(research_id))
 
     @app.get("/api/research/{research_id}/timeline")
-    def timeline(research_id: str, after: int = 0, limit: int = 200):
+    def timeline(research_id: str, after: int = 0, limit: int = 200, detail: bool = False):
         s = store()
         s.project(research_id)
-        events = s.events(research_id, after, limit)
+        events = s.events(research_id, after, limit, detail=detail)
         return {"items": events, "next_cursor": events[-1]["seq"] if events else after}
+
+    @app.get("/api/research/{research_id}/tool-calls")
+    def tool_calls(research_id: str, conversation_id: str | None = None, before: int | None = Query(default=None, ge=1),
+                   limit: int = 50, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):
+        s = store()
+        s.project(research_id)
+        if conversation_id:
+            conversation = s.get("conversation", conversation_id)
+            if not conversation or conversation["research_id"] != research_id:
+                raise StoreError("conversation_not_found", "会话不属于当前研究", 404)
+        return s.tool_calls(research_id, conversation_id, before, limit, q, at_seq)
 
     @app.get("/api/research/{research_id}/events")
     async def stream_events(research_id: str, request: Request, after: int = 0):

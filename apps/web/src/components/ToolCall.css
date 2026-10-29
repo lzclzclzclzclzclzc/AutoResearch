@@ -1,0 +1,11 @@
+.tool-call { margin-top: 10px; min-width: 0; }
+.tool-call-heading { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); cursor: pointer; list-style: none; padding: 4px 0; }
+.tool-call-heading::-webkit-details-marker { display: none; }
+.tool-call-heading svg { flex-shrink: 0; }
+.tool-call[open] > .tool-call-heading svg { transform: rotate(90deg); }
+.tool-call-heading strong { color: var(--text); font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.tool-call-heading:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tool-call-status { margin-top: 8px; font-size: 11px; color: var(--muted); }
+.tool-call-status.failed { color: #ad3439; }
+.tool-call-label { margin: 12px 0 6px; font-size: 11px; color: var(--muted); }
+.tool-call .tool-call-data { margin: 0; padding: 10px; background: var(--ground); border-radius: 4px; font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 280px; tab-size: 2; }

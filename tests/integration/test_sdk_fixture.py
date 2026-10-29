@@ -106,7 +106,10 @@ async def test_official_full_sdk_tools_stream_resume_and_dedup(tmp_path):
         assert "6" in json.dumps(requests[2])
         assert "input.csv" in json.dumps(requests[3]) and "source_sha256" in json.dumps(requests[4])
         assert any(artifact.get("source_kind") == "human_input" for artifact in store.list("artifact", project["id"]))
-        assert any(event["type"] == "agent.output_delta" for event in store.events(project["id"], limit=2000))
+        assert not any(event["type"] == "agent.output_delta" for event in store.events(project["id"], limit=2000))
+        calls = store.tool_calls(project["id"], conversation_id)["items"]
+        assert {call["tool_name"] for call in calls} >= {"run_light_cpu", "list_research_inputs", "read_research_input"}
+        assert all("result" in call for call in calls)
         deltas = [event for event in store.events(project["id"], limit=2000) if event["type"] == "message.delta"]
         assert len(deltas) >= 2 and len({event["payload"]["message_id"] for event in deltas}) == 1
         messages = store.messages(conversation_id)["items"]
