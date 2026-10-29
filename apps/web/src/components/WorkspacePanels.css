@@ -1,0 +1,10 @@
+.workbench-resizer { display: none; }
+@media (min-width: 768px) {
+  .workbench-grid.resizable-workbench { grid-template-columns: minmax(0, 1fr) 10px var(--chat-width, 360px); }
+  .workbench-resizer { display: block; position: relative; cursor: col-resize; touch-action: none; background: var(--ground); }
+  .workbench-resizer::after { content: ''; position: absolute; top: 24px; bottom: 24px; left: 4px; width: 2px; background: var(--border); border-radius: 1px; }
+  .workbench-resizer:hover::after, .workbench-resizer:focus-visible::after, .is-resizing .workbench-resizer::after { background: var(--accent); }
+  .workbench-resizer:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .workbench-grid.is-resizing { user-select: none; cursor: col-resize; }
+  .resizable-workbench > .chat-pane { min-width: 0; }
+}
