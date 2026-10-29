@@ -76,10 +76,11 @@ class DependencyService:
             raise RuntimeBlocked("dependency_coordination_failed", "内部依赖尚未通过 Boss 协调和共享结果验收")
         return job["result"]
 
-    def _published(self, job, boss_id):
+    def _published(self, job, boss_id=None):
         # Only Boss-committed memory crosses a line boundary. A completed child,
         # unverified claim, or an artifact in another line is not permission.
-        return [node for node in self.store.list("memory_node", job["research_id"], boss_decision_id=boss_id)
+        filters = {"boss_decision_id": boss_id} if boss_id else {}
+        return [node for node in self.store.list("memory_node", job["research_id"], **filters)
             if node.get("receipt") and (node.get("source_ids") or node.get("source_refs")) and
             all(self.store.source_exists(job["research_id"], source) for source in (node.get("source_ids") or node.get("source_refs") or []))]
 
@@ -116,12 +117,13 @@ class DependencyService:
                 continue
             for boss_id in job["coordination_ids"]:
                 boss = self.store.get("task", boss_id)
-                effects = self.store.get("boss_effects", boss_id)
-                shared = self._published(job, boss_id)
+                effective_id = self.store.effective_boss_task_id(boss_id)
+                effects = self.store.get("boss_effects", effective_id)
+                shared = self._published(job, effective_id)
                 if boss and boss["status"] == "completed" and effects and effects["status"] == "applied" and shared:
                     # The original group still reviews whether these results meet
                     # each blocker. This wakes review, never fabricates acceptance.
-                    result = {"boss_decision_id": boss_id, "shared_memory": shared,
+                    result = {"boss_decision_id": effective_id, "shared_memory": shared,
                         "notice": "Boss 已提交可追溯的共享信息；仍需逐项审查原阻断项，未验证结果不得当作实测"}
                     with self.store.connect(True) as c:
                         current = self.store._get(c, "dependency_wait", job["id"])
@@ -130,13 +132,18 @@ class DependencyService:
                             self.store._emit(c, rid, "dependency.ready", {"task_id": job["root_task_id"], "arbitration_id": job["arbitration_id"], "boss_decision_id": boss_id}, line_id=job["line_id"])
                     break
             else:
-                # One initial coordination, then only meaningful new upstream
-                # submissions trigger another. No per-heartbeat task creation.
+                # A submission exists before Verify and ordinary Boss handoff.
+                # Those later facts must also trigger a fresh coordination.
                 upstream_ids = {line["line_id"] for line in job["upstreams"]}
                 submissions = [s for s in self.store.list("submission", rid) if s.get("line_id") in upstream_ids]
-                fingerprint = digest(sorted(s["id"] for s in submissions))
+                submission_ids = {s["id"] for s in submissions}
+                verifications = [v for v in self.store.list("verification", rid)
+                    if v.get("submission_version_id") in submission_ids]
+                fingerprint = digest({"submissions": sorted(submission_ids),
+                    "verifications": sorted(verifications, key=lambda v: v["id"]),
+                    "shared_memory": sorted(self._published(job), key=lambda v: v["id"])})
                 boss_id = job["id"] + ":boss:" + fingerprint[:16]
-                if boss_id not in job["coordination_ids"] and len(job["coordination_ids"]) < 3:
+                if boss_id not in job["coordination_ids"]:
                     with self.store.connect(True) as c:
                         current = self.store._get(c, "dependency_wait", job["id"])
                         ids = list(current["coordination_ids"])
@@ -145,7 +152,8 @@ class DependencyService:
                                 "created_at": now(), "control_generation": project["control_generation"],
                                 "payload": {"reason": "internal_dependency", "dependency_wait_id": job["id"],
                                     "waiting_line_id": job["line_id"], "dependency_line_ids": sorted(upstream_ids),
-                                    "requirements": job["requirements"], "upstream_submission_ids": [s["id"] for s in submissions]}}, rid)
+                                    "requirements": job["requirements"], "upstream_submission_ids": [s["id"] for s in submissions],
+                                    "upstream_verification_ids": [v["id"] for v in verifications]}}, rid)
                             self.store._put(c, "dependency_wait", job["id"], {**current, "coordination_ids": [*ids, boss_id]}, rid)
                             self.store._emit(c, rid, "dependency.coordination_requested", {"task_id": boss_id, "waiting_task_id": job["root_task_id"], "dependency_line_ids": sorted(upstream_ids)}, line_id=job["line_id"])
                 continue

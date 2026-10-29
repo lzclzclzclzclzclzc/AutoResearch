@@ -83,3 +83,40 @@ def test_only_registered_cross_line_dependencies_can_be_routed(waiting):
     for invalid in [["line-99"], ["line-02"], ["line-01", "line-01"]]:
         with pytest.raises(ValueError):
             service.line_ids(request, {"dependency_line_ids": invalid})
+
+
+@pytest.mark.asyncio
+async def test_verify_and_ordinary_boss_publication_trigger_new_coordination_and_resume(waiting, tmp_path):
+    store, _, service, p, root, job = waiting
+    store.put("submission", "upstream", {"line_id": "line-01", "status": "awaiting_verification"}, p["id"])
+    await service.dispatch(p["id"])
+    first = store.get("dependency_wait", job["id"])["coordination_ids"][0]
+    store.finish_task(first, result={})
+    store.put("boss_effects", first, {"status": "applied"}, p["id"])
+    store.put("verification", "verified", {"submission_version_id": "upstream", "passed": True}, p["id"])
+    await service.dispatch(p["id"])
+    ids = store.get("dependency_wait", job["id"])["coordination_ids"]
+    assert len(ids) == 2
+    second = ids[-1]
+    store.finish_task(second, result={})
+    store.put("boss_effects", second, {"status": "applied"}, p["id"])
+    source = tmp_path / "baseline.json"
+    source.write_text('{"score":0.7}', encoding="utf-8")
+    artifact = store.register_artifact(p["id"], source, line_id="line-01")
+    shared = {"boss_decision_id": "ordinary-upstream-boss", "receipt": {"persisted": True},
+        "source_ids": [artifact["id"]], "content_markdown": "verified baseline"}
+    store.put("memory_node", "baseline", shared, p["id"])
+    await service.dispatch(p["id"])
+    ids = store.get("dependency_wait", job["id"])["coordination_ids"]
+    assert len(ids) == 3
+    for _ in range(3):
+        await service.dispatch(p["id"])
+    assert store.get("dependency_wait", job["id"])["coordination_ids"] == ids
+    # Coordination itself may have been revised after a memory conflict.
+    store.put("boss_reconsideration", ids[-1], {"replacement_task": {"id": "reconsidered"}}, p["id"])
+    store.put("boss_effects", "reconsidered", {"status": "applied"}, p["id"])
+    store.put("memory_node", "accepted", {**shared, "boss_decision_id": "reconsidered"}, p["id"])
+    store.finish_task(ids[-1], result={})
+    await service.dispatch(p["id"])
+    assert store.get("dependency_wait", job["id"])["status"] == "fulfilled"
+    assert store.get("task", root["id"])["status"] == "pending"

@@ -590,6 +590,8 @@ class ResearchEngine:
                 context["instruction"] = "协调本项目内部研究线依赖。复用正在运行或待重试的上游任务，不重复分派同一周期。由设计阶段定义并冻结折划分/清洗/交接接口；后续 Runner 产出的基线数字是执行阶段前置条件，不能要求 Exploration 先运行实验才能冻结设计。可通过带来源的共享记忆发布接口、阶段安排或实际已有结果；不得把协议建议或未验证数字写成实测。"
                 context["dependency_submissions"] = [s for identity in payload.get("upstream_submission_ids", [])
                     if (s := self.store.get("submission", identity)) and s["research_id"] == research_id]
+                context["dependency_verifications"] = [v for identity in payload.get("upstream_verification_ids", [])
+                    if (v := self.store.get("verification", identity)) and v["research_id"] == research_id]
             if payload.get("submission_id"):
                 context["submission"] = self.store.get("submission", payload["submission_id"])
                 context["cycle_history"] = self.store.list("verification", research_id, cycle_id=payload.get("cycle_id"))

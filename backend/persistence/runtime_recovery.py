@@ -4,6 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 class RuntimeRecoveryStoreMixin:
 
+    def effective_boss_task_id(self, task_id):
+        while revision := self.get("boss_reconsideration", task_id):
+            task_id = revision["replacement_task"]["id"]
+        return task_id
 
     def complete_model_turn(self, execution_key, output, *, payload, fields=None, session_id=None):
         """Cache the result, session history and completion event as one fact."""
