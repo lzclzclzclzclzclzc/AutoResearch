@@ -64,6 +64,49 @@ async def test_admitted_process_creation_failure_is_packaged_and_verified_once(r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("observed_state", ["running", "completed", "mismatched"])
+async def test_successful_start_with_lost_response_rejoins_same_experiment(runtime, tmp_path, monkeypatch, observed_state):
+    store, p, control, runner = runtime
+    original_start, original_status = runner.start, runner.status
+    starts = []
+    def lose_response(payload):
+        run = original_start(payload)
+        starts.append(run["experiment_run_id"])
+        raise ConnectionError("successful start acknowledgement lost")
+    def status(run_id):
+        result = original_status(run_id)
+        if starts and observed_state == "completed":
+            import time
+            until = time.monotonic() + 10
+            while result["state"] in {"starting", "running", "reconciling"} and time.monotonic() < until:
+                time.sleep(.05)
+                result = original_status(run_id)
+            assert result["state"] == "completed"
+        if starts and observed_state == "mismatched":
+            return {**result, "code_version": "different execution"}
+        return result
+    monkeypatch.setattr(runner, "start", lose_response)
+    monkeypatch.setattr(runner, "status", status)
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
+        engine = ResearchEngine(store, control, runner, CredentialService(tmp_path, store), saver)
+        try:
+            await engine.supervisor(next(t for t in store.pending_tasks() if t["kind"] == "supervisor"))
+            task = next(t for t in store.pending_tasks() if t["kind"] == "line")
+            if observed_state == "mismatched":
+                with pytest.raises(ConnectionError):
+                    await engine.line(task)
+                assert not store.list("verification", p["id"])
+            else:
+                await engine.line(task)
+                await engine.line(task)
+                assert len(store.list("submission", p["id"])) == len(store.list("verification", p["id"])) == 1
+                assert store.list("run", p["id"])[0]["state"] == "completed"
+            assert len(starts) == 1
+        finally:
+            await engine.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["admission_denied", "project_stopped", "exit_unknown"])
 async def test_denial_stop_and_unproven_cleanup_do_not_reach_verify(runtime, tmp_path, monkeypatch, failure):
     store, p, control, runner = runtime

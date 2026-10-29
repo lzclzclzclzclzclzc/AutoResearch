@@ -17,6 +17,7 @@ from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBloc
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved
+from backend.runtime.control import ControlUnavailable
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
     Role, RunAssessment, StageReport, Verification, assert_spec_unchanged, digest, validate_issue_transition)
 from packages.prompts.roles import VERSION, role_prompt
@@ -919,17 +920,22 @@ class ResearchEngine:
             run = await asyncio.to_thread(self.runner.start, payload)
         except Exception:
             await self.guard(state["research_id"])
-            # A transport/start response may be lost after an admitted failure commits.
-            # Only the matching, proven terminal execution can enter the failure pipeline.
+            # Lost acknowledgements may hide a live or already finished run.
+            # Rejoin only the exact admitted operation; never submit a new one.
             try:
                 recovered = await asyncio.to_thread(self.runner.status, run_id)
+            except ControlUnavailable:
+                # A second lost response remains a durable infrastructure retry.
+                raise
             except Exception:
                 raise RuntimeBlocked("runner_unknown", "启动应答失败且无法确认运行状态，保留资源等待对账")
             proof = recovered.get("terminal_proof", {})
             bound = ("research_id", "allocation_id", "start_operation_id", "experiment_run_id", "control_generation",
                      "grant_revision", "spec_id", "spec_version", "spec_hash", "code_version")
-            if (recovered.get("state") not in {"execution_failed", "interrupted"}
-                    or any(recovered.get(k) != payload.get(k) for k in bound)
+            if any(recovered.get(k) != payload.get(k) for k in bound):
+                raise
+            if recovered.get("state") not in {"starting", "running", "reconciling"} and (
+                    recovered.get("state") not in {"execution_failed", "interrupted", "completed", "succeeded", "early_stopped"}
                     or not proof.get("process_tree_exited") or not proof.get("start_operation_terminal")
                     or any(proof.get(k) != recovered.get(k) for k in ("allocation_id", "grant_revision", "experiment_run_id", "runner_generation", "start_operation_id"))):
                 raise
