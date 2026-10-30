@@ -2,7 +2,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
     "DecompositionPart": {
-      "additionalProperties": false,
       "properties": {
         "part_id": {
           "minLength": 1,
@@ -57,7 +56,6 @@
       "type": "object"
     },
     "DecompositionPlan": {
-      "additionalProperties": false,
       "properties": {
         "target_schema_hash": {
           "title": "Target Schema Hash",
@@ -99,7 +97,6 @@
       "type": "object"
     },
     "MergePlan": {
-      "additionalProperties": false,
       "properties": {
         "strategy": {
           "enum": [
@@ -133,7 +130,6 @@
       "type": "object"
     }
   },
-  "additionalProperties": false,
   "properties": {
     "arbitration_id": {
       "title": "Arbitration Id",

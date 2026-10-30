@@ -2,7 +2,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
     "Evidence": {
-      "additionalProperties": false,
       "properties": {
         "source_id": {
           "title": "Source Id",
@@ -33,7 +32,6 @@
       "type": "object"
     }
   },
-  "additionalProperties": false,
   "properties": {
     "content_markdown": {
       "title": "Content Markdown",

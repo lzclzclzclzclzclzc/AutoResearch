@@ -2,7 +2,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
     "Evidence": {
-      "additionalProperties": false,
       "properties": {
         "source_id": {
           "title": "Source Id",
@@ -33,7 +32,6 @@
       "type": "object"
     },
     "Issue": {
-      "additionalProperties": false,
       "properties": {
         "issue_id": {
           "title": "Issue Id",
@@ -88,7 +86,6 @@
       "type": "object"
     },
     "IssueReclassification": {
-      "additionalProperties": false,
       "properties": {
         "from_category": {
           "enum": [
@@ -122,7 +119,6 @@
       "type": "object"
     }
   },
-  "additionalProperties": false,
   "properties": {
     "content_markdown": {
       "title": "Content Markdown",

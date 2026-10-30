@@ -14,7 +14,7 @@ def digest(value: Any) -> str:
 
 
 class Contract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     @model_validator(mode="before")
     @classmethod
@@ -273,7 +273,7 @@ class ArbitrationRequest(Contract):
 
 
 class DecompositionPart(Contract):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
     part_id: str = Field(min_length=1)
     target_role: str
     instructions: str = Field(min_length=1)
@@ -290,7 +290,7 @@ class MergePlan(Contract):
 
 
 class DecompositionPlan(Contract):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
     target_schema_hash: str
     parts: list[DecompositionPart] = Field(min_length=1, max_length=8)
     merge_plan: MergePlan
@@ -342,7 +342,7 @@ class DecompositionPlan(Contract):
 
 
 class GodDecisionBase(Contract):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
     arbitration_id: str
     snapshot_hash: str
     content_markdown: str = Field(min_length=1)

@@ -62,13 +62,12 @@ def test_snapshot_cannot_be_modified_or_forged(records):
         store.patch("arbitration_snapshot", request["snapshot_id"], sections={"forged": True})
 
 
-def test_model_action_union_is_flat_and_disallows_unrelated_fields(records):
+def test_model_action_union_is_flat_and_ignores_unrelated_fields(records):
     _, request, _ = records
     value = GodDecision.model_validate(decision(request)).model_dump()
     assert value["action"] == "select_candidate"
     assert "root" not in value
-    with pytest.raises(ValidationError):
-        GodDecision.model_validate({**decision(request), "output": {"score": 100}})
+    assert GodDecision.model_validate({**decision(request), "output": {"score": 100}}).model_dump() == value
 
 
 def test_expired_lease_requires_exit_reconciliation(records):

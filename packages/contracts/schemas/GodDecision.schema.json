@@ -2,7 +2,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
     "DecomposeTaskDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -64,7 +63,6 @@
       "type": "object"
     },
     "DecompositionPart": {
-      "additionalProperties": false,
       "properties": {
         "part_id": {
           "minLength": 1,
@@ -119,7 +117,6 @@
       "type": "object"
     },
     "DecompositionPlan": {
-      "additionalProperties": false,
       "properties": {
         "target_schema_hash": {
           "title": "Target Schema Hash",
@@ -161,7 +158,6 @@
       "type": "object"
     },
     "FinishScopeDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -238,7 +234,6 @@
       "type": "object"
     },
     "MergePlan": {
-      "additionalProperties": false,
       "properties": {
         "strategy": {
           "enum": [
@@ -272,7 +267,6 @@
       "type": "object"
     },
     "NeedsExternalInputDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -358,7 +352,6 @@
       "type": "object"
     },
     "RepairOutputDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -434,7 +427,6 @@
       "type": "object"
     },
     "RequestEvidenceDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -535,7 +527,6 @@
       "type": "object"
     },
     "RequestRevisionDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",
@@ -622,7 +613,6 @@
       "type": "object"
     },
     "SelectCandidateDecision": {
-      "additionalProperties": false,
       "properties": {
         "arbitration_id": {
           "title": "Arbitration Id",

@@ -2,7 +2,6 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
     "Assignment": {
-      "additionalProperties": false,
       "properties": {
         "line_id": {
           "title": "Line Id",
@@ -26,7 +25,6 @@
       "type": "object"
     }
   },
-  "additionalProperties": false,
   "properties": {
     "content_markdown": {
       "title": "Content Markdown",
