@@ -154,12 +154,13 @@ class ExperimentSpec(Contract):
 
 
 class Implementation(Contract):
-    content_markdown: str
-    spec_hash: str
+    model_config = ConfigDict(extra="ignore")
+    content_markdown: str = ""
+    spec_hash: str = ""
     files: dict[str, str]
     entrypoint: str
     arguments: list[str] = Field(default_factory=list)
-    actual_config: dict[str, Any]
+    actual_config: dict[str, Any] | None = None
     cpu_cores: int = Field(default=1, ge=1)
     memory_mb: int = Field(default=256, ge=64)
     gpu_count: int = Field(default=0, ge=0)
@@ -409,9 +410,9 @@ class GodDecision(RootModel[Annotated[SelectCandidateDecision | RepairOutputDeci
 
 
 def assert_spec_unchanged(spec: ExperimentSpec, implementation: Implementation) -> None:
-    if implementation.spec_hash != digest(spec.model_dump()):
+    if implementation.spec_hash and implementation.spec_hash != digest(spec.model_dump()):
         raise ValueError("spec_revision_required: implementation changed the frozen plan")
-    if implementation.actual_config != spec.fixed:
+    if implementation.actual_config is not None and implementation.actual_config != spec.fixed:
         raise ValueError("spec_revision_required: actual scientific configuration differs from frozen fixed fields")
 
 

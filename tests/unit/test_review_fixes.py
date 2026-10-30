@@ -100,3 +100,26 @@ def test_light_retry_artifacts_and_restart(tmp_path, monkeypatch):
     finally:
         service.close()
         control.close()
+
+@pytest.mark.asyncio
+async def test_local_dependencies_and_unchanged_repairs_are_executed(tmp_path):
+    store = Store(tmp_path)
+    project = started(store, 'implementation')
+    spec = ExperimentSpec(spec_id='spec', version=1, question='q', hypothesis='h', fixed={}, baseline='b', data={}, metrics=['m'], design={}, monitoring={}, completion_criteria='exit', deadline_at=project['deadline_at'])
+    store.put('spec', 'spec', spec.model_dump(), project['id'])
+    engine = ResearchEngine.__new__(ResearchEngine)
+    engine.store = store
+    async def line_open(*args): pass
+    async def turn(*args, **kwargs):
+        return {'files': {'main': 'import helper\nprint(helper.value)', 'helper.py': 'value=42'},
+                'entrypoint': 'main', 'dependencies': ['helper', 'nonexistent-package>=1']}
+    engine.line_open, engine.turn = line_open, turn
+    state = {'research_id': project['id'], 'line_id': 'line-01', 'spec_id': 'spec', 'direction_epoch': 1,
+             'revision': 1, 'task_id': 'task', 'cycle_id': 'cycle'}
+    state.update(await engine.implement(state))
+    state['code_attempt'] = 2
+    result = await engine.implement(state)
+    assert result['implementation_route'] == 'organize'
+    implementation = store.get('implementation', result['implementation_id'])
+    run = subprocess.run([sys.executable, implementation['entrypoint']], cwd=implementation['cwd'], capture_output=True)
+    assert run.returncode == 0 and run.stdout.strip() == b'42'

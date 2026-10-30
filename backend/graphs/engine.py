@@ -814,11 +814,6 @@ class ResearchEngine:
                     return {"implementation_route": "design", "revision": state["revision"] + 1}
                 await self.recover_action(request, resolution, context={"spec": spec.model_dump()}, line_id=state["line_id"])
             return {"implementation_route": "design", "revision": state["revision"] + 1}
-        if state.get("code_attempt", 1) > 1 and state.get("implementation_id"):
-            previous = self.store.get("implementation", state["implementation_id"])
-            if previous["code_version"] == digest(implementation.files):
-                self.store.emit(state["research_id"], "implementation.repair_no_progress", {"spec_id": state["spec_id"], "code_version": previous["code_version"]}, line_id=state["line_id"])
-                return {"implementation_route": "package"}
         workspace = self.store.data_dir / "projects" / state["research_id"] / "workspaces" / state["line_id"] / f"epoch-{state['direction_epoch']}" / f"revision-{state['revision']}" / f"code-{state.get('code_attempt', 1)}"
         workspace.mkdir(parents=True, exist_ok=True)
         for relative, content in implementation.files.items():
@@ -828,17 +823,9 @@ class ResearchEngine:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         entrypoint = (workspace / implementation.entrypoint).resolve()
-        if not entrypoint.is_relative_to(workspace.resolve()) or not entrypoint.is_file() or entrypoint.suffix != ".py":
-            raise RuntimeBlocked("invalid_entrypoint", "首版正式实验入口必须是工作区内的 Python 文件")
-        if implementation.dependencies:
-            # No implicit installation executes unreviewed package hooks.
-            import importlib.util
-            absent = [name for name in implementation.dependencies if importlib.util.find_spec(name) is None]
-            if absent:
-                if state.get("code_attempt", 1) > 1 and state.get("run_id"):
-                    self.store.put("implementation_attempt", implementation_id, {**result, "status": "dependency_blocked", "missing": absent}, state["research_id"])
-                    return {"implementation_route": "package"}
-                raise RuntimeBlocked("experiment_dependency_missing", "实验环境缺少依赖：" + ", ".join(absent))
+        if not entrypoint.is_relative_to(workspace.resolve()) or not entrypoint.is_file():
+            raise RuntimeBlocked("invalid_entrypoint", "实验入口必须是工作区内的文件")
+        result = implementation.model_dump()
         code_version = digest(implementation.files)
         self.store.put("implementation", implementation_id, {**result, "spec_id": state["spec_id"], "cwd": str(workspace), "code_version": code_version}, state["research_id"])
         for chain in self.store.list("recovery_chain", state["research_id"]):

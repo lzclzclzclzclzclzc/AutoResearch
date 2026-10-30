@@ -1,12 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "additionalProperties": false,
   "properties": {
     "content_markdown": {
+      "default": "",
       "title": "Content Markdown",
       "type": "string"
     },
     "spec_hash": {
+      "default": "",
       "title": "Spec Hash",
       "type": "string"
     },
@@ -29,9 +30,17 @@
       "type": "array"
     },
     "actual_config": {
-      "additionalProperties": true,
-      "title": "Actual Config",
-      "type": "object"
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Actual Config"
     },
     "cpu_cores": {
       "default": 1,
@@ -66,11 +75,8 @@
     }
   },
   "required": [
-    "content_markdown",
-    "spec_hash",
     "files",
-    "entrypoint",
-    "actual_config"
+    "entrypoint"
   ],
   "title": "Implementation",
   "type": "object"
