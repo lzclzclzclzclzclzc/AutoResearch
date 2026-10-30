@@ -249,7 +249,11 @@ class ResourceService:
                 if other["allocation_id"] == allocation["allocation_id"]:
                     continue
                 try:
-                    self._project(c, other["research_id"], other["control_generation"])
+                    other_project = self._project(c, other["research_id"], other["control_generation"])
+                    other_config = other_project.get("config_snapshot", {}).get("team", {})
+                    other_max = max(1, int(other_config.get("experiment_concurrency", 1)))
+                    if sum(not item.get("light_cpu") and item["research_id"] == other["research_id"] for item in held) >= other_max:
+                        continue
                 except ResourceConflict:
                     # A paused/blocked/obsolete request keeps its queue position
                     # for recovery but cannot hold up currently runnable work.
@@ -260,6 +264,7 @@ class ResourceService:
                     and (not other_requested or g["uuid"] in other_requested)]
                 if (other_score > score and used_cpu + other["cpu_cores"] <= self.capacity["cpu_cores"]
                     and used_memory + other["memory_bytes"] <= self.capacity["memory_total_bytes"]
+                    and other["memory_bytes"] <= physical["memory_available_bytes"]
                     and len(other_devices)>=other.get("gpu_count",0)):
                     fits = False
             impossible = (cores > self.capacity["cpu_cores"] or memory > self.capacity["memory_total_bytes"]
