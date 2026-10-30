@@ -773,6 +773,7 @@ class ResearchEngine:
                 await self.recover_action(request, marker["decision"], context={"spec": spec.model_dump()}, line_id=state["line_id"])
         result = recovery["output"] if recovery else await self.turn(state["research_id"], f"{state['line_id']}/implementation", "implementation", implementation_id, "code", Implementation,
             {"instruction": "完整实现或修复冻结计划，返回相对路径源文件与 Python 入口，禁止改动固定配置。修复必须根据真实失败证据恢复既定方案", "spec": spec.model_dump(), "spec_hash": digest(spec.model_dump()), "direction_epoch": state["direction_epoch"],
+             "resource_feedback": self.store.get("resource_feedback", state["spec_id"]),
              "prior_runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
              "prior_runs": [run for run in self.store.list("run", state["research_id"]) if run.get("spec_id") == state["spec_id"]]},
             conversation_id=implementation_id, line_id=state["line_id"])
@@ -846,7 +847,6 @@ class ResearchEngine:
             "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"], "memory_bytes": impl["memory_mb"] * 1024 * 1024,
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
 
-             "resource_feedback": self.store.get("resource_feedback", state["spec_id"]),
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
             advice = await self.organizer_graph.run({"research_id": state["research_id"], "id": request["resource_request_id"],
@@ -957,9 +957,6 @@ class ResearchEngine:
             bound = ("research_id", "allocation_id", "start_operation_id", "experiment_run_id", "control_generation",
                      "grant_revision", "spec_id", "spec_version", "spec_hash", "code_version")
             if any(recovered.get(k) != payload.get(k) for k in bound):
-            if allocation["state"] == "unsatisfiable":
-                self.store.emit(state["research_id"], "allocation.unsatisfiable", allocation, line_id=state["line_id"])
-                return allocation
                 raise
             if recovered.get("state") not in {"starting", "running", "reconciling"} and (
                     recovered.get("state") not in {"execution_failed", "interrupted", "completed", "succeeded", "early_stopped"}

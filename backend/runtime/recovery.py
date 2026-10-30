@@ -14,9 +14,9 @@ def retryable_failure(error):
         return "local_service_unavailable", "本机控制或执行服务暂时不可用，确认执行状态后自动恢复"
     if is_storage_busy(error):
         return "storage_busy", "数据库写入暂时繁忙，保留检查点并自动重试"
-    if getattr(error, "code", None) == "stream_recorder_unavailable":
     if getattr(error, "code", None) == "confirmation_pending":
         return "local_service_unavailable", "业务操作等待控制确认，自动重试"
+    if getattr(error, "code", None) == "stream_recorder_unavailable":
         return "stream_recorder_unavailable", "本机流式记录暂时不可用，确认旧执行退出后自动恢复"
     return None
 

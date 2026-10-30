@@ -208,9 +208,6 @@ class DshRuntimeAdapter:
         logical_key = digest([research_id, agent_id, task_id, turn_id])
         concurrency = project["config_snapshot"]["team"].get("model_concurrency", 4)
         project_semaphore = self.project_semaphores.setdefault(research_id, asyncio.Semaphore(concurrency))
-        async with self._admission(research_id, generation, runtime_context or {},
-                self.locks.setdefault(session["id"], asyncio.Lock()), project_semaphore,
-                *measured_gates, *([self.semaphore] if self.semaphore is not None else [])):
         provider = self.store.get("provider", project["provider_config_id"]) or {}
         benchmark = provider.get("concurrency_benchmark") or {}
         measured_gates = []
@@ -219,6 +216,9 @@ class DshRuntimeAdapter:
                 and benchmark.get("credential_version") == provider.get("credential_version")):
             key = digest([project["provider_config_id"], benchmark])
             measured_gates.append(self.provider_semaphores.setdefault(key, asyncio.Semaphore(int(benchmark["recommended_limit"]))))
+        async with self._admission(research_id, generation, runtime_context or {},
+                self.locks.setdefault(session["id"], asyncio.Lock()), project_semaphore,
+                *measured_gates, *([self.semaphore] if self.semaphore is not None else [])):
             if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                 raise ResearchStopped("研究已停止或控制服务不可用")
             previous = self.store.get("execution", logical_key)
