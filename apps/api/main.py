@@ -33,14 +33,14 @@ class Input(BaseModel):
 
 class Team(Input):
     version: int | None = None
-    n: int = Field(default=2, ge=1, le=16)
-    m1: int = Field(default=2, ge=1, le=8)
-    m2: int = Field(default=2, ge=1, le=8)
-    k: int = Field(default=3, ge=1, le=20)
-    boss_members: int = Field(default=3, ge=1, le=9)
+    n: int = Field(default=2, ge=1)
+    m1: int = Field(default=2, ge=1)
+    m2: int = Field(default=2, ge=1)
+    k: int = Field(default=3, ge=1)
+    boss_members: int = Field(default=3, ge=1)
     max_runtime_seconds: int = Field(default=3600, ge=1, le=31536000)
     model_concurrency: int = Field(default=4, ge=1)
-    experiment_concurrency: int = Field(default=1, ge=1, le=16)
+    experiment_concurrency: int = Field(default=1, ge=1)
 
 
 class Research(Input):
@@ -54,7 +54,7 @@ class Research(Input):
     mode: Literal["live", "demo"] = "live"
     workspace_path: str | None = Field(default=None, max_length=4000)
     model_concurrency: int | None = Field(default=None, ge=1)
-    experiment_concurrency: int | None = Field(default=None, ge=1, le=16)
+    experiment_concurrency: int | None = Field(default=None, ge=1)
 
     @field_validator("topic")
     @classmethod
