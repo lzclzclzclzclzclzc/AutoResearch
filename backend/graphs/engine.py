@@ -262,17 +262,16 @@ class ResearchEngine:
             assert_spec_unchanged(spec, implementation)
             names = []
             for relative in implementation.files:
-                normalized = relative.replace("\\", "/")
+                normalized = os.path.normpath(relative.replace("\\", "/")).replace("\\", "/")
                 if (not normalized or normalized.startswith("/") or ":" in normalized or "\0" in normalized or
                         any(part in {"", ".", ".."} for part in normalized.split("/"))):
                     raise ValueError("Repaired implementation file must stay in the research workspace")
                 names.append(normalized.casefold())
             if len(set(names)) != len(names):
                 raise ValueError("Repaired implementation contains conflicting Windows file paths")
-            entry = implementation.entrypoint.replace("\\", "/")
-            if (entry not in {path.replace("\\", "/") for path in implementation.files} or
-                    not entry.endswith(".py")):
-                raise ValueError("Repaired implementation entrypoint must be one of its owned Python source files")
+            entry = os.path.normpath(implementation.entrypoint.replace("\\", "/")).replace("\\", "/")
+            if entry not in {os.path.normpath(path.replace("\\", "/")).replace("\\", "/") for path in implementation.files}:
+                raise ValueError("Repaired implementation entrypoint must be one of its owned source files")
         if schema is BossDecision and original.get("lines") is not None:
             legal = {line["line_id"] for line in original["lines"]}
             assigned = [a["line_id"] for a in result["assignments"]]
