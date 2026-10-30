@@ -30,6 +30,33 @@
       ],
       "title": "Evidence",
       "type": "object"
+    },
+    "ExecutionCheck": {
+      "properties": {
+        "issue_id": {
+          "title": "Issue Id",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "issue_id",
+        "passed",
+        "evidence"
+      ],
+      "title": "ExecutionCheck",
+      "type": "object"
     }
   },
   "properties": {
@@ -78,6 +105,13 @@
       "default": false,
       "title": "Independent Replication",
       "type": "boolean"
+    },
+    "execution_checks": {
+      "items": {
+        "$ref": "#/$defs/ExecutionCheck"
+      },
+      "title": "Execution Checks",
+      "type": "array"
     }
   },
   "required": [

@@ -6,7 +6,7 @@ import math
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_serializer, model_validator
 
 
 def digest(value: Any) -> str:
@@ -168,6 +168,12 @@ class Implementation(Contract):
     dependencies: list[str] = Field(default_factory=list)
 
 
+class ExecutionCheck(Contract):
+    issue_id: str
+    passed: bool
+    evidence: list[Evidence] = Field(min_length=1)
+
+
 class Verification(Contract):
     content_markdown: str
     passed: bool
@@ -176,6 +182,14 @@ class Verification(Contract):
     limitations: list[str]
     required_changes: list[str] = Field(default_factory=list)
     independent_replication: Literal[False] = False
+    execution_checks: list[ExecutionCheck] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_defaults(self, handler):
+        value = handler(self)
+        if not self.execution_checks:
+            value.pop("execution_checks", None)
+        return value
 
 
 class Assignment(Contract):

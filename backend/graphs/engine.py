@@ -19,6 +19,7 @@ from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
+from backend.runtime.evidence import validate_execution_checks
 from backend.persistence.store import StoreError
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
     Role, RunAssessment, StageReport, Verification, assert_spec_unchanged, digest, validate_issue_transition)
@@ -245,6 +246,9 @@ class ResearchEngine:
                 lambda source: self.store.source_exists(research_id, source))
         if output_validator is not None:
             output_validator(result)
+        if schema is Verification:
+            validate_execution_checks(self.store, research_id, context.get("submission", {}), result,
+                context.get("line_id") or agent_id.split("/")[0])
         return result
 
     def validate_recovery_output(self, research_id, agent_id, schema, result, context, output_validator=None):
