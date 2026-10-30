@@ -397,7 +397,7 @@ class ResourceService:
             if not row:
                 raise ResourceConflict("Unknown lightweight reservation")
             current = json.loads(row[0])
-            if current["state"] in TERMINAL:
+            if current["state"] in TERMINAL and (job["state"] != current["state"] or not terminal_proof):
                 return
             if job["state"] in TERMINAL and not terminal_proof:
                 raise ResourceConflict("Lightweight reservation requires process tree exit proof")

@@ -73,3 +73,30 @@ def test_paused_backlog_does_not_hide_other_projects(tmp_path):
     for i in range(120):
         store.add_task(first['id'], 'communication', {}, f'paused-{i}')
     assert any(t['research_id'] == second['id'] for t in store.pending_tasks())
+
+def test_light_retry_artifacts_and_restart(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    project = started(store, 'light')
+    rid = project['id']
+    control = ControlSupervisor(tmp_path/'control')
+    control.register_project(rid, project['deadline_at'])
+    resources = ResourceService(store.path, control, {'cpu_cores': 8, 'memory_total_bytes': 8*1024**3, 'gpus': []})
+    service = LightCpuService(tmp_path, control, resources, 'runner', 'generation')
+    store.put('agent', rid+':line-01/implementation', {'role': 'implementation'}, rid)
+    payload = {'research_id': rid, 'agent_id': 'line-01/implementation', 'role': 'implementation',
+        'line_id': 'line-01', 'code': 'result=42', 'execution_id': 'light', 'control_generation': 1}
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(resources, 'reserve_light', lambda *args: (_ for _ in ()).throw(ResourceConflict('busy')))
+            with pytest.raises(ResourceConflict): service.execute(payload)
+        job = service.execute(payload)
+        assert job['state'] == 'completed'
+        assert job['artifact']['line_id'] == 'line-01'
+        saved = resources.light_jobs()[0]
+        assert saved['artifact']['id'] == job['artifact']['id']
+        service.close()
+        service = LightCpuService(tmp_path, control, resources, 'runner2', 'generation2')
+        assert service.execute(payload)['artifact']['id'] == job['artifact']['id']
+    finally:
+        service.close()
+        control.close()

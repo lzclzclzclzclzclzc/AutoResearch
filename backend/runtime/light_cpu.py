@@ -104,9 +104,12 @@ class LightCpuService:
             old=self.jobs.get(execution_id)
             if old:
                 if old["content_hash"]!=content_hash:raise ValueError("执行 ID 不能用于不同内容")
+                if old.get("state") == "completed":
+                    self._artifacts(store, old, payload.get("line_id"))
+                    self.resources.update_light(old, terminal_proof=True)
                 return old
             job={"execution_id":execution_id,"research_id":rid,"agent_id":agent,"role":role,"content_hash":content_hash,
-                "state":"starting","light_cpu":True,"cpu_cores":1,"memory_bytes":LIGHT_CPU_MEMORY_BYTES,"gpu_uuids":[],
+                "line_id":payload.get("line_id"),"state":"starting","light_cpu":True,"cpu_cores":1,"memory_bytes":LIGHT_CPU_MEMORY_BYTES,"gpu_uuids":[],
                 "control_generation":generation,"control_epoch":control_state["control_epoch"],"deadline_at":timestamp(project["deadline_at"]),
                 "parent_execution_id":parent,
                 "parent_pid":payload.get("parent_pid"),"parent_create_time":payload.get("parent_create_time"),
@@ -200,13 +203,17 @@ Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_as
                 job["result_numeric_status"]=numeric_status(job["result"])
         except Exception as error:
             job.update(state="cancelled" if isinstance(error,ControlUnavailable) else "execution_failed",error=str(error))
-            if not admitted:raise
+            if not admitted:
+                with self.lock:
+                    self.jobs.pop(execution_id, None)
+                raise
         finally:
             exited=process.terminate() if process else True
             if admitted:
                 job.update(ended_at=iso_now(),process_tree_exited=exited)
                 if exited:
                     try:
+                        self._artifacts(store, job)
                         self.resources.update_light(job,terminal_proof=True)
                         self.control.complete_execution(execution_id)
                     except Exception:
@@ -215,14 +222,18 @@ Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_as
             if process:
                 process.close()
             self.processes.pop(execution_id,None)
+        return job
+
+    def _artifacts(self, store, job, line_id=None):
+        line_id = job.get("line_id") or line_id or job["agent_id"].split("/")[0]
+        job["line_id"] = line_id
         if job.get("log_path") and Path(job["log_path"]).exists():
             with Path(job["log_path"]).open("rb") as stream:
                 stream.seek(max(0,Path(job["log_path"]).stat().st_size-65536))
                 job["logs"]=stream.read().decode("utf-8",errors="replace")
-            job["log_artifact"]=store.register_artifact(rid,job["log_path"],"text/plain",kind="light_cpu_log")
+            job["log_artifact"]=store.register_artifact(job["research_id"],job["log_path"],"text/plain",kind="light_cpu_log",line_id=line_id)
         if job.get("state")=="completed":
-            job["artifact"]=store.register_artifact(rid,job["result_path"],"application/json",kind="light_cpu_result",source_evidence_ids=ids)
-        return job
+            job["artifact"]=store.register_artifact(job["research_id"],job["result_path"],"application/json",kind="light_cpu_result",line_id=line_id,source_evidence_ids=job.get("evidence_ids",[]))
 
     def expire_due(self):
         with self.lock:
@@ -240,6 +251,8 @@ Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_as
                 pending=[job for job in self.jobs.values() if job.get("reconciliation_pending") and job.get("process_tree_exited")]
             for job in pending:
                 try:
+                    from backend.persistence.store import Store
+                    self._artifacts(Store(self.data_dir), job)
                     self.resources.update_light(job,terminal_proof=True)
                     self.control.complete_execution(job["execution_id"])
                     job["reconciliation_pending"]=False
