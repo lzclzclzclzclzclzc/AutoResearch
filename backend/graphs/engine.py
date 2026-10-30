@@ -430,7 +430,6 @@ class ResearchEngine:
                 state.update(await self.discussions.prepare(state))
                 state["history_snapshot"].append({"message_id": message["message_id"], "speaker": message["sender"]["id"],
                     "text": message["content_markdown"][-4000:]})
-                state.update(await self.discussions.score_members(state))
                 member = (await self.discussions.choose_speaker(state))["member"]
                 binding = self.store.put("communication_state", task["id"], {"member": member,
                     "direction_epoch": line["direction_epoch"] if line else None}, rid)

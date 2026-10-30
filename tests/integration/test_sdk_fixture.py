@@ -215,7 +215,7 @@ async def test_official_sdk_message_tool_reaches_receiver_context_and_delivers_r
                 finish = "tool_use"
             else:
                 output = {2: {"content_markdown": "LOCAL SENDER FIXTURE", "candidate": {"sent": True}, "evidence": []},
-                    3: {"score": 80}, 4: {"content_markdown": "LOCAL RECEIVER FIXTURE: fix the split before fitting."}}[index]
+                    3: {"content_markdown": "LOCAL RECEIVER FIXTURE: fix the split before fitting."}}[index]
                 block, delta, finish = {"type": "text", "text": ""}, {"type": "text_delta", "text": json.dumps(output)}, "end_turn"
             chunks = [
                 {"type": "message_start", "message": {"id": f"native-mail-{index}", "type": "message", "role": "assistant", "model": "deepseek-flash", "content": [], "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 0}}},
@@ -253,14 +253,13 @@ async def test_official_sdk_message_tool_reaches_receiver_context_and_delivers_r
             graph = CommunicationGraph(engine.communication, saver)
             reply = await asyncio.wait_for(graph.run(jobs[0]), 60)
             assert "LOCAL RECEIVER FIXTURE" in reply["content_markdown"]
-            wire = json.dumps(requests[3], ensure_ascii=False)
+            wire = json.dumps(requests[2], ensure_ascii=False)
             assert "received_messages" in wire and "LOCAL_PROTOCOL_QUESTION" in wire
-            assert requests[2]["max_tokens"] == 16384
-            assert requests[0]["max_tokens"] == requests[3]["max_tokens"] == 65536
+            assert requests[0]["max_tokens"] == requests[2]["max_tokens"] == 65536
             inbox = store.consume_agent_inbox(p["id"], sender, "receive-native-reply", control, 1)
             assert inbox[0]["message"]["content_markdown"] == reply["content_markdown"]
             await graph.run(jobs[0])
-            assert len(requests) == 4
+            assert len(requests) == 3
             assert not store.list("cycle", p["id"]) and not store.list("run", p["id"])
             await engine.close()
     finally:

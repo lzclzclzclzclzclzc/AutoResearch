@@ -4,22 +4,17 @@ import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend.adapters.dsh import RuntimeBlocked
-from backend.graphs.discussion import select_speaker
+from backend.graphs.discussion import speaking_order
 from backend.graphs.engine import ResearchEngine
 from backend.persistence.store import Store
 from backend.runtime.control import ControlSupervisor
 from backend.services.credentials import CredentialService
 
 
-def test_kds_policy_penalizes_recent_speakers_and_never_selects_ineligible_members():
+def test_discussion_order_is_a_reproducible_permutation():
     members = ["a", "b", "c"]
-    scores = dict.fromkeys(members, 50)
-    selected, p = select_speaker(members, members, scores, {"a": 2}, "c", "seed")
-    assert p["c"] == 0 and p["a"] < p["b"] and selected != "c"
-    assert sum(p.values()) == pytest.approx(1)
-    assert select_speaker(members, ["b"], scores, {}, "b", "seed")[0] == "b"
-    assert select_speaker(["a", "b"], ["a", "b"], {"a": 100, "b": 0}, {}, "a", "seed")[0] == "b"
-    assert select_speaker(members, members, scores, {}, None, "seed") == select_speaker(members, members, scores, {}, None, "seed")
+    assert sorted(speaking_order(members, "seed")) == members
+    assert speaking_order(members, "seed") == speaking_order(members, "seed")
 
 
 @pytest.mark.asyncio
@@ -87,7 +82,10 @@ async def test_blockers_get_revision_opportunity_before_vote_and_cannot_be_omitt
             assert any(observed_context) and all(m["speaker"] for ctx in observed_context for m in ctx)
             selections = store.list("discussion_selection", p["id"])
             assert len(selections) == len([c for c in calls if c[0] in {"BossProposal", "BossReview", "Vote", "Synthesis"}])
-            assert all(set(s["scores"]) == set(members) for s in selections)
+            assert not any(c[0] == "Willingness" for c in calls)
+            order = store.get("discussion_order", "test-discussion:serial-v2")["members"]
+            for phase_round in {(s['phase'], s['round']) for s in selections if s['phase'] != 'synthesis'}:
+                assert [s['speaker'] for s in selections if (s['phase'],s['round']) == phase_round] == order
             await engine.close()
     finally:
         control.close()

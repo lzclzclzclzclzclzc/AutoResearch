@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import random
 from typing import Annotated, Any, TypedDict
 
@@ -10,27 +9,17 @@ from langgraph.types import Command
 
 from backend.adapters.dsh import RuntimeBlocked
 from backend.graphs.tasks import ScopeResolved, TaskSuspended, current_task, recovery_suffix
-from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, Willingness, digest, majority, validate_issue_transition, validate_vote
+from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, digest, majority, validate_issue_transition, validate_vote
 
 
 def merge_records(left, right):
     return {**(left or {}), **(right or {})}
 
 
-def select_speaker(members, eligible, scores, heat, last_speaker, seed):
-    """KDS policy: softmax((score - 2 * heat) / 1.5), no consecutive speaker."""
-    allowed = [m for m in members if m in eligible]
-    if len(allowed) > 1:
-        allowed = [m for m in allowed if m != last_speaker]
-    if not allowed:
-        raise ValueError("No eligible discussion member")
-    logits = {m: (scores[m] - 2.0 * heat.get(m, 0.0)) / 1.5 for m in allowed}
-    peak = max(logits.values())
-    weights = {m: math.exp(value - peak) for m, value in logits.items()}
-    total = sum(weights.values())
-    probabilities = {m: weights.get(m, 0.0) / total for m in members}
-    selected = random.Random(seed).choices(allowed, weights=[weights[m] for m in allowed], k=1)[0]
-    return selected, probabilities
+def speaking_order(members, seed):
+    order = list(members)
+    random.Random(seed).shuffle(order)
+    return order
 
 
 class DiscussionState(TypedDict, total=False):
@@ -73,8 +62,8 @@ class GroupDiscussionGraph:
         for node in ("prepare", "score_members", "choose_speaker", "member_turn", "collect", "synthesize", "arbitrate", "apply_resolution"):
             graph.add_node(node, getattr(self, node))
         graph.add_edge(START, "prepare")
-        graph.add_edge("prepare", "score_members")
-        graph.add_edge("score_members", "choose_speaker")
+        graph.add_edge("prepare", "choose_speaker")
+        graph.add_edge("score_members", "choose_speaker")  # Resume legacy checkpoints.
         graph.add_edge("choose_speaker", "member_turn")
         graph.add_edge("member_turn", "collect")
         graph.add_conditional_edges("collect", lambda s: "arbitrate" if s.get("arbitration_reason") else "synthesize" if s.get("winner") else "again",
@@ -102,38 +91,25 @@ class GroupDiscussionGraph:
         return {"history_snapshot": snapshot}
 
     async def score_members(self, state):
-        # All private scorers receive exactly the same frozen transcript.
-        async def score(member):
-            output = await self.engine.turn(state["research_id"], member, state["role"], state["discussion_id"],
-                self.selection_key(state) + ":willingness", Willingness,
-                {"phase": state["phase"], "topic": state["context"].get("topic", ""),
-                 "instruction": "根据是否有相关观点、证据或需要回应的问题，评估现在发言的意愿。",
-                 "conversation_snapshot": [{**m, "text": m["text"][-1500:]} for m in state["history_snapshot"][-8:]]},
-                conversation_id=state["discussion_id"], line_id=state.get("line_id"), publish_message=False)
-            return member, output["score"]
-        tasks = [asyncio.create_task(score(m)) for m in state["members"]]
-        try:
-            return {"scores": dict(await asyncio.gather(*tasks))}
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Kept only as a resume point for checkpoints created by older versions.
+        return {}
 
     async def choose_speaker(self, state):
         await self.engine.guard(state["research_id"])
         key = self.selection_key(state)
         store = self.engine.store
-        # Commit selection before speaking. Crash recovery must not redraw the speaker.
         with store.connect(True) as c:
+            plan = store._get(c, "discussion_order", state["discussion_id"])
+            if plan is None:
+                plan = store._put(c, "discussion_order", state["discussion_id"],
+                    {"members": speaking_order(state["members"], digest(state["discussion_id"]))}, state["research_id"])
             selection = store._get(c, "discussion_selection", key)
             if selection is None:
-                seed = digest(key)
-                speaker, probabilities = select_speaker(state["members"], self.eligible(state), state["scores"],
-                    state.get("heat", {}), state.get("last_speaker"), seed)
-                selection = store._put(c, "discussion_selection", key, {"speaker": speaker, "scores": state["scores"],
-                    "probabilities": probabilities, "heat": state.get("heat", {}), "seed": seed,
-                    "phase": state["phase"], "round": state["round"], "discussion_id": state["discussion_id"]}, state["research_id"])
+                eligible = self.eligible(state)
+                speaker = next(member for member in plan["members"] if member in eligible)
+                selection = store._put(c, "discussion_selection", key,
+                    {"speaker": speaker, "order": plan["members"], "phase": state["phase"],
+                     "round": state["round"], "discussion_id": state["discussion_id"]}, state["research_id"])
                 store._emit(c, state["research_id"], "discussion.speaker_selected", {"selection_id": key, "speaker": speaker},
                             conversation_id=state["discussion_id"], line_id=state.get("line_id"))
         return {"member": selection["speaker"]}
@@ -192,9 +168,9 @@ class GroupDiscussionGraph:
         reviewed = dict(state.get("reviewed_candidates", {}))
         if phase == "review":
             reviewed[member] = digest(candidates)
-        heat = {m: state.get("heat", {}).get(m, 0) * 0.7 + int(m == member) for m in state["members"]}
         return {"records": {f"{phase}:{state['round']}:{member}": output}, "candidates": candidates,
-                "reviewed_candidates": reviewed, "heat": heat, "last_speaker": member}
+                "reviewed_candidates": reviewed}
+
 
     async def collect(self, state):
         if state.get("arbitration_reason"):
@@ -228,7 +204,6 @@ class GroupDiscussionGraph:
 
     async def synthesize(self, state):
         synthesis_state = {**state, "phase": "synthesis", **await self.prepare(state)}
-        synthesis_state.update(await self.score_members(synthesis_state))
         host = (await self.choose_speaker(synthesis_state))["member"]
         candidate = state["candidates"][state["winner"]]
         result = await self.engine.turn(state["research_id"], host, state["role"], state["discussion_id"],
@@ -242,8 +217,7 @@ class GroupDiscussionGraph:
             return {"arbitration_reason": "invalid_group_decision", "arbitration_origin": "discussion.synthesize",
                 "arbitration_diagnostic": "主持人决议与程序选定候选不符", "failed_synthesis": result}
         records = {f"synthesis:{state['round']}:{host}": result}
-        speaking = {"heat": {m: state.get("heat", {}).get(m, 0) * 0.7 + int(m == host) for m in state["members"]},
-                    "last_speaker": host}
+        speaking = {}
         if self.blockers({**state, "records": {**state["records"], **records}}):
             return {**speaking, "records": records, "winner": None, "phase": "review", "round": state["round"] + 1}
         result["selected_payload"] = candidate
