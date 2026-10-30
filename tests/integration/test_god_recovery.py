@@ -36,7 +36,7 @@ def test_god_prompt_preserves_candidates_and_exposes_complete_pagination_manifes
     assert len(sections["diagnostic"]["source_output"]) == 50000
 
 
-@pytest.mark.parametrize("failure", ["fixed", "hash", "path", "entrypoint", "case_collision"])
+@pytest.mark.parametrize("failure", ["fixed", "path", "entrypoint", "case_collision"])
 def test_god_implementation_repair_cannot_bypass_original_business_constraints(failure):
     engine = object.__new__(ResearchEngine)
     spec = ExperimentSpec(spec_id="s", version=1, question="q", hypothesis="h", fixed={"seed": 42},

@@ -410,8 +410,6 @@ class GodDecision(RootModel[Annotated[SelectCandidateDecision | RepairOutputDeci
 
 
 def assert_spec_unchanged(spec: ExperimentSpec, implementation: Implementation) -> None:
-    if implementation.spec_hash and implementation.spec_hash != digest(spec.model_dump()):
-        raise ValueError("spec_revision_required: implementation changed the frozen plan")
     if implementation.actual_config is not None and implementation.actual_config != spec.fixed:
         raise ValueError("spec_revision_required: actual scientific configuration differs from frozen fixed fields")
 

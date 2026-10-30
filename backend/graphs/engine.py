@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.adapters.demo import DemoRuntimeAdapter
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
+from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
@@ -232,7 +233,7 @@ class ResearchEngine:
 
     def validate_output(self, research_id, agent_id, schema, result, context, output_validator=None):
         """Accept structured output only after schema and contextual business checks."""
-        result = schema.model_validate(result).model_dump()
+        result = schema.model_validate(bind_metadata(schema, result, context)).model_dump()
         previous = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"}
                     for i in context.get("issues", []) if i.get("raised_by") == agent_id}
         seen = set()
@@ -244,10 +245,6 @@ class ResearchEngine:
                 lambda source: self.store.source_exists(research_id, source))
         if output_validator is not None:
             output_validator(result)
-        if schema is ExperimentSpec:
-            expected = {"spec_id": context.get("spec_id"), "version": context.get("spec_version"), "deadline_at": context.get("deadline_at")}
-            if any(value is not None and result[key] != value for key, value in expected.items()):
-                raise ValueError("ExperimentSpec identity, version and shared deadline must match the original task")
         return result
 
     def validate_recovery_output(self, research_id, agent_id, schema, result, context, output_validator=None):
@@ -258,7 +255,7 @@ class ResearchEngine:
             if not original.get("spec"):
                 raise ValueError("Implementation recovery needs the original frozen ExperimentSpec")
             spec = ExperimentSpec.model_validate(original["spec"])
-            implementation = Implementation.model_validate(result)
+            implementation = Implementation.model_validate(bind_metadata(Implementation, result, {"spec": spec.model_dump()}))
             assert_spec_unchanged(spec, implementation)
             names = []
             for relative in implementation.files:
@@ -305,14 +302,15 @@ class ResearchEngine:
         identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
         instructions = role_prompt(Role(role)) if publish_message else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
         prompt = identity + "\n" + instructions + "\n\n任务输入（只包含授权上下文）:\n" + json.dumps(context, ensure_ascii=False, default=str)
-        prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象:\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
+        wire_contract = model_contract(schema, context)
+        prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象（系统编号、版本和哈希由程序填写）:\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
         delay, last_error = 1.0, None
         token_limit = output_tokens(not publish_message)
         while True:
             try:
                 result = await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
-                    task_id=task_id, turn_id=turn_id, prompt=prompt, schema=schema, direction_epoch=context.get("direction_epoch", 1),
+                    task_id=task_id, turn_id=turn_id, prompt=prompt, schema=wire_contract, direction_epoch=context.get("direction_epoch", 1),
                     model=project["config_snapshot"]["provider"], context=context,
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
                         "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message,
@@ -459,14 +457,16 @@ class ResearchEngine:
         prompt_context = {"arbitration_request": {k: v for k, v in request.items()
             if k not in {"history", "attempts", "recovered_response"}}, "repair_feedback": feedback, **god_prompt_context(sections)}
         prompt = f"你的独立执行身份是 {agent_id}。\n" + role_prompt(Role.GOD) + "\n本次冻结仲裁请求：\n" + json.dumps(prompt_context, ensure_ascii=False)
-        prompt += "\n返回允许动作之一的完整 JSON：\n" + json.dumps(GodDecision.model_json_schema(), ensure_ascii=False)
+        wire_contract = model_contract(GodDecision, context)
+        prompt += "\n返回允许动作之一的完整 JSON（系统身份和哈希由程序填写）：\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
         output = await adapter.execute_turn(research_id=request["research_id"], agent_id=agent_id, role="god",
-            task_id=aid + ":judge", turn_id=f"judge:{attempt}", prompt=prompt, schema=GodDecision,
+            task_id=aid + ":judge", turn_id=f"judge:{attempt}", prompt=prompt, schema=wire_contract,
             direction_epoch=request.get("direction_epoch", 1), model=project["config_snapshot"]["provider"], context=context,
             runtime_context={"conversation_id": cid, "line_id": request.get("line_id"),
                 "direction_epoch": request.get("direction_epoch"), "arbitration_id": aid,
                 "snapshot_hash": request["snapshot_hash"], "max_output_tokens": max_output_tokens})
+        output = bind_metadata(GodDecision, output, context)
         # The service validates the action and only then publishes an applied summary.
         self.store.create_message(request["research_id"], cid, agent_id,
             output.get("content_markdown", json.dumps(output, ensure_ascii=False)), source_system="god_generation",
@@ -775,7 +775,7 @@ class ResearchEngine:
              "prior_runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
              "prior_runs": [run for run in self.store.list("run", state["research_id"]) if run.get("spec_id") == state["spec_id"]]},
             conversation_id=implementation_id, line_id=state["line_id"])
-        implementation = Implementation.model_validate(result)
+        implementation = Implementation.model_validate(bind_metadata(Implementation, result, {"spec": spec.model_dump()}))
         await self.line_open(state)
         try:
             assert_spec_unchanged(spec, implementation)
@@ -916,9 +916,10 @@ class ResearchEngine:
             "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
             "rule_ids": [str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)]},
             conversation_id=run_id + ":monitor", line_id=state["line_id"])
+        monitor["evidence_log_hash"] = window["log_hash"]
         if monitor["request_early_stop"]:
             allowed = {str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)} | {"execution_unusable"}
-            if monitor["rule_id"] not in allowed or monitor["evidence_log_hash"] != window["log_hash"]:
+            if monitor["rule_id"] not in allowed:
                 raise RuntimeBlocked("invalid_early_stop", "提前终止意见未绑定冻结规则与真实运行证据")
             await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
         await self.guard(rid)
