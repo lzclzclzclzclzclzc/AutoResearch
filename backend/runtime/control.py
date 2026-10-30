@@ -476,6 +476,8 @@ def _request(url: str, body: dict | None = None, token: str | None = None, timeo
             detail = json.loads(exc.read(8192))
         except (OSError, ValueError):
             detail = {}
+        if detail.get("code") == "control_unavailable":
+            raise ControlUnavailable("本机服务暂时不可用") from exc
         if detail.get("code") == "control_journal_incomplete":
             raise ControlUnavailable("控制日志存在未确认或损坏记录，启动门禁已关闭；请检查控制服务恢复状态。", "control_journal_incomplete") from exc
         if 400 <= exc.code < 500 and exc.code not in {408, 429}:

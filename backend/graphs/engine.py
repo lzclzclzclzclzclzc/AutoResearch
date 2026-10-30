@@ -1053,7 +1053,9 @@ class ResearchEngine:
         report = {**report, "checks": [report["content_markdown"]], "supported_conclusions": [e["claim"] for e in report["evidence"]],
                   "unsupported_conclusions": report["limitations"], **{k: submission[k] for k in ("spec_id", "spec_version", "code_version", "run_ids")}}
         transition = await asyncio.to_thread(self.store.commit_verification, state["cycle_id"], state["submission_id"], report, p["control_generation"], self.control)
-        if transition["route"] in {"halted", "awaiting_confirmation_sync"}:
+        if transition["route"] == "awaiting_confirmation_sync":
+            raise RuntimeBlocked("confirmation_pending", "验证等待控制确认，稍后自动重试")
+        if transition["route"] == "halted":
             raise ResearchStopped("验证候选未获得有效控制确认，不增加轮次")
         self.store.update_line(state["research_id"], state["line_id"], completed_verify_rounds=transition["round_no"])
         return {"route": transition["route"]}

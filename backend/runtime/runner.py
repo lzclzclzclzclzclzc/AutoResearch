@@ -974,7 +974,7 @@ def create_app(data_dir: str | Path = "data", supervisor: RunnerSupervisor | Non
 
     @app.exception_handler(ControlUnavailable)
     async def control_error(request, exc):
-        return JSONResponse(status_code=409, content={"code": "execution_forbidden", "message": str(exc)})
+        return JSONResponse(status_code=503 if exc.code == "control_unavailable" else 409, content={"code": exc.code, "message": str(exc)})
 
     @app.get("/health")
     def health():
