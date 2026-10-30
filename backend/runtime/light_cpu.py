@@ -7,7 +7,6 @@ supervision is not a filesystem security boundary.
 from __future__ import annotations
 
 import ast
-import csv
 import hashlib
 import json
 import os
@@ -136,38 +135,14 @@ class LightCpuService:
                 if actual!=metadata["sha256"]:raise ValueError("证据完整性检查失败")
                 copied=inputs/(hashlib.sha256(eid.encode()).hexdigest()[:24]+path.suffix)
                 shutil.copyfile(path,copied);copied.chmod(stat.S_IREAD)
-                text=copied.read_text(encoding="utf-8")
-                content=scientific_loads(text) if path.suffix.lower()==".json" else list(csv.DictReader(text.splitlines(),delimiter="\t" if path.suffix.lower()==".tsv" else ",")) if path.suffix.lower() in (".csv",".tsv") else text
-                evidence[eid]={"name":metadata["name"],"sha256":actual,"data":content}
+                evidence[eid]={"name":metadata["name"],"sha256":actual,"path":str(copied)}
             data_dir = str(Path(project["workspace_path"]).expanduser().resolve()) if project.get("workspace_path") else None
             context={"evidence":evidence,"workspace_dir":str(directory),"data_dir":data_dir}
             job.update(workspace_dir=str(directory),data_dir=data_dir)
             (directory/"inputs.json").write_text(json.dumps(context,ensure_ascii=False),encoding="utf-8")
             (directory/"analysis.py").write_text(code,encoding="utf-8")
-            wrapper="""import json,runpy,sys
-from pathlib import Path
-context=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-scope=runpy.run_path(str(Path(__file__).with_name('analysis.py')), init_globals={
-    'evidence':context['evidence'], 'workspace_dir':context['workspace_dir'],
-    'data_dir':context['data_dir'], 'result':None}, run_name='__main__')
-def scientific_default(value):
-    root = type(value).__module__.split('.')[0]
-    if root == 'numpy':
-        return value.tolist() if hasattr(value, 'tolist') else value.item()
-    if root == 'pandas':
-        if type(value).__name__ == 'DataFrame':
-            return value.to_dict(orient='records')
-        if hasattr(value, 'tolist'):
-            return value.tolist()
-        if type(value).__name__ in ('NAType', 'NaTType'):
-            return None
-        if hasattr(value, 'isoformat'):
-            return value.isoformat()
-    raise TypeError('Unsupported result type: ' + type(value).__name__)
-Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_ascii=False,default=scientific_default),encoding='utf-8')
-"""
             script=directory/"run_numeric.py"
-            script.write_text(wrapper,encoding="utf-8")
+            shutil.copyfile(Path(__file__).with_name("light_cpu_child.py"), script)
             job.update(log_path=str(directory/"stdout.log"),result_path=str(directory/"result.json"),evidence_ids=ids)
             self.control.register_process(rid,execution_id,kind="light_cpu",control_epoch=job["control_epoch"],control_generation=generation,supervisor_id=self.instance_id)
             # Keep BLAS from allocating a machine-wide worker pool for a 1-core job.
@@ -199,8 +174,12 @@ Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_as
                 raise ControlUnavailable("结果返回前研究已停止")
             job.update(state="completed" if process.poll()==0 else "execution_failed",exit_code=process.poll())
             if job["state"]=="completed":
-                job["result"]=scientific_loads(Path(job["result_path"]).read_text(encoding="utf-8"))["result"]
-                job["result_numeric_status"]=numeric_status(job["result"])
+                if Path(job["result_path"]).exists():
+                    job["result"]=scientific_loads(Path(job["result_path"]).read_text(encoding="utf-8"))["result"]
+                    job["result_numeric_status"]=numeric_status(job["result"])
+                preview = directory/"result.txt"
+                if preview.exists():
+                    job["result_text"]=preview.read_text(encoding="utf-8")
         except Exception as error:
             job.update(state="cancelled" if isinstance(error,ControlUnavailable) else "execution_failed",error=str(error))
             if not admitted:
@@ -233,7 +212,21 @@ Path(sys.argv[2]).write_text(json.dumps({'result':scope.get('result')},ensure_as
                 job["logs"]=stream.read().decode("utf-8",errors="replace")
             job["log_artifact"]=store.register_artifact(job["research_id"],job["log_path"],"text/plain",kind="light_cpu_log",line_id=line_id)
         if job.get("state")=="completed":
-            job["artifact"]=store.register_artifact(job["research_id"],job["result_path"],"application/json",kind="light_cpu_result",line_id=line_id,source_evidence_ids=job.get("evidence_ids",[]))
+            directory = Path(job["workspace_dir"])
+            internal = {"analysis.py", "run_numeric.py", "inputs.json", "stdout.log"}
+            outputs = []
+            for path in sorted(directory.rglob("*")):
+                if (not path.is_file() or not path.resolve().is_relative_to(directory.resolve())
+                        or path.relative_to(directory).parts[0] in {"evidence", "__pycache__"}
+                        or path.relative_to(directory).as_posix() in internal):
+                    continue
+                import mimetypes
+                outputs.append(store.register_artifact(job["research_id"], path,
+                    mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    kind="light_cpu_result",line_id=line_id,source_evidence_ids=job.get("evidence_ids",[])))
+            job["output_artifacts"] = outputs
+            if outputs:
+                job["artifact"] = next((a for a in outputs if a["name"] == "result.json"), outputs[0])
 
     def expire_due(self):
         with self.lock:
