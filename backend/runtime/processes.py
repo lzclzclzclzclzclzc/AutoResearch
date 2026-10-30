@@ -71,6 +71,8 @@ def sanitized_environment(overrides: dict | None = None, gpu_uuids: list[str] | 
             raise ValueError("Credential-like environment variables are forbidden in experiments")
         safe[str(key)] = str(value)
     safe["PYTHONUNBUFFERED"] = "1"
+    safe["PYTHONIOENCODING"] = "utf-8"
+    safe["PYTHONUTF8"] = "1"
     safe["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids or [])
     return safe
 
