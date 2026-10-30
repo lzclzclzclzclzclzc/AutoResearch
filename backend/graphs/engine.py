@@ -862,6 +862,9 @@ class ResearchEngine:
         while True:
             await self.line_open(state)
             allocation = await asyncio.to_thread(self.runner.request_allocation, request)
+            if allocation["state"] == "unsatisfiable":
+                self.store.emit(state["research_id"], "allocation.unsatisfiable", allocation, line_id=state["line_id"])
+                return allocation
             if allocation["state"] == "granted":
                 self.store.emit(state["research_id"], "allocation.granted", allocation, line_id=state["line_id"])
                 return allocation
