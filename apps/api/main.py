@@ -39,7 +39,7 @@ class Team(Input):
     k: int = Field(default=3, ge=1, le=20)
     boss_members: int = Field(default=3, ge=1, le=9)
     max_runtime_seconds: int = Field(default=3600, ge=1, le=31536000)
-    model_concurrency: int = Field(default=4, ge=1, le=64)
+    model_concurrency: int = Field(default=4, ge=1)
     experiment_concurrency: int = Field(default=1, ge=1, le=16)
 
 
@@ -53,7 +53,7 @@ class Research(Input):
     max_runtime_seconds: int | None = Field(default=None, ge=1, le=31536000)
     mode: Literal["live", "demo"] = "live"
     workspace_path: str | None = Field(default=None, max_length=4000)
-    model_concurrency: int | None = Field(default=None, ge=1, le=64)
+    model_concurrency: int | None = Field(default=None, ge=1)
     experiment_concurrency: int | None = Field(default=None, ge=1, le=16)
 
     @field_validator("topic")

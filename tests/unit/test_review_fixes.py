@@ -138,3 +138,42 @@ def test_resource_limits_are_per_project_and_impossible_requests_return(tmp_path
             'spec_version': 1, 'spec_hash': digest(spec.model_dump()), 'resource_request_id': name, 'cpu_cores': 1, 'memory_bytes': 128*1024**2})
     assert [resources.request_allocation(r)['state'] for r in requests] == ['granted', 'granted']
     assert resources.request_allocation({**requests[0], 'resource_request_id': 'too-large', 'cpu_cores': 9})['state'] == 'unsatisfiable'
+
+def test_output_metadata_is_optional_and_concurrency_has_no_arbitrary_ceiling(tmp_path):
+    from apps.api.main import Team, Research
+    assert Implementation.model_validate({'files': {'main': 'pass'}, 'entrypoint': 'main', 'extra_note': 'allowed'}).actual_config is None
+    assert Team(model_concurrency=1000).model_concurrency == 1000
+    assert Research(title='test', topic='test', model_concurrency=1000).model_concurrency == 1000
+    assert DshRuntimeAdapter(Store(tmp_path), None, None).semaphore is None
+
+
+@pytest.mark.asyncio
+async def test_measured_provider_capacity_is_shared_across_projects(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    store = Store(tmp_path)
+    projects = [started(store, name) for name in ('a', 'b')]
+    provider = store.get('provider', 'deepseek-default')
+    benchmark = {k: provider.get(k) for k in ('base_url', 'model', 'credential_version')}
+    benchmark['recommended_limit'] = 96
+    store.patch('provider', provider['id'], concurrency_benchmark=benchmark)
+    adapter = DshRuntimeAdapter(store, None, None)
+    monkeypatch.setattr(adapter, 'availability', lambda: {'available': True})
+    observed = []
+    class AdmissionObserved(Exception): pass
+    @asynccontextmanager
+    async def admission(*args):
+        observed.append(args[3:])
+        raise AdmissionObserved
+        yield
+    monkeypatch.setattr(adapter, '_admission', admission)
+    for project in projects:
+        with pytest.raises(AdmissionObserved):
+            await adapter.execute_turn(research_id=project['id'], agent_id='line-01/implementation', role='implementation',
+                task_id='task', turn_id='code', prompt='', schema=Implementation)
+    assert observed[0][-1] is observed[1][-1]
+    assert observed[0][-1]._value == 96
+    store.patch('provider', provider['id'], credential_version=provider.get('credential_version', 0)+1)
+    with pytest.raises(AdmissionObserved):
+        await adapter.execute_turn(research_id=projects[0]['id'], agent_id='line-01/implementation', role='implementation',
+            task_id='task', turn_id='code', prompt='', schema=Implementation)
+    assert len(observed[-1]) == 2  # Session identity and project setting; stale measurement is ignored.

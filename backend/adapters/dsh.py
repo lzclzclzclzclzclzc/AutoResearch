@@ -124,15 +124,16 @@ class DshRuntimeAdapter:
     normal Harness home. The business ledger owns attempts, not the SDK.
     """
 
-    def __init__(self, store, control, credentials, concurrency: int = 4, runner=None):
+    def __init__(self, store, control, credentials, concurrency: int | None = None, runner=None):
         self.store, self.control, self.credentials = store, control, credentials
         self.root = store.data_dir / "dsh"
         self.root.mkdir(parents=True, exist_ok=True)
-        self.semaphore = asyncio.Semaphore(concurrency)
+        self.semaphore = asyncio.Semaphore(concurrency) if concurrency is not None else None
         self.locks: dict[str, asyncio.Lock] = {}
         self.processes: dict[str, asyncio.subprocess.Process] = {}
         self.runner, self.gateway = runner, None
         self.project_semaphores = {}
+        self.provider_semaphores = {}
 
     def availability(self):
         return runtime_availability()
@@ -208,7 +209,16 @@ class DshRuntimeAdapter:
         concurrency = project["config_snapshot"]["team"].get("model_concurrency", 4)
         project_semaphore = self.project_semaphores.setdefault(research_id, asyncio.Semaphore(concurrency))
         async with self._admission(research_id, generation, runtime_context or {},
-                self.locks.setdefault(session["id"], asyncio.Lock()), self.semaphore, project_semaphore):
+                self.locks.setdefault(session["id"], asyncio.Lock()), project_semaphore,
+                *measured_gates, *([self.semaphore] if self.semaphore is not None else [])):
+        provider = self.store.get("provider", project["provider_config_id"]) or {}
+        benchmark = provider.get("concurrency_benchmark") or {}
+        measured_gates = []
+        if (benchmark.get("recommended_limit") and benchmark.get("base_url") == provider.get("base_url")
+                and benchmark.get("model") == provider.get("model")
+                and benchmark.get("credential_version") == provider.get("credential_version")):
+            key = digest([project["provider_config_id"], benchmark])
+            measured_gates.append(self.provider_semaphores.setdefault(key, asyncio.Semaphore(int(benchmark["recommended_limit"]))))
             if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                 raise ResearchStopped("研究已停止或控制服务不可用")
             previous = self.store.get("execution", logical_key)
