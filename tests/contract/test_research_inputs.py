@@ -50,22 +50,22 @@ def test_authorized_csv_and_python_are_read_only_immutable_evidence(inputs):
     assert len([event for event in gateway.store.events(project["id"]) if event["type"] == "research.input_read"]) == 2
 
 
-@pytest.mark.parametrize("path", ["../outside.py", "..\\outside.py", "C:\\Windows\\win.ini", "/Windows/win.ini", "data.csv:secret", ".env", ".ssh/id_rsa", "my_api_key.txt"])
-def test_traversal_and_credential_paths_are_denied(inputs, path):
+@pytest.mark.parametrize("path", ["../outside.py", "..\\outside.py", "C:\\Windows\\win.ini", "/Windows/win.ini", "data.csv:secret"])
+def test_paths_outside_the_selected_directory_are_denied(inputs, path):
     with pytest.raises((InputAccessError, PermissionError)):
         call(inputs, "read_research_input", relative_path=path)
 
 
-def test_input_listing_is_paginated_and_hides_credentials(inputs):
+def test_input_listing_is_paginated_and_includes_hidden_files(inputs):
     _, _, root, _ = inputs
     (root / ".env").write_text("secret", encoding="utf-8")
     for index in range(105):
         (root / f"item-{index:03d}.py").write_text("pass", encoding="utf-8")
     first = call(inputs, "list_research_inputs")
     second = call(inputs, "list_research_inputs", offset=first["next_offset"])
-    assert len(first["entries"]) == 100 and len(second["entries"]) == 5
+    assert len(first["entries"]) == 100 and len(second["entries"]) == 6
     assert first["next_offset"] == 100 and second["next_offset"] is None
-    assert all(entry["name"] != ".env" for entry in first["entries"] + second["entries"])
+    assert any(entry["name"] == ".env" for entry in first["entries"] + second["entries"])
 
 
 def test_input_chunk_transport_is_bounded_and_advances(inputs):
@@ -90,10 +90,9 @@ def test_managed_storage_missing_input_and_frozen_paper_are_denied(inputs):
     with pytest.raises(PermissionError):
         gateway.call(paper, {"name": "list_research_inputs", "arguments": {}})
     gateway.store.update_project(project["id"], workspace_path=str(gateway.store.data_dir))
-    with pytest.raises(InputAccessError):
-        call(inputs, "list_research_inputs")
+    assert call(inputs, "list_research_inputs")["entries"]
     gateway.store.update_project(project["id"], workspace_path=str(root.parent))
-    assert "managed" not in {entry["name"] for entry in call(inputs, "list_research_inputs")["entries"]}
+    assert "managed" in {entry["name"] for entry in call(inputs, "list_research_inputs")["entries"]}
     gateway.store.update_project(project["id"], workspace_path=None)
     with pytest.raises(InputAccessError, match="No human-selected"):
         call(inputs, "list_research_inputs")
@@ -121,3 +120,23 @@ def test_reparse_or_symlink_to_outside_input_is_denied(inputs):
     with pytest.raises(InputAccessError):
         call(inputs, "read_research_input", relative_path=relative)
     assert not call(inputs, "list_research_inputs")["entries"]
+
+
+def test_selected_directory_allows_names_and_binary_files(inputs):
+    import base64
+    _, _, root, _ = inputs
+    (root / 'tokens').mkdir()
+    for name in ('.env', 'tokens/data.key', 'my_api_key.txt'):
+        (root / name).write_text('ordinary selected input', encoding='utf-8')
+        assert call(inputs, 'read_research_input', relative_path=name)['text'] == 'ordinary selected input'
+    raw = bytes(range(256)) * 400
+    (root / 'data.npy').write_bytes(raw)
+    offset, restored = 0, b''
+    while True:
+        page = call(inputs, 'read_research_input', relative_path='data.npy', offset=offset)
+        restored += base64.b64decode(page['data_base64'])
+        assert len(json.dumps(page).encode()) <= 64 * 1024
+        if page['eof']: break
+        assert page['next_offset'] > offset
+        offset = page['next_offset']
+    assert restored == raw

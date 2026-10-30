@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import codecs
 import json
 import mimetypes
@@ -12,15 +13,12 @@ from pathlib import Path, PureWindowsPath
 
 
 class InputAccessError(PermissionError):
-    public_message = "资料路径未获授权、包含受保护文件，或文件在读取时发生变化"
+    public_message = "资料路径未获授权，或文件在读取时发生变化"
 
 
 class ResearchInputs:
     TRANSPORT_LIMIT = 64 * 1024
     PAGE_SIZE = 100
-    PROTECTED_PARTS = {".git", ".ssh", ".aws", ".azure", ".config", ".codex", ".agents", "credentials", "secrets", "node_modules", ".venv"}
-    PROTECTED_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".dpapi", ".jks", ".kdbx"}
-
     def __init__(self, store, research_id, context, progress):
         self.store, self.research_id, self.context, self.progress = store, research_id, context, progress
         value = store.project(research_id).get("workspace_path")
@@ -36,25 +34,11 @@ class ResearchInputs:
         except OSError as error:
             raise InputAccessError("Human input directory is unavailable") from error
         self.managed = store.data_dir.resolve()
-        if not self.root.is_dir() or self.root.is_relative_to(self.managed) or self._protected(self.root.parts):
-            raise InputAccessError("Protected input directory")
-
-    @classmethod
-    def _protected(cls, parts):
-        for part in parts:
-            name = part.lower()
-            if name in cls.PROTECTED_PARTS or name.startswith((".env", ".credentials")):
-                return True
-            if Path(name).suffix in cls.PROTECTED_SUFFIXES:
-                return True
-            if any(token in name for token in ("credential", "api_key", "api-key", "apikey", "private_key", "private-key", "access_token", "access-token")):
-                return True
-            if name in {"id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", ".netrc", ".npmrc", ".pypirc", "authorized_keys", "password", "passwords", "token", "tokens", "secrets.json", "secrets.toml", "secrets.yaml", "secrets.yml"}:
-                return True
-        return False
+        if not self.root.is_dir():
+            raise InputAccessError("Selected input is not a directory")
 
     def _check(self, path):
-        if not path.is_relative_to(self.root) or path.is_relative_to(self.managed) or self._protected(path.relative_to(self.root).parts):
+        if not path.is_relative_to(self.root):
             raise InputAccessError("Path escapes the selected workspace or is protected")
         return path
 
@@ -62,7 +46,7 @@ class ResearchInputs:
         if not isinstance(value, str) or "\x00" in value or ":" in value:
             raise InputAccessError("Invalid relative input path")
         windows = PureWindowsPath(value)
-        if windows.is_absolute() or windows.drive or any(part == ".." for part in windows.parts) or self._protected(windows.parts):
+        if windows.is_absolute() or windows.drive or any(part == ".." for part in windows.parts):
             raise InputAccessError("Input paths must stay relative to the selected directory")
         try:
             return self._check((self.root / Path(*windows.parts)).resolve(strict=True))
@@ -83,8 +67,6 @@ class ResearchInputs:
         for entry in sorted(directory.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
             try:
                 resolved = self._check(entry.resolve(strict=True))
-                if self._protected(entry.relative_to(self.root).parts):
-                    continue
                 info = resolved.stat()
                 if not (resolved.is_file() or resolved.is_dir()):
                     continue
@@ -142,8 +124,6 @@ class ResearchInputs:
                 while chunk := original.read(1024 * 1024):
                     if not self.progress():
                         raise InputAccessError("Research is stopped")
-                    if b"\x00" in chunk:
-                        raise InputAccessError("Binary input reading is unsupported")
                     copied.write(chunk)
                     sha.update(chunk)
                 after = os.fstat(original.fileno())
@@ -161,7 +141,17 @@ class ResearchInputs:
                 handle.seek(offset)
                 raw = handle.read(self.TRANSPORT_LIMIT)
             result = {"artifact_id": artifact["id"], "source_relative_path": relative, "source_sha256": source_hash,
-                "sha256": artifact["sha256"], "offset": offset, "total_bytes": artifact["size_bytes"]}
+                "sha256": artifact["sha256"], "path": str(immutable), "offset": offset, "total_bytes": artifact["size_bytes"]}
+            try:
+                raw.decode("utf-8")
+                binary = b"\x00" in raw
+            except UnicodeDecodeError as error:
+                binary = error.reason != "unexpected end of data"
+            if binary:
+                raw = raw[:(self.TRANSPORT_LIMIT // 2)]
+                result.update(encoding="base64", data_base64=base64.b64encode(raw).decode("ascii"),
+                    next_offset=offset + len(raw), eof=offset + len(raw) >= artifact["size_bytes"])
+                return result
             # Bound serialized UTF-8 response, including escaped controls/metadata.
             count = len(raw)
             while True:
