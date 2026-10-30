@@ -85,6 +85,7 @@ class LineState(TypedDict, total=False):
     spec_id: str
     implementation_id: str
     allocation_id: str
+    allocation_route: str
     run_id: str
     submission_id: str
     route: str
@@ -120,6 +121,7 @@ class ResearchEngine:
                                ("run_experiment", "assess_run"), ("package", "verify"), ("verify", "route_result")):
             graph.add_edge(source, target)
         graph.add_conditional_edges("implement", lambda state: state.get("implementation_route", "organize"), {"organize": "organize", "package": "package", "design": "design", "implement": "implement"})
+        graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement"})
         graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package"})
         graph.add_conditional_edges("route_result", lambda state: "design" if state["route"] == "exploration_and_critic" else END,
                                     {"design": "design", END: END})
@@ -843,13 +845,18 @@ class ResearchEngine:
             "implementation_agent_id": f"{state['line_id']}/implementation", "spec_id": spec.spec_id, "spec_version": spec.version,
             "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"], "memory_bytes": impl["memory_mb"] * 1024 * 1024,
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
+
+             "resource_feedback": self.store.get("resource_feedback", state["spec_id"]),
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
             advice = await self.organizer_graph.run({"research_id": state["research_id"], "id": request["resource_request_id"],
                 "payload": request})
         request["priority"] = advice["priority"]
         allocation = await self.wait_for_allocation(state, request)
-        return {"allocation_id": allocation["allocation_id"]}
+        if allocation["state"] == "unsatisfiable":
+            self.store.put("resource_feedback", state["spec_id"], allocation, state["research_id"])
+            return {"allocation_route": "implement", "code_attempt": state.get("code_attempt", 1) + 1}
+        return {"allocation_id": allocation["allocation_id"], "allocation_route": "run_experiment"}
 
     async def wait_for_allocation(self, state, request):
         while True:
@@ -950,6 +957,9 @@ class ResearchEngine:
             bound = ("research_id", "allocation_id", "start_operation_id", "experiment_run_id", "control_generation",
                      "grant_revision", "spec_id", "spec_version", "spec_hash", "code_version")
             if any(recovered.get(k) != payload.get(k) for k in bound):
+            if allocation["state"] == "unsatisfiable":
+                self.store.emit(state["research_id"], "allocation.unsatisfiable", allocation, line_id=state["line_id"])
+                return allocation
                 raise
             if recovered.get("state") not in {"starting", "running", "reconciling"} and (
                     recovered.get("state") not in {"execution_failed", "interrupted", "completed", "succeeded", "early_stopped"}

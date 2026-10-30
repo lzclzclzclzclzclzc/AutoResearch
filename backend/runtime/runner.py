@@ -241,7 +241,7 @@ class ResourceService:
             if isinstance(config, dict):
                 config = config.get("team", config)
             maximum = int(config.get("experiment_concurrency", 1)) if isinstance(config, dict) else 1
-            fits = fits and sum(not item.get("light_cpu") for item in held) < max(maximum, 1)
+            fits = fits and sum(not item.get("light_cpu") and item["research_id"] == rid for item in held) < max(maximum, 1)
             # Aging plus explicit priority: a fitting older request may not be bypassed indefinitely.
             waiting = [json.loads(row[0]) for row in c.execute("SELECT data FROM runtime_allocations WHERE state='queued'")]
             score = float(allocation.get("priority", 0)) + (now - allocation["requested_at"]) / 30
@@ -262,7 +262,11 @@ class ResourceService:
                     and used_memory + other["memory_bytes"] <= self.capacity["memory_total_bytes"]
                     and len(other_devices)>=other.get("gpu_count",0)):
                     fits = False
-            if fits:
+            impossible = (cores > self.capacity["cpu_cores"] or memory > self.capacity["memory_total_bytes"]
+                or gpu_count > len(self.capacity.get("gpus", [])))
+            if impossible:
+                allocation.update(state="unsatisfiable", waiting_reason="申请超过机器总容量，请调整执行资源", capacity=self.capacity)
+            elif fits:
                 allocation.update(state="granted", granted_at=now, grant_expires_at=min(now + 30, allocation["deadline_at"]),
                     gpu_uuids=[g["uuid"] for g in available[:gpu_count]])
                 allocation.pop("waiting_reason", None)

@@ -123,3 +123,18 @@ async def test_local_dependencies_and_unchanged_repairs_are_executed(tmp_path):
     implementation = store.get('implementation', result['implementation_id'])
     run = subprocess.run([sys.executable, implementation['entrypoint']], cwd=implementation['cwd'], capture_output=True)
     assert run.returncode == 0 and run.stdout.strip() == b'42'
+
+def test_resource_limits_are_per_project_and_impossible_requests_return(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    capacity = {'cpu_cores': 8, 'memory_total_bytes': 8*1024**3, 'memory_available_bytes': 8*1024**3, 'gpus': []}
+    monkeypatch.setattr('backend.runtime.runner.detect_resources', lambda *args: capacity)
+    resources = ResourceService(store.path, SimpleNamespace(allows_progress=lambda *args: True), capacity)
+    requests = []
+    for name in ['a', 'b']:
+        project = started(store, name)
+        spec = ExperimentSpec(spec_id=name, version=1, question='q', hypothesis='h', fixed={}, baseline='b', data={}, metrics=['m'], design={}, monitoring={}, completion_criteria='exit', deadline_at=project['deadline_at'])
+        store.put('spec', name, spec.model_dump(), project['id'])
+        requests.append({'research_id': project['id'], 'implementation_agent_id': 'line-01/implementation', 'spec_id': name,
+            'spec_version': 1, 'spec_hash': digest(spec.model_dump()), 'resource_request_id': name, 'cpu_cores': 1, 'memory_bytes': 128*1024**2})
+    assert [resources.request_allocation(r)['state'] for r in requests] == ['granted', 'granted']
+    assert resources.request_allocation({**requests[0], 'resource_request_id': 'too-large', 'cpu_cores': 9})['state'] == 'unsatisfiable'
