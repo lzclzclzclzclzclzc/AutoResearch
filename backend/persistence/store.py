@@ -799,8 +799,21 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
                 "status": "pending", "created_at": now(), "attempt": 0}, research_id)
 
     def pending_tasks(self, limit=100):
-        return [t for t in self.list("task") if t["status"] == "pending" or
-                (t["status"] == "retry_wait" and t.get("retry_not_before", "") <= now())][:limit]
+        eligible = {p["id"] for p in self.projects() if p["status"] in {"created", "queued", "running"}}
+        queues = {}
+        for task in self.list("task"):
+            if task["research_id"] in eligible and (task["status"] == "pending" or
+                    task["status"] == "retry_wait" and task.get("retry_not_before", "") <= now()):
+                queues.setdefault(task["research_id"], []).append(task)
+        result = []
+        while queues and len(result) < limit:
+            for rid in list(queues):
+                result.append(queues[rid].pop(0))
+                if not queues[rid]:
+                    del queues[rid]
+                if len(result) >= limit:
+                    break
+        return result
 
     def claim_task(self, task_id, owner):
         with self.connect(True) as c:

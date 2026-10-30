@@ -65,3 +65,11 @@ async def test_verify_confirmation_loss_retries_same_report(tmp_path):
         assert store.get('cycle', 'cycle')['completed_verify_rounds'] == 1
     finally:
         control.close()
+
+def test_paused_backlog_does_not_hide_other_projects(tmp_path):
+    store = Store(tmp_path)
+    first, second = sorted([started(store, 'a'), started(store, 'b')], key=lambda p: p['id'])
+    store.update_project(first['id'], status='paused')
+    for i in range(120):
+        store.add_task(first['id'], 'communication', {}, f'paused-{i}')
+    assert any(t['research_id'] == second['id'] for t in store.pending_tasks())
