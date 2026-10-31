@@ -1,5 +1,6 @@
 data/
-/docs/
+docs/*
+!docs/GROUP-DISCUSSION-AND-GOD-REDESIGN.md
 /.taste-skill/
 .venv/
 .cache/
