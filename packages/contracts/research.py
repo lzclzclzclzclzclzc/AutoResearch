@@ -6,7 +6,7 @@ import math
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, model_serializer, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel, model_serializer, model_validator
 
 
 def digest(value: Any) -> str:
@@ -43,6 +43,100 @@ class Role(StrEnum):
     PAPER = "paper"
 
 
+# These are executable handoffs, rather than model-invented node identifiers.
+DISCUSSION_NEXT_STEPS = {
+    "exploration": ("critic",),
+    "critic": ("implementation", "exploration"),
+    "boss": ("dispatch", "finish_lines", "finish_project", "report"),
+}
+
+
+def allowed_next_steps(role: str | Role) -> tuple[str, ...]:
+    try:
+        return DISCUSSION_NEXT_STEPS[str(role)]
+    except KeyError as error:
+        raise ValueError(f"Role {role!s} has no group-discussion handoff") from error
+
+
+class OrdinaryVoteRequest(Contract):
+    question: str = Field(min_length=1)
+    options: list[str] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def readable_choices(self):
+        if not self.question.strip() or any(not option.strip() for option in self.options):
+            raise ValueError("A poll needs a readable question and options")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("Poll options must be distinct")
+        return self
+
+
+class EndVoteRequest(Contract):
+    final_output: dict[str, Any] = Field(min_length=1)
+
+
+class DiscussionTurn(Contract):
+    """A normal utterance, optionally followed by a member-initiated vote."""
+    content_markdown: str
+    ordinary_vote: OrdinaryVoteRequest | None = Field(default=None,
+        validation_alias=AliasChoices("ordinary_vote", "poll"))
+    end_vote: EndVoteRequest | None = None
+
+    @model_validator(mode="after")
+    def one_request_at_a_time(self):
+        if self.ordinary_vote is not None and self.end_vote is not None:
+            raise ValueError("Only one vote can be opened by a discussion turn")
+        return self
+
+
+class PollBallot(Contract):
+    option: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+# Both names describe the same ordinary (non-ending) poll contract.
+OrdinaryBallot = PollBallot
+
+
+class EndBallot(Contract):
+    approve: bool = Field(strict=True)
+    next_step: str | None = None
+
+
+class DiscussionFinal(Contract):
+    next_step: str = Field(min_length=1)
+    final_output: dict[str, Any] = Field(min_length=1)
+
+
+class BossOperation(Contract):
+    operation: Literal["research", "change_direction", "finish_line", "report"]
+    target: str | None = None
+    objective: str | None = None
+
+    @model_validator(mode="after")
+    def executable_parameters(self):
+        if self.operation != "report" and not (self.target or "").strip():
+            raise ValueError("A line operation needs a target from the line catalog")
+        if self.operation == "change_direction" and not (self.objective or "").strip():
+            raise ValueError("Changing direction needs a new research objective")
+        return self
+
+
+class SharedKnowledge(Contract):
+    """Optional Boss knowledge; storage identity and tree placement are program-owned."""
+    content_markdown: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+    title: str | None = None
+    status: str = "unverified"
+    conditions: str = ""
+
+    @model_validator(mode="after")
+    def readable_knowledge(self):
+        if not self.content_markdown.strip() or any(not source.strip() for source in self.source_ids):
+            raise ValueError("Shared knowledge needs readable content and actual source references")
+        return self
+
+
 class Evidence(Contract):
     source_id: str
     claim: str
@@ -61,6 +155,18 @@ class IssueReclassification(Contract):
         return self
 
 
+class IssueStageReview(Contract):
+    from_stage: Literal["design", "execution"]
+    rationale: str = Field(min_length=1)
+    evidence: list[Evidence] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def supported_review(self):
+        if not self.rationale.strip() or any(not e.source_id.strip() or not e.claim.strip() or e.status == "unverified" for e in self.evidence):
+            raise ValueError("Changing acceptance stage needs a reason and traceable evidence")
+        return self
+
+
 class Issue(Contract):
     issue_id: str
     category: Literal["must_fix", "experimental_disagreement", "suggestion"]
@@ -69,6 +175,17 @@ class Issue(Contract):
     resolution: str = ""
     experiment_mapping: str = ""
     reclassification: IssueReclassification | None = None
+    acceptance_stage: Literal["design", "execution"] = "design"
+    stage_review: IssueStageReview | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_defaults(self, handler):
+        value = handler(self)
+        if self.acceptance_stage == "design":
+            value.pop("acceptance_stage", None)
+        if self.stage_review is None:
+            value.pop("stage_review", None)
+        return value
 
     @model_validator(mode="after")
     def resolution_has_evidence(self):
@@ -76,6 +193,8 @@ class Issue(Contract):
             raise ValueError("Resolving a blocking issue requires an explicit reason and evidence")
         if self.reclassification and self.reclassification.from_category == self.category:
             raise ValueError("Reclassification must name the previous, different category")
+        if self.acceptance_stage == "execution" and not self.experiment_mapping.strip():
+            raise ValueError("Execution requirements must name their experiment and acceptance check")
         return self
 
 
@@ -87,7 +206,18 @@ def validate_issue_transition(previous: dict | None, current: dict, source_exist
             raise ValueError(f"Issue {issue.issue_id}: changing category requires a review of the previous category, a reason and evidence")
         if source_exists and any(not source_exists(e.source_id) for e in review.evidence):
             raise ValueError(f"Issue {issue.issue_id}: reclassification evidence must reference existing evidence or messages in this research")
+    if previous and previous.get("acceptance_stage", "design") != issue.acceptance_stage:
+        review = issue.stage_review
+        if not review or review.from_stage != previous.get("acceptance_stage", "design"):
+            raise ValueError(f"Issue {issue.issue_id}: changing acceptance stage requires a stage_review with the original stage, reason and evidence")
+        if source_exists and any(not source_exists(e.source_id) for e in review.evidence):
+            raise ValueError(f"Issue {issue.issue_id}: stage review must reference existing evidence or messages in this research")
     return issue.model_dump()
+
+
+def design_blocker(issue):
+    return ((issue["category"] == "must_fix" and not issue["resolved"] and issue.get("acceptance_stage", "design") == "design")
+        or (issue["category"] == "experimental_disagreement" and not issue["experiment_mapping"]))
 
 
 class Proposal(Contract):
@@ -127,6 +257,8 @@ class Synthesis(Contract):
 
 
 class ExperimentSpec(Contract):
+    discussion_protocol: Literal[1, 2] = 1
+    content_markdown: str = ""
     spec_id: str
     version: int = Field(ge=1)
     question: str
@@ -140,13 +272,39 @@ class ExperimentSpec(Contract):
     monitoring: dict[str, Any]
     completion_criteria: str
     early_stop_rules: list[dict[str, Any]] = Field(default_factory=list)
-    issues: list[Issue] = Field(default_factory=list)
+    issues: list[Issue | dict[str, Any] | str] = Field(default_factory=list)
     deadline_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def minimal_current_plan(cls, value):
+        if isinstance(value, dict) and value.get("discussion_protocol") == 2:
+            value = dict(value)
+            # The new discussion owns its plan. These optional scientific details
+            # remain expressible without requiring an empty legacy form.
+            for key, default in {"hypothesis": "", "baseline": "", "data": {},
+                    "design": {}, "monitoring": {}, "completion_criteria": ""}.items():
+                value.setdefault(key, default)
+        return value
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        value = handler(self)
+        if self.discussion_protocol == 1:
+            value.pop("discussion_protocol", None)
+        if not self.content_markdown:
+            value.pop("content_markdown", None)
+        return value
 
     @model_validator(mode="after")
     def validate_issues(self):
+        if self.discussion_protocol == 2:
+            return self
+        # Saved legacy plans retain their original Issue protocol. New plans may
+        # keep readable risks or historical opinions without adopting that gate.
+        self.issues = [issue if isinstance(issue, Issue) else Issue.model_validate(issue) for issue in self.issues]
         for issue in self.issues:
-            if issue.category == "must_fix" and not issue.resolved:
+            if design_blocker(issue.model_dump()):
                 raise ValueError(f"Unresolved blocking issue: {issue.issue_id}")
             if issue.category == "experimental_disagreement" and not issue.experiment_mapping:
                 raise ValueError(f"Disagreement lacks experiment mapping: {issue.issue_id}")

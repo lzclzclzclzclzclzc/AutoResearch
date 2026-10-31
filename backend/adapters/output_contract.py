@@ -10,8 +10,11 @@ def bindings(schema, context):
     name = schema.__name__
     context = context.get('original_context', context)
     if name == 'ExperimentSpec':
-        return {key: context[source] for key, source in
+        value = {key: context[source] for key, source in
                 [('spec_id','spec_id'), ('version','spec_version'), ('deadline_at','deadline_at')] if source in context}
+        if context.get('discussion_protocol') == 2:
+            value['discussion_protocol'] = 2
+        return value
     if name == 'Implementation' and context.get('spec'):
         return {'spec_hash': digest(context['spec'])}
     if name == 'MonitorDecision' and context.get('evidence_log_hash'):
@@ -48,6 +51,9 @@ def model_contract(schema, context):
             omit(node, bound)
     else:
         omit(document, bound)
+        if schema.__name__ == 'ExperimentSpec' and context.get('discussion_protocol') == 2:
+            optional = {'hypothesis', 'baseline', 'data', 'design', 'monitoring', 'completion_criteria'}
+            document['required'] = [key for key in document.get('required', []) if key not in optional]
     class BoundContract:
         @classmethod
         def model_json_schema(cls): return copy.deepcopy(document)

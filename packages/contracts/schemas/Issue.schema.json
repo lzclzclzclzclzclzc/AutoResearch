@@ -63,6 +63,38 @@
       ],
       "title": "IssueReclassification",
       "type": "object"
+    },
+    "IssueStageReview": {
+      "properties": {
+        "from_stage": {
+          "enum": [
+            "design",
+            "execution"
+          ],
+          "title": "From Stage",
+          "type": "string"
+        },
+        "rationale": {
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "from_stage",
+        "rationale",
+        "evidence"
+      ],
+      "title": "IssueStageReview",
+      "type": "object"
     }
   },
   "properties": {
@@ -102,6 +134,26 @@
       "anyOf": [
         {
           "$ref": "#/$defs/IssueReclassification"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "acceptance_stage": {
+      "default": "design",
+      "enum": [
+        "design",
+        "execution"
+      ],
+      "title": "Acceptance Stage",
+      "type": "string"
+    },
+    "stage_review": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/IssueStageReview"
         },
         {
           "type": "null"

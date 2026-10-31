@@ -75,6 +75,26 @@
             }
           ],
           "default": null
+        },
+        "acceptance_stage": {
+          "default": "design",
+          "enum": [
+            "design",
+            "execution"
+          ],
+          "title": "Acceptance Stage",
+          "type": "string"
+        },
+        "stage_review": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IssueStageReview"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -117,9 +137,55 @@
       ],
       "title": "IssueReclassification",
       "type": "object"
+    },
+    "IssueStageReview": {
+      "properties": {
+        "from_stage": {
+          "enum": [
+            "design",
+            "execution"
+          ],
+          "title": "From Stage",
+          "type": "string"
+        },
+        "rationale": {
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "from_stage",
+        "rationale",
+        "evidence"
+      ],
+      "title": "IssueStageReview",
+      "type": "object"
     }
   },
   "properties": {
+    "discussion_protocol": {
+      "default": 1,
+      "enum": [
+        1,
+        2
+      ],
+      "title": "Discussion Protocol",
+      "type": "integer"
+    },
+    "content_markdown": {
+      "default": "",
+      "title": "Content Markdown",
+      "type": "string"
+    },
     "spec_id": {
       "title": "Spec Id",
       "type": "string"
@@ -188,7 +254,18 @@
     },
     "issues": {
       "items": {
-        "$ref": "#/$defs/Issue"
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Issue"
+          },
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "string"
+          }
+        ]
       },
       "title": "Issues",
       "type": "array"

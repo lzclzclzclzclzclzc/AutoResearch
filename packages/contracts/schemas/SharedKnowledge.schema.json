@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Optional Boss knowledge; storage identity and tree placement are program-owned.",
+  "properties": {
+    "content_markdown": {
+      "minLength": 1,
+      "title": "Content Markdown",
+      "type": "string"
+    },
+    "source_ids": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Source Ids",
+      "type": "array"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Title"
+    },
+    "status": {
+      "default": "unverified",
+      "title": "Status",
+      "type": "string"
+    },
+    "conditions": {
+      "default": "",
+      "title": "Conditions",
+      "type": "string"
+    }
+  },
+  "required": [
+    "content_markdown",
+    "source_ids"
+  ],
+  "title": "SharedKnowledge",
+  "type": "object"
+}
