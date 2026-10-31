@@ -137,12 +137,12 @@ async def test_every_group_member_reads_mail_in_regular_turns_and_wakeup_then_sk
         engine = ResearchEngine(store, control, None, CredentialService(tmp_path, store), saver)
         original, seen = engine.demo._produce_turn, set()
         async def model(**args):
-            if args["schema"].__name__ == "Proposal":
+            if args["schema"].__name__ in {"DiscussionTurn", "OrdinaryBallot", "PollBallot", "EndBallot"} and args["context"].get("received_messages"):
                 assert "评估阈值" in args["context"]["received_messages"][0]["message"]["content_markdown"]
                 seen.add(args["agent_id"])
             return await original(**args)
         engine.demo._produce_turn = model
-        await engine.discussions.run(ctx["research_id"], "critic-mail", "critic", engine.members(store.project(ctx["research_id"]), "critic", "line-01"), {}, "line-01")
+        await engine.discussions.run(ctx["research_id"], "critic-mail", "critic", engine.members(store.project(ctx["research_id"]), "critic", "line-01"), {"deadline_at": store.project(ctx["research_id"])["deadline_at"]}, "line-01")
         assert len(seen) == 2
         task = next(t for t in store.pending_tasks() if t["kind"] == "communication")
         assert (await engine.communication(task))["already_consumed_or_obsolete"]

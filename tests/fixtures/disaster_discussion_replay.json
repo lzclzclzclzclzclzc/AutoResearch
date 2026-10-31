@@ -1,0 +1,148 @@
+[
+  {
+    "name": "Disaster-Tweets5",
+    "source_project_id": "research-b4da2960172346899f748340f559fb9c",
+    "source_status": "terminated",
+    "snapshot_id": "arb-4ad06548a5d825da9a818cc503ad1ffe5d5432b7:snapshot",
+    "snapshot_hash": "7ea9540ba19099b6b6ec15cdd2185b51b26563f34f8a9da96a368e9c920dc936",
+    "material_scope": "Exact saved blockers and final two saved discussion messages; a protocol replay, not a rerun or scientific result.",
+    "blockers": [
+      {
+        "category": "must_fix",
+        "description": "norm-v1 的 MOJIBAKE 六键表与「norm-v1 精确文本」分组键不足以合并乱码变体同族，dedup 主折仍含同族跨折泄漏，且同族标签冲突不被记录。",
+        "experiment_mapping": "X1",
+        "issue_id": "MF-01",
+        "raised_by": "line-01/critic/member-01",
+        "reclassification": null,
+        "resolution": "设计已闭合（group_key 非字母数字归一作主折分组键，exactkey 降对照，冲突组数入 stats），但泄漏上界未实测，故不标已解决。依据：artifact-eb3b895827b08cc21975369159d6465a 的 id 1394/1402/1406/1414/1420 与 1409=1；artifact-2dc7e9109f2a80ed1847c978daa986d8 的 id 3207–3232。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "目标 (c) 全部实测项至今未实测：train/test 行数、正例比例、完全与近似重复规模、keyword/location 空值率、keyword train/test 重合度、组内标签冲突组数、主折固定阈值 CV F1 与折间 std，以及契约要求的产物 SHA256 与生成时间。",
+        "experiment_mapping": "X1/X2/X3 全部依赖此回填",
+        "issue_id": "MF-06",
+        "raised_by": "line-01/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决，我无法自行解决：携带证据 ID 调 run_light_cpu 返回「科研工具请求未获授权或参数无效」，零数值产出；产物未落盘运行，其 SHA256 与生成时间按契约声明为不可提供。须由 Runner 实跑 stats.json 回填后，tol 与任何「提升」声明才成立。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "共享问题（boss/member-02 提出，归属更正记录于 memory-6c60b1a08a4c4072b4e1b240ffee1e0d）：重复/近似重复文本跨折使 CV F1 被高估；重复率与近似重复规模尚未实测。",
+        "experiment_mapping": "X1",
+        "issue_id": "issue-shared-folds-leakage",
+        "raised_by": "line-01/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决。存在性由 memory-3612bfee892e4359b371445b99c126a2 记为 observed_presence_unverified_rate，无实测数值；run_light_cpu 未授权，不填任何数值。依据：memory-6c60b1a08a4c4072b4e1b240ffee1e0d、memory-3612bfee892e4359b371445b99c126a2。",
+        "resolved": false
+      }
+    ],
+    "diagnostic": "修订讨论后仍无进展。MF-01：norm-v1 的 MOJIBAKE 六键表与「norm-v1 精确文本」分组键不足以合并乱码变体同族，dedup 主折仍含同族跨折泄漏，且同族标签冲突不被记录。；MF-06：目标 (c) 全部实测项至今未实测：train/test 行数、正例比例、完全与近似重复规模、keyword/location 空值率、keyword train/test 重合度、组内标签冲突组数、主折固定阈值 CV F1 与折间 std，以及契约要求的产物 SHA256 与生成时间。；issue-shared-folds-leakage：共享问题（boss/member-02 提出，归属更正记录于 memory-6c60b1a08a4c4072b4e1b240ffee1e0d）：重复/近似重复文本跨折使 CV F1 被高估；重复率与近似重复规模尚未实测。",
+    "messages": [
+      {
+        "message_id": "stream-9a076c8b544ae780651eb3880176a0f4",
+        "content_markdown": "## 本回合无新增事实，候选不做实质改动\n\n`received_messages` 为空，除我此前发言外没有其他成员意见被传入，我不引用、不评价未传给我的内容。此前多次携带证据 ID 调 `run_light_cpu` 均返回「科研工具请求未获授权或参数无效」；`read_shared_memory` 一直是 memory_version 2、四个节点（`shared_protocol_required`、`leakage_risk_duplicate_text`、`issue_attribution_correction`、`line03_dependency_evidence_required`），key 与 verification_status 未变更。故本轮不再重复无效调用，只据既有事实重申结论。\n\n目标 (c) 的 train/test 行数、正例比例、完全与近似重复规模、keyword/location 空值率、keyword train/test 重合度、组内标签冲突组数，以及主折固定阈值 CV F1、折间 std、跨折套用落差、容差 tau，**全部仍未实测**；契约要求的产物 path+SHA256+generated_at **不可提供**。我唯一实测到的仍是 `list_research_inputs` 的字节数（train.csv 987712、test.csv 420783、sample_submission.csv 22746）与快照中读到的具体行。\n\n另需自查一处：我此前有回合在 issue 对象里误加了 `raised_by` 字段，已被 schema 拒绝（不在 Issue 允许列表内）。本轮全部 issue 一律不含该字段，issue_id、category、resolved、resolution、experiment_mapping 内容不变，不借此淡化任何阻断项。\n\n## 未解决阻断项（一条不减、不改名、不合并）\n\n1. `issue-shared-folds-leakage`：由 boss/member-02 提出（归属更正经 `memory-6c60b1a08a4c4072b4e1b240ffee1e0d` 记录；我未读到该流消息原文，只按共享记忆转述），存在性由 `memory-3612bfee892e4359b371445b99c126a2` 记为 observed_presence_unverified_rate，**率与规模无实测值**。\n2. `MF-01`：norm-v1 的六键乱码表与「norm-v1 精确文本」分组键不足以合并乱码变体同族。实测行支撑缺口存在——train 快照 id 1394/1402/1406/1414/1420 的 body%20bag 同模板仅乱码前缀不同（我读到的 1409=1、其余=0），test 快照 id 3207–3232 的 deluged 族为单字符近重复。设计已闭合，**泄漏上界仍未实测**。\n3. `MF-06`：目标 (c) 全部实测项与契约产物哈希均未产出。\n\n三者都绑定 (c) 的实测回填，故本回合仍 `ready_for_vote=false`，不用投票掩盖。\n\n## 已闭合项（代码级可核对，依据见 resolution）\n\n`MF-02`（评测分列固定阈值 CV F1、折外选阈诚实估计、折内选阈上界诊断；tol 只取固定阈值口径）、`MF-03`（OOF 合并五处断言）、`MF-04`（ndup 与 exactkey 列为必报对照并定义两个泄漏上界量；主折按 `memory-65416de47b1942ddab359e392f034b86` 固定为 dedup）、`MF-05`（近重复连通分量改在唯一 group_key 上做并输出漏桶审计）、`MF-07`（评测脚本列名对齐 id/fold/oof_prob/norm_text 并声明阈值区间与步长、正类、平均方式）。`SG-01`/`SG-03`/`SG-04` 已采纳；`SG-02` 仍为建议、不写入合同。\n\n## 实验分歧与映射\n\n`ED-01`（已收窄为「dedup 主折分组键用 group_key(norm-v2) 还是精确文本」）→ X1；`ED-02`（固定 0.5 / 全 OOF 选阈 / 折外选阈）→ X2；`ED-03`（ndup 是否升格为必报主指标）→ X3。三者均无实测数据，不由投票裁决。\n\n## 不等价声明（按契约原文保留）\n\n依 `memory-f4884de484964a629827828bfe61587f` 原文「替代物必须声明不等价于共享协议产物」：本候选的 norm-v2 折文件与规范化脚本为替代物，在 Runner 落盘、登记 path+SHA256+generated_at 并三线只读复用前，**不等价于共享协议冻结产物**，不得作为跨线判优基准，也不得与他线产物按同一口径横向比 F1。该节点 verification_status 为 proposed_not_yet_validated，我只做字段对齐，不据此声称任何数值。\n\n本回合 `revised_candidate` 保持已登记的 v5 内容不变（本轮无任何新信息可据以改动），仅重申未解决项与声明。",
+        "content_hash": "fff69d889418ba2142a275515e055c101450fdc80bb4d3ab9668fa95b1bd1a16"
+      },
+      {
+        "message_id": "stream-4b2f154d2d4251d2a67d10de10c26152",
+        "content_markdown": "## 本回合无新增事实，候选不做实质改动\n\n`received_messages` 为空，快照里只有我自己此前发言的片段，没有其他成员的实际意见被传入，我不引用、不评价未传给我的内容。此前多次携带证据 ID 调 `run_light_cpu` 均返回「科研工具请求未获授权或参数无效」；`read_shared_memory` 一直是 memory_version 2、四个节点（`shared_protocol_required`、`leakage_risk_duplicate_text`、`issue_attribution_correction`、`line03_dependency_evidence_required`），key 与 verification_status 未变更。故本轮不再重复无效调用，只据既有事实重申结论。\n\n目标 (c) 的 train/test 行数、正例比例、完全与近似重复规模、keyword/location 空值率、keyword train/test 重合度、组内标签冲突组数，以及主折固定阈值 CV F1、折间 std、跨折套用落差、容差 tau，**全部仍未实测**；契约要求的产物 path+SHA256+generated_at **不可提供**。我唯一实测到的仍是 `list_research_inputs` 的字节数（train.csv 987712、test.csv 420783、sample_submission.csv 22746）与快照中读到的具体行。\n\n另需自查一处：我曾有回合在 issue 对象里误加 `raised_by` 字段并被 schema 拒绝（不在 Issue 允许列表内）。本轮全部 issue 一律不含该字段，issue_id、category、resolved、resolution、experiment_mapping 内容不变，不借此淡化任何阻断项。\n\n## 未解决阻断项（一条不减、不改名、不合并）\n\n1. `issue-shared-folds-leakage`：由 boss/member-02 提出（归属更正经 `memory-6c60b1a08a4c4072b4e1b240ffee1e0d` 记录；我未读到该流消息原文，只按共享记忆转述），存在性由 `memory-3612bfee892e4359b371445b99c126a2` 记为 observed_presence_unverified_rate，**率与规模无实测值**。\n2. `MF-01`：norm-v1 的六键乱码表与「norm-v1 精确文本」分组键不足以合并乱码变体同族。实测行支撑缺口存在——train 快照 id 1394/1402/1406/1414/1420 的 body%20bag 同模板仅乱码前缀不同（我读到的 1409=1、其余=0），test 快照 id 3207–3232 的 deluged 族为单字符近重复。设计已闭合，**泄漏上界仍未实测**。\n3. `MF-06`：目标 (c) 全部实测项与契约产物哈希均未产出。\n\n三者都绑定 (c) 的实测回填，故本回合仍 `ready_for_vote=false`，不用投票掩盖。\n\n## 已闭合项（代码级可核对，依据见 resolution）\n\n`MF-02`（评测分列固定阈值 CV F1、折外选阈诚实估计、折内选阈上界诊断；tol 只取固定阈值口径）、`MF-03`（OOF 合并五处断言）、`MF-04`（ndup 与 exactkey 列为必报对照并定义两个泄漏上界量；主折按 `memory-65416de47b1942ddab359e392f034b86` 固定为 dedup）、`MF-05`（近重复连通分量改在唯一 group_key 上做并输出漏桶审计）、`MF-07`（评测脚本列名对齐 id/fold/oof_prob/norm_text 并声明阈值区间与步长、正类、平均方式）。`SG-01`/`SG-03`/`SG-04` 已采纳；`SG-02` 仍为建议、不写入合同。\n\n## 实验分歧与映射\n\n`ED-01`（已收窄为「dedup 主折分组键用 group_key(norm-v2) 还是精确文本」）→ X1；`ED-02`（固定 0.5 / 全 OOF 选阈 / 折外选阈）→ X2；`ED-03`（ndup 是否升格为必报主指标）→ X3。三者均无实测数据，不由投票裁决。\n\n## 不等价声明（按契约原文保留）\n\n依 `memory-f4884de484964a629827828bfe61587f` 原文「替代物必须声明不等价于共享协议产物」：本候选的 norm-v2 折文件与规范化脚本为替代物，在 Runner 落盘、登记 path+SHA256+generated_at 并三线只读复用前，**不等价于共享协议冻结产物**，不得作为跨线判优基准，也不得与他线产物按同一口径横向比 F1。该节点 verification_status 为 proposed_not_yet_validated，我只做字段对齐，不据此声称任何数值。\n\n本回合 `revised_candidate` 保持已登记的 v5 内容不变（本轮无任何新信息可据以改动），仅重申未解决项与声明。",
+        "content_hash": "8137b50f8ca17a2c085d0c519bbd5e66e8483054c537dbf6714fbf7c9c8a88d7"
+      }
+    ]
+  },
+  {
+    "name": "Disaster-Tweets6",
+    "source_project_id": "research-d5d5458d53f74347a250bb568f415513",
+    "source_status": "terminated",
+    "snapshot_id": "arb-98f164abcda96591b33c6299290834dc48c4323b:snapshot",
+    "snapshot_hash": "000532f1e693feccfda826e96990d69b8dac32e14a5a03c69dd2540bbbe9cb8b",
+    "material_scope": "Exact saved blockers and final two saved discussion messages; a protocol replay, not a rerun or scientific result.",
+    "blockers": [
+      {
+        "category": "must_fix",
+        "description": "落定执行对象缺 line-01 基线 per-fold F1 / OOF 预测，gains_vs_baseline.csv 数学上不可生成。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-001",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象：required_inputs 逐字未变、无基线指标入口。我的 rev7 data_gate.baseline_folds 已实现（缺即硬停），未被采纳到执行对象。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "落定执行对象在 train 文本出现在 test 时硬停，会让本线永远产出 0 个增益数字。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-002",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象：硬停分支仍在。修正应为 test-contamination 诊断项（见我的 rev7 leak_audit.policy）。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "落定执行对象对跨折重复文本硬停，等于用数据属性否决 objective 要求的横向比较。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-003",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象：stop_rules 仍写硬停。修正应为报告 + 标记 row id + 同 mask 敏感性行。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "落定执行对象代码与交付清单不一致：两个结果文件无写出代码，判定函数从未调用，聚类与诊断子集无实现。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-004",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象：run_all.py 末尾仍只写两个文件。我的 rev7 全部落盘。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "H2/H4 在落定执行对象中无可承载的输出列。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-005",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象。我的 rev7 交付 subset=keyword_missing 与 subset=near_dup_conflict_free 行。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "落定执行对象折分配校验不足（set 比较 + 假定行序，未查 NaN 与折平衡）。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-006",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象。修正为 one_to_one merge + NaN 硬停 + 折平衡元数据。",
+        "resolved": false
+      },
+      {
+        "category": "must_fix",
+        "description": "落定执行对象 NB-SVM 权重广播依赖隐式 1-D 行为。",
+        "experiment_mapping": "",
+        "issue_id": "cmf-007",
+        "raised_by": "line-02/critic/member-01",
+        "reclassification": null,
+        "resolution": "未解决于落定对象。修正为 apply_log_count 中 reshape(1,-1) 显式广播。",
+        "resolved": false
+      }
+    ],
+    "diagnostic": "修订讨论后仍无进展。cmf-001：落定执行对象缺 line-01 基线 per-fold F1 / OOF 预测，gains_vs_baseline.csv 数学上不可生成。；cmf-002：落定执行对象在 train 文本出现在 test 时硬停，会让本线永远产出 0 个增益数字。；cmf-003：落定执行对象对跨折重复文本硬停，等于用数据属性否决 objective 要求的横向比较。；cmf-004：落定执行对象代码与交付清单不一致：两个结果文件无写出代码，判定函数从未调用，聚类与诊断子集无实现。；cmf-005：H2/H4 在落定执行对象中无可承载的输出列。；cmf-006：落定执行对象折分配校验不足（set 比较 + 假定行序，未查 NaN 与折平衡）。；cmf-007：落定执行对象 NB-SVM 权重广播依赖隐式 1-D 行为。",
+    "messages": [
+      {
+        "message_id": "stream-3c5fe872d73f40b54590b981a57a5ba2",
+        "content_markdown": "## review：line-02/critic/member-01（rev7-critic 状态复核，不再新增自查 issue）\n\n本轮没有新的 line-01 公布物、没有新消息、没有新证据；落定执行对象仍是 `line-02/exploration/member-01 rev2`，其代码文本逐字未变。我遵守上回合承诺：非新证据时不追加自查 issue，只做状态复述与请求证据。我没有运行任何实验。\n\n### 一、落定执行对象上的阻断项（全部仍未解决）\n\ncmf-001～cmf-007 保持 `resolved=false`，逐项依据仍可核验：\n\n- cmf-001：`interface_with_line01.required_inputs` 五项里没有任何基线指标，而 gain 的定义要求基线折均值，缺它 `gains_vs_baseline.csv` 无从生成。\n- cmf-002：`assert_no_leak` 在 train 文本出现在 test 时硬停；该重叠是给定数据属性（train id 59/68 与 test id 58 逐字相同，`artifact-a615445602708a201a770a19ee5ababb`、`artifact-b7fb20ffa3eda2e3ca5275ff809a7f9c` 均 observed），硬停会让本线永远出不了增益。\n- cmf-003：对跨折重复文本硬停，等于用数据属性否决 objective 要求的横向比较，而本线无权改划分或删行。\n- cmf-004：`run_all.py` 末尾只写 `per_config_fold_metrics.csv` 与 `confusion_matrices.json`；`gains_and_significance()` 定义后从未调用；`gains_vs_baseline.csv`、`diagnostic_subset_f1.csv` 无写出代码；聚类/诊断子集无实现。\n- cmf-005：H2/H4 的对照无交付物承载（H2 的 keyword 空子集、H4 的诊断子集成对列）。\n- cmf-006：`load_folds` 用 `set(id)` 比较并假定行序一致，未查 NaN 折值与每折正类比例。\n- cmf-007：`Btr.multiply(r)` 依赖隐式 1-D 广播，跨 scipy 版本不稳。\n\n这些修正只存在于我自己的候选；我不改其他成员的候选，因此无法替落定对象宣布已修。\n\n### 二、我自己候选的当前状态\n\nrev7-critic 已把 cmf-008～cmf-019 与 s-001～s-005 全部落到代码并在此前各回合逐项说明理由与依据：逐配置聚合、同 mask 敏感性、整行 L2 后的真余弦、显式声明聚合语义、C 只在 folds[0] 选定、空折记 nan、失败折捕获、哨兵全域拦截、逐配置汇总行、基线硬标签域校验、诊断距离分块 float32。本轮无新增缺陷，故 `revised_candidate` 保持 null，rev7 即我的当前候选。\n\n### 三、实验分歧映射（逐一，不靠多数票隐藏）\n\n- **exp-A**（ed-001）：阈值两口径并列输出，主判定用基线 per-fold F1 的 ddof=1 σ；配对差值只作诊断列。\n- **exp-B**（ed-002）：C 冻结 vs 每折内层重选都跑；后者只进诊断列，主判定用冻结 C，fold 0 内层 CV 不接触该折验证部分。\n- **exp-C**（ed-003、ed-004）：聚类参数与 `include_noise_points` 未公布即该诊断行 `not_available`；公布后逐字复述并按其表示/度量实现，不近似、不调阈值。\n\n### 四、请求证据（本线仍卡在这五件，缺任一件都不能产生合法增益数字）\n\n一、`fold_assignment.csv` 与 sha256、折列名；二、归一化规则（用于逐字替换唯一 `normalize` 钩子）；三、诊断聚类参数（度量 / eps / min_samples / 表示 / `include_noise_points`）；四、固定评测集聚合函数的可导入标识，及其输入语义（硬标签还是分数）与参数顺序——若已在其文档中写明，该文档即视为声明；五、基线 per-fold F1（`f1_pos∈[0,1]`）或基线 OOF 硬标签预测（`pred∈{0,1}`），并附基线模型配置。\n\n### 五、结论边界与未验证\n\n`ready_for_vote=false`：落定执行对象上 cmf-001/002/003 这类「会让本线永远产出 0 个增益数字」的项仍未解决，提前投票等于覆盖未解决阻断项。\n\nline-01 的主基准 sha256、fold 列名、归一化规则、聚类参数（是否含噪声点）、聚合函数签名与语义、基线 per-fold F1 及基线模型配置，本轮仍未公布，我不复述任何数值。已观察到的仅限：`artifact-a615445602708a201a770a19ee5ababb`（train 含完全重复文本行、keyword/location 大量空、7613 行）、`artifact-b7fb20ffa3eda2e3ca5275ff809a7f9c`（test 含与 train 逐字相同的文本）、`artifact-86e7827a43f0afd1767576ca438a4046`（F1 与 TP/FP/FN 定义）。跨折重复是否真出现仍取决于不可得的 line-01 划分，属未验证推断。",
+        "content_hash": "e6afc1a07c3b32b34e3609dd4d23cdd9a33149c5f9906c25ae7c3ec69723895d"
+      },
+      {
+        "message_id": "stream-a098b5f69cb7a8c22728d670fd433f42",
+        "content_markdown": "## review：line-02/critic/member-01（状态复述，无新证据）\n\n本轮无新证据、无新消息、line-01 五件产物仍未公布；落定执行对象仍是 `line-02/exploration/member-01 rev2`，其代码文本逐字未变。我不新增自查 issue，只做状态复述与请求证据。我没有运行任何实验。\n\n### 一、落定执行对象上的阻断项（全部仍未解决，依据可核验）\n\n- **cmf-001**：`interface_with_line01.required_inputs` 五项里没有任何基线指标，而 gain 的定义要求「基线折均值」，缺它 `gains_vs_baseline.csv` 无从生成。\n- **cmf-002**：`assert_no_leak` 在 train 文本出现在 test 时硬停；该重叠是给定数据属性（train id 59/68 与 test id 58 逐字相同，`artifact-a615445602708a201a770a19ee5ababb`、`artifact-b7fb20ffa3eda2e3ca5275ff809a7f9c` 均 observed），硬停会让本线永远出不了增益。\n- **cmf-003**：对跨折重复文本硬停，等于用数据属性否决 objective 要求的横向比较，而本线无权改划分或删行。\n- **cmf-004**：`run_all.py` 末尾只写 `per_config_fold_metrics.csv` 与 `confusion_matrices.json`；`gains_and_significance()` 定义后从未调用；`gains_vs_baseline.csv`、`diagnostic_subset_f1.csv` 无写出代码；聚类与诊断子集无实现。\n- **cmf-005**：H2/H4 的对照无交付物承载（H2 的 keyword 空子集、H4 的诊断子集成对列）。\n- **cmf-006**：`load_folds` 用 `set(id)` 比较并假定行序一致，未查 NaN 折值与每折正类比例。\n- **cmf-007**：`Btr.multiply(r)` 依赖隐式 1-D 广播，跨 scipy 版本不稳。\n\n这些修正只存在于我自己的候选，我不改其他成员的候选，故无法替落定对象宣布已修。\n\n### 二、我自己候选的当前状态\n\nrev7-critic 已把 cmf-008～cmf-019 与 s-001～s-005 落到代码并在此前各回合逐项给出理由与依据（逐配置聚合、同 mask 敏感性、整行 L2 后的真余弦、显式声明聚合语义、C 只在 folds[0] 选定、空折记 nan、失败折捕获、哨兵全域拦截、逐配置汇总行、基线硬标签域校验、诊断距离分块 float32）。本轮无新增缺陷，`revised_candidate` 保持 null，rev7 即我的当前候选。\n\n### 三、实验分歧映射（逐一，不靠多数票隐藏）\n\n- **exp-A**（ed-001）：阈值两口径并列输出，主判定用基线 per-fold F1 的 ddof=1 σ；配对差值只作诊断列。\n- **exp-B**（ed-002）：C 冻结 vs 每折内层重选都跑；后者只进诊断列，主判定用冻结 C，fold 0 内层 CV 不接触该折验证部分。\n- **exp-C**（ed-003、ed-004）：聚类参数与 `include_noise_points` 未公布即该诊断行 `not_available`；公布后逐字复述并按其表示/度量实现，不近似、不调阈值。\n\n### 四、请求证据（本线仍卡在这五件，缺任一件都不能产生合法增益数字）\n\n一、`fold_assignment.csv` 与 sha256、折列名；二、归一化规则（用于逐字替换唯一 `normalize` 钩子）；三、诊断聚类参数（度量 / eps / min_samples / 表示 / `include_noise_points`）；四、固定评测集聚合函数的可导入标识，及其输入语义（硬标签还是分数）与参数顺序——该语义若已在其随附文档中写明，即视为声明；五、基线 per-fold F1（`f1_pos∈[0,1]`）或基线 OOF 硬标签预测（`pred∈{0,1}`），并附基线模型配置。\n\n### 五、结论边界与未验证\n\n`ready_for_vote=false`：落定执行对象上 cmf-001/002/003 这类「会让本线永远产出 0 个增益数字」的项仍未解决，提前投票等于覆盖未解决阻断项。\n\nline-01 的主基准 sha256、fold 列名、归一化规则、聚类参数（是否含噪声点）、聚合函数签名与语义、基线 per-fold F1 及基线模型配置，本轮仍未公布，我不复述任何数值。已观察到的仅限：`artifact-a615445602708a201a770a19ee5ababb`（train 含完全重复文本行、keyword/location 大量空、7613 行）、`artifact-b7fb20ffa3eda2e3ca5275ff809a7f9c`（test 含与 train 逐字相同的文本）、`artifact-86e7827a43f0afd1767576ca438a4046`（F1 与 TP/FP/FN 定义）。跨折重复是否真出现仍取决于不可得的 line-01 划分，属未验证推断。",
+        "content_hash": "15bc5e3b9ee179feeddafa3515159bd4d5c7b27ba88d9a92149705911de15a0c"
+      }
+    ]
+  }
+]

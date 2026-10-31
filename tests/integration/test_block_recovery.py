@@ -25,6 +25,12 @@ async def test_internal_dependency_runs_boss_after_parent_releases_slot_and_resu
     try:
         async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as saver:
             engine = ResearchEngine(store, control, None, None, saver)
+            # Exercise recovery of the historical Issue/Review protocol explicitly.
+            original_discussion = engine.discussions.run
+            async def legacy_discussion(research_id, discussion_id, role, members, context, line_id=None):
+                return await original_discussion(research_id, discussion_id, role, members,
+                    {**context, "discussion_protocol": 1}, line_id)
+            engine.discussions.run = legacy_discussion
             original = engine.demo._produce_turn
             calls = []
             async def produce(**args):

@@ -517,7 +517,8 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             cutoff = json.loads(row[0])["occurred_at"] if row else s.project(research_id)["created_at"]
             visible_arbitrations = {row["conversation_id"] for row in request_list(s, research_id, at_seq)}
             items = [item for item in items if item.get("created_at", "") <= cutoff and
-                     (":god:" not in item["conversation_id"] or item["conversation_id"] in visible_arbitrations)]
+                     (":god:" not in item["conversation_id"] or item["conversation_id"] in visible_arbitrations
+                      or item.get("kind") == "discussion_finalization")]
         for item in items:
             latest = s.messages(item["conversation_id"], limit=1, at_seq=at_seq)["items"]
             item["last_message"] = latest[-1] if latest else None

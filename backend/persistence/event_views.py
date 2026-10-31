@@ -4,6 +4,18 @@ from __future__ import annotations
 import json
 
 
+def message_search_text(message):
+    """Index typed votes by their visible labels as well as their stored choices."""
+    vote = message.get("vote")
+    if message.get("kind") != "discussion_vote" or not isinstance(vote, dict):
+        return message.get("content_markdown", "")
+    directions = {"critic": "交给 Critic", "implementation": "交给 Implementation", "exploration": "交回 Exploration",
+                  "dispatch": "分派研究任务", "finish_lines": "结束选中研究线", "finish_project": "结束项目", "report": "生成阶段报告"}
+    steps = [vote.get("next_step")] + [ballot.get("next_step") for ballot in vote.get("ballots", [])]
+    return "\n".join([message.get("content_markdown", ""), "结束投票" if vote.get("type") == "end" else "普通投票",
+        json.dumps(vote, ensure_ascii=False), *[directions[step] for step in steps if step in directions]])
+
+
 DETAIL_EVENT_TYPES = (
     "agent.output_delta", "agent.stream_event", "agent.runtime_event",
     "message.started", "message.delta",

@@ -142,13 +142,44 @@ class ToolGateway:
         name, args = payload.get("name"), payload.get("arguments", {})
         if name == "record_stream_event":
             return self.record_stream(context, args)
-        if context.get("suppress_chat"):
+        if context.get("suppress_chat") and context.get("discussion_protocol") != 2:
             raise PermissionError("Private scheduling scores cannot use research tools")
         if role == "god":
             # God has a separate allowlist: ordinary role exclusions are unsafe
             # for a new role, especially evidence, memory and messaging tools.
             if name != "read_arbitration_context":
                 raise PermissionError("God can only read its bound arbitration snapshot")
+            if context.get("discussion_protocol") == 2:
+                snapshot = self.store.get("discussion_finalization_snapshot", context.get("finalization_id", ""))
+                if (not snapshot or snapshot["research_id"] != research_id
+                        or snapshot["snapshot_hash"] != context.get("snapshot_hash")
+                        or digest(snapshot["sections"]) != snapshot["snapshot_hash"]):
+                    raise PermissionError("Final discussion snapshot binding mismatch")
+                sections = snapshot["sections"]
+                section, offset = args.get("section"), args.get("offset", 0)
+                if section not in sections:
+                    raise PermissionError("Section is outside the frozen final discussion")
+                if type(offset) is not int or offset < 0:
+                    raise ValueError("Snapshot offset must be a nonnegative integer")
+                value = sections[section]
+                if section.startswith("evidence:"):
+                    artifact, path = self.store.artifact(value["artifact_id"])
+                    if artifact["research_id"] != research_id or artifact["sha256"] != value["sha256"]:
+                        raise PermissionError("Final discussion evidence binding mismatch")
+                    with path.open("rb") as handle:
+                        if hashlib.file_digest(handle, "sha256").hexdigest() != value["sha256"]:
+                            raise PermissionError("Evidence integrity check failed")
+                        handle.seek(offset)
+                        page = handle.read(16384)
+                    return {"finalization_id": snapshot["id"], "snapshot_hash": snapshot["snapshot_hash"],
+                        "section": section, "sha256": value["sha256"], "offset": offset,
+                        "next_offset": offset + len(page), "total_length": value["size_bytes"],
+                        "text": page.decode("utf-8", errors="replace")}
+                text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+                page = text[offset:offset + 16384]
+                return {"finalization_id": snapshot["id"], "snapshot_hash": snapshot["snapshot_hash"],
+                    "section": section, "sha256": hashlib.sha256(text.encode()).hexdigest(), "offset": offset,
+                    "next_offset": offset + len(page), "total_length": len(text), "text": page}
             request = self.store.get("arbitration_request", context.get("arbitration_id", ""))
             if not request or request["research_id"] != research_id or request["snapshot_hash"] != context.get("snapshot_hash"):
                 raise PermissionError("Arbitration snapshot binding mismatch")

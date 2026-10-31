@@ -58,7 +58,7 @@ async def test_blockers_get_revision_opportunity_before_vote_and_cannot_be_omitt
                         in_speech -= 1
             engine.demo._produce_turn = fixture
             members = engine.members(p, "boss")
-            args = (p["id"], "test-discussion", "boss", members, {"initial": True, "lines": store.lines(p["id"]), "topic": "fixture"})
+            args = (p["id"], "test-discussion", "boss", members, {"discussion_protocol": 1, "initial": True, "lines": store.lines(p["id"]), "topic": "fixture"})
             if resolve:
                 result = await engine.discussions.run(*args)
                 assert result["selected_payload"]["rationale"] == "修订后的验证口径"
@@ -110,7 +110,7 @@ async def test_selection_survives_interruption_without_redrawing_or_duplicate_me
                     raise RuntimeBlocked("fixture_interrupted", "Injected interruption after committed selection")
                 return await original(**args)
             engine.demo._produce_turn = fixture
-            args = (p["id"], "recover-discussion", "boss", engine.members(p, "boss"), {"initial": True, "lines": store.lines(p["id"])})
+            args = (p["id"], "recover-discussion", "boss", engine.members(p, "boss"), {"discussion_protocol": 1, "initial": True, "lines": store.lines(p["id"])})
             with pytest.raises(RuntimeBlocked, match="Injected interruption"):
                 await engine.discussions.run(*args)
             before = store.list("discussion_selection", p["id"])

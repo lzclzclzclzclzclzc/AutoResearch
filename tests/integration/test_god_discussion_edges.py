@@ -153,3 +153,63 @@ async def test_replayed_old_arbitration_does_not_restore_an_outdated_scope_revis
         await engine.arbitration.resolve(**old)
     assert len(calls) == 2
     assert store.get("arbitration_request", first["arbitration_id"])["status"] == "stale"
+
+
+async def test_god_final_reply_reuses_stream_message_and_supplies_exact_recovery_constraints(scene):
+    store, project, engine = scene
+    rid, aid, message_id = project["id"], "arb-stream", "stream-god-reply"
+    output = {"arbitration_id": aid, "snapshot_hash": "frozen", "action": "request_revision",
+        "target_role": "critic", "instructions": "区分验收阶段", "allowed_changes": ["acceptance_stage"],
+        "acceptance_checks": ["保留问题"], "content_markdown": "修订条件", "rationale": "执行结果尚未产生"}
+    async def execute(**args):
+        assert '"target_role": "critic"' in args["prompt"]
+        assert '"select_candidate_allowed": false' in args["prompt"]
+        store.upsert_stream_message(rid, message_id, f"{rid}:god:{aid}", "god/" + aid, "修订条件",
+            source_event_id="stream-source")
+        store.complete_stream_message(message_id, "修订条件")
+        return output
+    engine.demo.execute_turn = execute
+    engine.demo.message_reference = lambda *args: message_id
+    provider = project["config_snapshot"]["provider"]
+    request = {"id": aid, "arbitration_id": aid, "research_id": rid, "snapshot_hash": "frozen", "line_id": "line-01",
+        "provider_config_id": project["provider_config_id"], "credential_version": project.get("credential_version", 0), "model": provider["model"]}
+    await engine.execute_god_turn(request, {"role": "critic", "blockers": [{"issue_id": "runtime-result"}]}, 1)
+    messages = store.messages(f"{rid}:god:{aid}")["items"]
+    assert len(messages) == 1 and messages[0]["message_id"] == message_id
+    assert messages[0]["source_system"] == "god_generation"
+    assert messages[0]["validation_status"] == "pending"
+
+
+async def test_runtime_result_deadlock_revises_acceptance_stage_then_votes_without_fabricated_metrics(scene, tmp_path):
+    store, project, engine = scene
+    rid = project["id"]
+    protocol = tmp_path / "protocol.txt"
+    protocol.write_text("先运行固定折基线，再记录逐折 F1 与标准差。设计时不声称这些数字已存在。", encoding="utf-8")
+    artifact = store.register_artifact(rid, protocol, line_id="line-01")
+    original = engine.demo._produce_turn
+    async def produce(**args):
+        if args["schema"].__name__ == "GodDecision":
+            request = args["context"]["arbitration_request"]
+            return {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"], "action": "request_revision",
+                "target_role": "critic", "instructions": "保留基线验收项，依据协议把阶段改为 execution",
+                "allowed_changes": ["acceptance_stage", "stage_review"], "acceptance_checks": ["不伪造数字，不删除问题"],
+                "content_markdown": "基线指标应在运行后核查", "rationale": "协议已明确生成和验收步骤", "evidence_refs": [artifact["id"]]}
+        output = await original(**args)
+        if args["schema"].__name__ == "Review":
+            revised = bool(args["context"].get("god_revision"))
+            issue = {"issue_id": "baseline-f1", "category": "must_fix", "description": "缺少逐折基线 F1 与标准差",
+                "resolved": False, "experiment_mapping": "固定折 Runner 产出逐折 F1/std，Verify 核查实际 metrics.json"}
+            if revised:
+                issue.update(acceptance_stage="execution", stage_review={"from_stage": "design", "rationale": "指标只能在运行后产生，协议已完整",
+                    "evidence": [{"source_id": artifact["id"], "claim": "固定协议规定了生成和核查顺序", "status": "observed"}]})
+            output.update(ready_for_vote=revised, issues=[issue], new_evidence=[])
+        return output
+    engine.demo._produce_turn = produce
+    result = await engine.discussions.run(rid, "runtime-metrics-design", "critic", engine.members(project, "critic", "line-01"),
+        {"discussion_protocol": 1, "evidence": [{"source_id": artifact["id"]}]}, "line-01")
+    assert result["issues"][0]["acceptance_stage"] == "execution"
+    assert result["issues"][0]["category"] == "must_fix" and not result["issues"][0]["resolved"]
+    requests = store.list("arbitration_request", rid)
+    assert len(requests) == 1 and requests[0]["status"] == "applied"
+    assert store.get("arbitration_decision", requests[0]["decision_id"])["decision"]["action"] == "request_revision"
+    assert not store.list("run", rid) and not store.list("verification", rid)

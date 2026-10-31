@@ -197,6 +197,9 @@ class DshRuntimeAdapter:
 
     async def execute_turn(self, *, research_id, agent_id, role, task_id, turn_id,
                            prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None):
+        runtime_context = runtime_context or {}
+        private_score = bool(runtime_context.get("private_score", runtime_context.get("suppress_chat")
+            and runtime_context.get("discussion_protocol") != 2))
         available = self.availability()
         if not available["available"]:
             raise RuntimeBlocked(available["code"], available["message"])
@@ -236,7 +239,7 @@ class DshRuntimeAdapter:
                 raise RuntimeBlocked("credential_missing", "请先在设置中保存 DeepSeek API Key")
             attempt = (previous or {}).get("attempt", 0) + 1
             execution_id = f"{logical_key}-{attempt}"
-            token_limit = output_tokens(bool((runtime_context or {}).get("suppress_chat")), (runtime_context or {}).get("max_output_tokens"))
+            token_limit = output_tokens(private_score, runtime_context.get("max_output_tokens"))
             record = {"status": "registered", "attempt": attempt, "execution_attempt_id": execution_id,
                 "max_output_tokens": token_limit,
                 "conversation_id": (runtime_context or {}).get("conversation_id"),
@@ -292,7 +295,7 @@ class DshRuntimeAdapter:
                     redact_secret=secret,
                     permitted_artifact_ids=artifact_ids(context or {}), **(runtime_context or {}))
                 payload.update(gateway_url=self.gateway.url, gateway_token=capability, role=role,
-                    auxiliary=bool((runtime_context or {}).get("suppress_chat")),
+                    auxiliary=private_score,
                     has_inputs=bool(project.get("workspace_path")),
                     plugin_entry=str(Path(__file__).resolve().parents[2] / "packages" / "dsh-plugin-research" / "index.js"))
                 proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())

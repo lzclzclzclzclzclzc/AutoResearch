@@ -49,7 +49,7 @@ async def test_tied_group_continues_without_fabricating_votes(setup_project, tmp
         line_id = None if role == "boss" else "line-01"
         try:
             args = (p["id"], "tie-" + role, role, engine.members(p, role, line_id),
-                {"initial": True, "lines": store.lines(p["id"]), "topic": p["topic"]})
+                {"discussion_protocol": 1, "initial": True, "lines": store.lines(p["id"]), "topic": p["topic"]})
             result = await engine.discussions.run(*args, line_id=line_id)
             assert result["decision_source"] == "god"
             assert len(calls) == 4 and len(god_calls) == 1

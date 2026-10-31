@@ -72,7 +72,50 @@ class DemoRuntimeAdapter:
         def boss_decision():
             initial = context.get("initial", False)
             return {"content_markdown": content, "action": "assign" if initial else "finish_line", "assignments": [{"line_id": line["line_id"], "objective": "演示 CPU 线性回归完整工作流", "priority": 0} for line in context.get("lines", [])] if initial else [], "memory_updates": [] if initial else [{"node_id": "research/demo/"+context.get("line_id", "line"), "parent_id": "research/demo", "title": "CPU 工作流演示", "content_markdown": "真实 CPU 演示流程已执行；非用户题目的科研结论", "status": "passed", "source_ids": [context.get("submission_id", "")], "conditions": "仅合成数据演示"}], "request_report": not initial, "rationale": "完成演示生命周期"}
-        if name == "GodDecision":
+        def discussion_output():
+            discussion_role = context.get("role", role)
+            if discussion_role == "critic":
+                return {"content_markdown": content + "\n完整的合成数据 CPU 演示计划，设置如下。",
+                    "experiment_spec": {"question": "演示：CPU 梯度下降拟合合成线性数据",
+                        "hypothesis": "固定数据上 120 步梯度下降可降低均方误差",
+                        "fixed": {"seed": 42, "samples": 200, "epochs": 120, "learning_rate": 0.08},
+                        "baseline": "零预测器", "data": {"source": "synthetic", "generator": "y=2*x+1+Gaussian(0,0.02)", "seed": 42},
+                        "metrics": ["mse"], "design": {"comparison": "zero predictor vs fixed gradient descent", "repetitions": 1, "scope": "workflow demonstration only"},
+                        "monitoring": {"signals": ["process_exit", "stdout_progress", "mse"], "window_epochs": 10},
+                        "completion_criteria": "完成 120 个固定训练步并写出 metrics.json",
+                        "early_stop_rules": [{"signal": "nonfinite_mse", "action": "stop_and_package"}]}}
+            if discussion_role == "boss":
+                initial = context.get("initial", False)
+                operations = [{"operation": "research", "target": line["line_id"],
+                    "objective": "演示 CPU 线性回归完整工作流"} for line in context.get("lines", [])] if initial else [
+                        {"operation": "finish_line", "target": context["line_id"]}, {"operation": "report"}]
+                output = {"content_markdown": content + "\n" + ("按目录分派各线的演示任务。" if initial else "保留真实演示结果，结束本线并整理报告。"),
+                    "operations": operations}
+                if not initial and context.get("submission_id"):
+                    output["memory_updates"] = [{"title": "CPU 工作流演示",
+                        "content_markdown": "真实 CPU 演示已执行，结果见本次提交包；不构成用户题目的科研结论。",
+                        "source_ids": [context["submission_id"]], "conditions": "仅合成数据演示", "status": "passed"}]
+                return output
+            return {"content_markdown": content + "\n采用合成线性回归 CPU 示例检验完整工作流。",
+                "method": "seeded_cpu_linear_regression"}
+        if name == "DiscussionTurn":
+            prior_poll = any(message.get("vote", {}).get("type") == "ordinary"
+                for message in context.get("conversation_snapshot", []))
+            value = {"content_markdown": content + "\n本演示仅验证工作流；所有正式结果由真实 CPU 进程提供。"}
+            if prior_poll:
+                value["end_vote"] = {"final_output": discussion_output()}
+            else:
+                value["ordinary_vote"] = {"question": "演示工作流是否使用固定种子的合成数据？",
+                    "options": ["使用固定种子，保留真实运行证据", "先补充其他演示设计"]}
+        elif name in {"PollBallot", "OrdinaryBallot"}:
+            option = context["vote"]["options"][0]
+            value = {"option": option["label"] if isinstance(option, dict) else option,
+                "reason": "固定种子有利于复核演示工作流；这张普通票不结束讨论。"}
+        elif name == "EndBallot":
+            value = {"approve": True, "next_step": context["allowed_next_steps"][0]}
+        elif name == "DiscussionFinal":
+            value = {"next_step": context["allowed_next_steps"][0], "final_output": discussion_output()}
+        elif name == "GodDecision":
             request, snapshot = context["arbitration_request"], context["snapshot"]
             value = {"arbitration_id": request["arbitration_id"], "snapshot_hash": request["snapshot_hash"],
                 "content_markdown": content, "rationale": "演示固定脚本：只处理当前冻结现场，不生成成员投票或实验事实。",
@@ -115,7 +158,9 @@ class DemoRuntimeAdapter:
             metrics = context["submission"].get("metrics", {})
             ok = context["submission"].get("run", {}).get("state") in {"completed", "succeeded"} and all(metrics.get(k) == v for k, v in {"seed": 42, "samples": 200, "epochs": 120}.items())
             improved = ok and metrics.get("final_mse", float("inf")) < metrics.get("baseline_mse", 0)
-            value = {"content_markdown": content + "\n仅根据真实 CPU 运行产物核查演示设置；不构成任何用户题目的科研结论。", "passed": ok, "scientific_observation": "improvement" if improved else "no_improvement" if ok else "execution_failed", "evidence": [{"source_id": context["submission"]["id"], "claim": "CPU 演示运行已完成，实际指标：" + str(metrics) if ok else "执行未正常完成或指标不完整", "status": "observed"}], "limitations": ["固定脚本演示，不含真实多 Agent 推理", "合成数据单次实验，不代表题目的有效科研证据"], "required_changes": []}
+            source_ids = context["submission"].get("run_ids", [])
+            source_id = source_ids[-1] if source_ids else context["submission"]["id"]
+            value = {"content_markdown": content + "\n仅根据真实 CPU 运行产物核查演示设置；不构成任何用户题目的科研结论。", "passed": ok, "scientific_observation": "improvement" if improved else "no_improvement" if ok else "execution_failed", "evidence": [{"source_id": source_id, "claim": "CPU 演示运行已完成，实际指标：" + str(metrics) if ok else "执行未正常完成或指标不完整", "status": "observed"}], "limitations": ["固定脚本演示，不含真实多 Agent 推理", "合成数据单次实验，不代表题目的有效科研证据"], "required_changes": []}
         elif name == "BossDecision":
             value = boss_decision()
         elif name == "ResourceAdvice":

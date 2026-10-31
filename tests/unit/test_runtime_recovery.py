@@ -9,6 +9,14 @@ from backend.runtime.recovery import recover_infrastructure_tasks, execution_exi
 from backend.runtime.control import ControlSupervisor
 
 
+def test_discussion_format_failure_retries_current_task_without_business_arbitration():
+    from backend.adapters.dsh import RuntimeBlocked
+    from backend.runtime.recovery import retryable_failure
+    failure = retryable_failure(RuntimeBlocked("discussion_technical_failure", "当前票的选项不存在"))
+    assert failure and failure[0] == "local_service_unavailable"
+    assert "保留已收票" in failure[1]
+
+
 def project(store):
     return store.start_project(store.create_project({"topic": "recovery", "client_request_id": "recovery", "mode": "demo"})["id"])
 

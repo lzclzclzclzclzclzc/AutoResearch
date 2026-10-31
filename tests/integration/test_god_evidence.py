@@ -44,7 +44,7 @@ async def test_group_evidence_child_releases_group_lock_and_resumes_review(tmp_p
             engine.demo._produce_turn = produce
             async def operation(task):
                 return await engine.discussions.run(p["id"], "evidence-discussion", "exploration",
-                    engine.members(p, "exploration", "line-01"), {"evidence": [{"source_id": artifact["id"]}]}, "line-01")
+                    engine.members(p, "exploration", "line-01"), {"discussion_protocol": 1, "evidence": [{"source_id": artifact["id"]}]}, "line-01")
             graph = PaperGraph(operation, saver)
             parent = store.add_task(p["id"], "paper", {}, "evidence-parent")
             token = current_task.set(parent)

@@ -38,6 +38,18 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def revision_roles(request, context):
+    """Only the engine's named critic-to-exploration route can cross a group boundary."""
+    role = context.get("role") or context.get("original_context", {}).get("role")
+    roles = [role] if role else []
+    if (request.get("scope_kind") == "discussion" and request.get("line_id") and role == "critic"
+            and request.get("reason_code") in {"design_deadlock", "decision_blocked"}
+            and context.get("revision_routes", {}).get("exploration") == "revise_exploration"
+            and context.get("task", {}).get("exploration")):
+        roles.append("exploration")
+    return roles
+
+
 class ArbitrationService:
     def __init__(self, engine):
         self.engine, self.store = engine, engine.store
@@ -303,8 +315,9 @@ class ArbitrationService:
         if action in {"request_revision", "request_evidence"}:
             if decision["target_role"] not in {r.value for r in Role if r != Role.GOD}:
                 raise ValueError("Recovery must target an existing research role")
-            if role and decision["target_role"] != role:
-                raise ValueError("Recovery cannot expand the original role permissions")
+            allowed_roles = revision_roles(request, context) if action == "request_revision" else [role]
+            if role and decision["target_role"] not in allowed_roles:
+                raise ValueError(f"Recovery cannot expand the original role permissions: target_role={decision['target_role']!r}; allowed target_role={allowed_roles!r}. Put upstream line IDs in dependency_line_ids, not target_role.")
         if action == "request_evidence" and any(ref not in allowed_refs for ref in decision.get("source_refs", [])):
             raise ValueError("Evidence tasks cannot read outside the frozen authorized snapshot")
         if action == "decompose_task":
@@ -319,7 +332,7 @@ class ArbitrationService:
             if decision["selected_candidate_id"] not in context.get("candidates", {}):
                 raise ValueError("God must select an existing frozen candidate")
             if context.get("blockers"):
-                raise ValueError("God selection cannot remove unresolved blockers")
+                raise ValueError("God selection cannot remove unresolved blockers. Use request_revision for the original role; retain issue IDs and require stage_review with existing sources when moving runtime-only acceptance conditions to execution.")
         if action == "repair_output":
             if not schema or decision["target_schema_hash"] != request["target_schema_hash"]:
                 raise ValueError("God repair must match the original target schema")
@@ -338,6 +351,8 @@ class ArbitrationService:
                 if any(decision["output"].get(field) != source.get(field) for field in
                        (*factual_fields, "independent_replication") if field in source):
                     raise ValueError("God may repair Verification formatting but cannot change verification facts")
+                if decision["output"].get("execution_checks", []) != source.get("execution_checks", []):
+                    raise ValueError("God cannot change Verify execution acceptance checks")
             validate = getattr(self.engine, "validate_recovery_output", self.engine.validate_output)
             validate(request["research_id"], context.get("agent_id", "god"), schema,
                 decision["output"], context.get("original_context", context), validator)

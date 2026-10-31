@@ -13,18 +13,18 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from backend.adapters.demo import DemoRuntimeAdapter
-from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
 from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
+from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
 from backend.runtime.evidence import validate_execution_checks
 from backend.persistence.store import StoreError
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
-    Role, RunAssessment, StageReport, Verification, assert_spec_unchanged, digest, validate_issue_transition)
-from packages.prompts.roles import VERSION, role_prompt
+    Role, RunAssessment, StageReport, Verification, Issue, assert_spec_unchanged, digest, validate_issue_transition)
+from packages.prompts.roles import VERSION, role_prompt, discussion_prompt
 
 
 def god_prompt_context(sections):
@@ -87,8 +87,8 @@ class LineState(TypedDict, total=False):
     revision: int
     spec_id: str
     implementation_id: str
-    allocation_id: str
     allocation_route: str
+    allocation_id: str
     run_id: str
     submission_id: str
     route: str
@@ -120,11 +120,11 @@ class ResearchEngine:
         for name in ("design", "implement", "organize", "run_experiment", "assess_run", "package", "verify", "route_result"):
             graph.add_node(name, getattr(self, name))
         graph.add_edge(START, "design")
-        for source, target in (("design", "implement"), ("organize", "run_experiment"),
+        for source, target in (("design", "implement"),
                                ("run_experiment", "assess_run"), ("package", "verify"), ("verify", "route_result")):
             graph.add_edge(source, target)
-        graph.add_conditional_edges("implement", lambda state: state.get("implementation_route", "organize"), {"organize": "organize", "package": "package", "design": "design", "implement": "implement"})
         graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement"})
+        graph.add_conditional_edges("implement", lambda state: state.get("implementation_route", "organize"), {"organize": "organize", "package": "package", "design": "design", "implement": "implement"})
         graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package"})
         graph.add_conditional_edges("route_result", lambda state: "design" if state["route"] == "exploration_and_critic" else END,
                                     {"design": "design", END: END})
@@ -179,7 +179,7 @@ class ResearchEngine:
                     return await self.accept_turn_output(**values)
                 values.pop("research_id")
                 return await self.recover_action(request, decision, **values)
-        if saved_failure:
+        if saved_failure and not original_values["context"].get("no_arbitration"):
             values = dict(original_values)
             schema, context = values.pop("schema"), values.pop("context")
             if context.get("recovery_part"):
@@ -191,6 +191,9 @@ class ResearchEngine:
             async with self.agent_turn_locks.setdefault((research_id, agent_id), asyncio.Lock()):
                 return await self._turn(**original_values)
         except RuntimeBlocked as error:
+            if original_values["context"].get("no_arbitration"):
+                # Technical recovery must never replace an individual member's vote.
+                raise
             if error.code not in {"invalid_output", "model_output_truncated"}:
                 raise
             # Exit both the member lock and DSH capacity slot before asking God.
@@ -236,10 +239,11 @@ class ResearchEngine:
     def validate_output(self, research_id, agent_id, schema, result, context, output_validator=None):
         """Accept structured output only after schema and contextual business checks."""
         result = schema.model_validate(bind_metadata(schema, result, context)).model_dump()
+        current_protocol = context.get("discussion_protocol", 1) == 2 or result.get("discussion_protocol") == 2
         previous = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"}
                     for i in context.get("issues", []) if i.get("raised_by") == agent_id}
         seen = set()
-        for issue in result.get("issues", []):
+        for issue in ([] if current_protocol else result.get("issues", [])):
             if issue["issue_id"] in seen:
                 raise ValueError("Each issue_id may occur only once in a response")
             seen.add(issue["issue_id"])
@@ -247,6 +251,11 @@ class ResearchEngine:
                 lambda source: self.store.source_exists(research_id, source))
         if output_validator is not None:
             output_validator(result)
+        if schema is ExperimentSpec and not current_protocol:
+            actual = {issue["issue_id"]: issue for issue in result["issues"]}
+            for required in context.get("execution_requirements", []):
+                if actual.get(required["issue_id"]) != Issue.model_validate(required).model_dump():
+                    raise ValueError(f"ExperimentSpec must retain execution requirement {required['issue_id']} and its acceptance criteria")
         if schema is Verification:
             validate_execution_checks(self.store, research_id, context.get("submission", {}), result,
                 context.get("line_id") or agent_id.split("/")[0])
@@ -288,12 +297,17 @@ class ResearchEngine:
                    publish_message=True, reply_to=None, output_validator=None):
         project = await self.guard(research_id)
         context = dict(context)
+        plan = context.get("spec") or context.get("submission", {}).get("spec", {})
+        if plan.get("discussion_protocol") == 2:
+            context.setdefault("discussion_protocol", 2)
         if line_id and "direction_epoch" not in context:
             line = next((line for line in self.store.lines(research_id) if line["line_id"] == line_id), None)
             if line:
                 context["direction_epoch"] = line["direction_epoch"]
         if line_id and role in {"exploration", "critic", "implementation"} and not turn_id.startswith("monitor-"):
             line = next(line for line in self.store.lines(research_id) if line["line_id"] == line_id)
+            if line["direction_epoch"] != context.get("direction_epoch", line["direction_epoch"]) or line.get("direction_stop_epoch") == context.get("direction_epoch"):
+                raise RuntimeBlocked("task_superseded", "旧研究方向已结束，当前回合仅保留历史")
             if line.get("finish_requested"):
                 raise RuntimeBlocked("line_finished", "Boss 已结束该研究方向，停止发起新角色任务")
         conversation_id = conversation_id or f"{research_id}:{task_id}"
@@ -305,13 +319,17 @@ class ResearchEngine:
             self.store.create_conversation(research_id, conversation_id, kind=message_kind, title=context.get("instruction", role),
                 participants=[{"type": "agent", "id": agent_id}], line_id=line_id)
         identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
-        instructions = role_prompt(Role(role)) if publish_message else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
+        private_score = not publish_message and context.get("discussion_protocol") != 2
+        instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
+        if context.get("discussion_protocol") == 2 and schema.__name__ in {"DiscussionTurn", "PollBallot", "OrdinaryBallot", "EndBallot"}:
+            mode = {"DiscussionTurn": "discussion", "PollBallot": "ordinary_vote", "OrdinaryBallot": "ordinary_vote", "EndBallot": "end_vote"}[schema.__name__]
+            instructions = discussion_prompt(Role(role), mode)
         prompt = identity + "\n" + instructions + "\n\n任务输入（只包含授权上下文）:\n" + json.dumps(context, ensure_ascii=False, default=str)
         wire_contract = model_contract(schema, context)
         prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象（系统编号、版本和哈希由程序填写）:\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
         delay, last_error = 1.0, None
-        token_limit = output_tokens(not publish_message)
+        token_limit = output_tokens(private_score)
         while True:
             response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
             response_retry = self.store.get("model_response_retry", response_retry_id) or {}
@@ -324,6 +342,8 @@ class ResearchEngine:
                     model=project["config_snapshot"]["provider"], context=context,
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
                         "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message,
+                        "discussion_protocol": context.get("discussion_protocol", 1), "private_score": private_score,
+                        **{key: context[key] for key in ("finalization_id", "snapshot_hash", "context_sections") if key in context},
                         "max_output_tokens": token_limit})
                 result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
                 break
@@ -395,6 +415,10 @@ class ResearchEngine:
         validator = self.validate_recovery_output if decision_source == "god" else self.validate_output
         result = validator(research_id, repaired_for_agent_id or agent_id, schema, result, context, output_validator)
         project = await self.guard(research_id)
+        if line_id and context.get("direction_epoch") is not None:
+            line = self.store.get("line", f"{research_id}:{line_id}")
+            if line and (line["direction_epoch"] != context["direction_epoch"] or line.get("direction_stop_epoch") == context["direction_epoch"]):
+                raise RuntimeBlocked("task_superseded", "旧方向的晚到回复不能推进后继任务")
         if not publish_message:
             return result
         conversation_id = conversation_id or f"{research_id}:{task_id}"
@@ -487,6 +511,15 @@ class ResearchEngine:
         context = {"arbitration_request": request, "snapshot": sections, "repair_feedback": feedback}
         prompt_context = {"arbitration_request": {k: v for k, v in request.items()
             if k not in {"history", "attempts", "recovered_response"}}, "repair_feedback": feedback, **god_prompt_context(sections)}
+        from backend.graphs.arbitration import revision_roles
+        prompt_context["recovery_constraints"] = {
+            "target_role": sections.get("role") or sections.get("original_context", {}).get("role"),
+            "revision_target_roles": revision_roles(request, sections),
+            "revision_routes": sections.get("revision_routes", {}),
+            "dependency_line_ids": [line["line_id"] for line in self.store.lines(request["research_id"])
+                if line["line_id"] != request.get("line_id")],
+            "select_candidate_allowed": not bool(sections.get("blockers")),
+            "design_deadlock_recovery": "用 request_revision 让原角色区分设计缺陷与运行后验收条件；已有问题调整 acceptance_stage 需要 stage_review，保留 issue_id 与必改分类。"}
         prompt = f"你的独立执行身份是 {agent_id}。\n" + role_prompt(Role.GOD) + "\n本次冻结仲裁请求：\n" + json.dumps(prompt_context, ensure_ascii=False)
         wire_contract = model_contract(GodDecision, context)
         prompt += "\n返回允许动作之一的完整 JSON（系统身份和哈希由程序填写）：\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
@@ -633,7 +666,7 @@ class ResearchEngine:
             p = await self.guard(research_id)
             context = {"instruction": "初始分派所有研究线" if payload.get("initial") else "审议冻结提交包与 Verify 事实，决定后续研究方向", "topic": p["topic"],
                 "description": p.get("description", ""), "workspace_path": p.get("workspace_path"),
-                "initial": payload.get("initial", False), "lines": self.store.lines(research_id), **payload,
+                "initial": payload.get("initial", False), "lines": self.store.lines(research_id), "research_id": research_id, **payload,
                 "memory_index": self.store.list("memory_node", research_id), "deadline_at": p["deadline_at"]}
             # A checkpointed discussion may return its old decision on retry.
             # Keep its memory baseline too, including checkpoints predating this record.
@@ -661,6 +694,8 @@ class ResearchEngine:
                 research_id, "boss", task["id"] + ":inbox", payload.get("cycle_id"), self.control)
             members = self.members(p, "boss")
             discussion = await self.discussions.run(research_id, task["id"] + ":discussion", "boss", members, context)
+            if discussion.get("protocol_version") == 2:
+                return await self.apply_discussion_boss(task, discussion, context)
             decision = BossDecision.model_validate(discussion["selected_payload"]).model_dump()
             marker = (current_task.get() or {}).get("recovery_marker") or {}
             if marker.get("resume_point") == "boss.validate_assignment":
@@ -741,6 +776,103 @@ class ResearchEngine:
                         await asyncio.to_thread(self.runner.request_stop, run["id"], "early_stopped")
             return decision
 
+    def validate_discussion_output(self, role, final_output, context, next_step=None):
+        """Check only the data actually needed to execute a chosen handoff."""
+        from packages.contracts.research import allowed_next_steps
+        from backend.graphs.boss_operations import normalize_operations
+        if not isinstance(final_output, dict) or not str(final_output.get("content_markdown", "")).strip():
+            raise ValueError("结束投票必须绑定一份包含 content_markdown 的完整产物")
+        if next_step is not None and next_step not in allowed_next_steps(role):
+            raise ValueError("推进方向不在当前角色的目录中")
+        if role == "critic" and (next_step == "implementation" or "experiment_spec" in final_output or "fixed" in final_output):
+            raw = final_output.get("experiment_spec", final_output)
+            if not isinstance(raw, dict):
+                raise ValueError("转 Implementation 必须提供 experiment_spec 实验计划")
+            ExperimentSpec.model_validate({**raw, "discussion_protocol": 2,
+                "spec_id": context.get("spec_id", "pending-spec"), "version": context.get("spec_version", 1),
+                "deadline_at": context["deadline_at"]})
+        if role == "boss":
+            from packages.contracts.research import SharedKnowledge
+            for update in final_output.get("memory_updates", []):
+                knowledge = SharedKnowledge.model_validate(update)
+                if any(not self.store.source_exists(context["research_id"], source) for source in knowledge.source_ids):
+                    raise ValueError("共享知识必须引用本项目实际存在的来源")
+            # Before the vote only explicit operations are checked; shortcuts
+            # become concrete after all members choose the same direction.
+            step = next_step or ("dispatch" if final_output.get("operations") else None)
+            if step:
+                normalize_operations(final_output, step, context["lines"])
+            elif next_step is None and final_output.get("targets") is not None:
+                normalize_operations(final_output, "finish_lines", context["lines"])
+        return final_output
+
+    async def apply_discussion_boss(self, task, discussion, context):
+        from backend.graphs.boss_operations import BossOperationService
+        if task["payload"].get("dependency_wait_id"):
+            dependency = self.store.get("dependency_wait", task["payload"]["dependency_wait_id"])
+            source = self.store.get("line", f"{task['research_id']}:{dependency['line_id']}") if dependency else None
+            if not dependency or dependency["status"] != "waiting_children" or not source or source.get("finish_requested") or source.get("cycle_id") != dependency.get("source_cycle_id"):
+                raise RuntimeBlocked("task_superseded", "原依赖已结束，旧 Boss 回复仅保留历史")
+        return await BossOperationService(self).apply(task, discussion, context)
+
+    async def design_discussion_v2(self, state, project, prefix, exploration, exploration_context, critic_context):
+        """Route immutable discussion products directly, including legal back handoffs."""
+        research_id, line_id = state["research_id"], state["line_id"]
+        spec_id = prefix + ":spec"
+        existing = self.store.get("spec", spec_id)
+        if existing:
+            self.store.update_line(research_id, line_id, phase="implementation", active_spec_id=spec_id)
+            return {"spec_id": spec_id, "revision": state.get("revision", 1), "code_attempt": 1}
+        critic_context = {**critic_context, "spec_id": spec_id, "spec_version": state.get("revision", 1),
+            "discussion_protocol": 2, "line_instructions": self.store.list("line_instruction", research_id, line_id=line_id)}
+        iteration = 0
+        while True:
+            await self.line_open(state)
+            suffix = "" if iteration == 0 else f":handoff-{iteration}"
+            self.store.update_line(research_id, line_id, phase="critic")
+            critic = await self.discussions.run(research_id, prefix + suffix + ":critic", "critic",
+                self.members(project, "critic", line_id), {**critic_context, "exploration": exploration,
+                    "handoff_from_discussion": exploration.get("discussion_id"),
+                    "instruction": "自由审议当前完整方案。可直接交 Implementation，或将完整修订任务交回 Exploration。选择 Implementation 时 final_output.experiment_spec 必须包含可解析实验计划。"}, line_id)
+            if critic.get("protocol_version") != 2:
+                raise RuntimeBlocked("discussion_protocol_mismatch", "新讨论不能混用历史讨论检查点")
+            await self.line_open(state)
+            if critic["next_step"] == "exploration":
+                iteration += 1
+                self.store.update_line(research_id, line_id, phase="exploration")
+                exploration = await self.discussions.run(research_id, prefix + f":handoff-{iteration}:exploration", "exploration",
+                    self.members(project, "exploration", line_id), {**exploration_context,
+                        "critic_handoff": critic["final_output"], "previous_exploration": exploration,
+                        "handoff_from_discussion": critic.get("discussion_id"), "discussion_protocol": 2}, line_id)
+                continue
+            self.validate_discussion_output("critic", critic["final_output"], critic_context, critic["next_step"])
+            output = critic["final_output"]
+            spec = ExperimentSpec.model_validate({**output.get("experiment_spec", output),
+                "content_markdown": output.get("experiment_spec", {}).get("content_markdown") or output["content_markdown"],
+                "discussion_protocol": 2, "spec_id": spec_id, "version": state.get("revision", 1),
+                "deadline_at": project["deadline_at"]}).model_dump()
+            # Final spec and the handoff marker are committed together. The
+            # serial line graph consumes this same spec on every retry.
+            await self.line_open(state)
+            with self.store.connect(True) as connection:
+                current = self.store._project(connection, research_id)
+                self.store.assert_progress(current, project["control_generation"])
+                self.store._put(connection, "spec", spec_id, {**spec, "spec_hash": digest(spec),
+                    "line_id": line_id, "decision_source": critic.get("decision_source"),
+                    "discussion_id": critic.get("discussion_id")}, research_id)
+                handoff_id = critic["discussion_id"]
+                handoff = self.store._get(connection, "discussion_handoff", handoff_id) or {}
+                self.store._put(connection, "discussion_handoff", handoff_id, {**handoff,
+                    "status": "delivered", "next_step": "implementation", "spec_id": spec_id,
+                    "discussion_id": critic.get("discussion_id")}, research_id)
+            self.store.create_message(research_id, prefix + ":cross_group", f"{line_id}/critic",
+                output["content_markdown"], source_system="discussion_v2", source_event_id=spec_id + ":handoff",
+                kind="handoff", line_id=line_id, structured=output, decision_source=critic.get("decision_source"),
+                recipients=[{"type": "agent", "id": f"{line_id}/implementation"}],
+                edge_id=f"{line_id}/critic->{line_id}/implementation", next_step="implementation")
+            self.store.update_line(research_id, line_id, phase="implementation", active_spec_id=spec_id)
+            return {"spec_id": spec_id, "revision": state.get("revision", 1), "code_attempt": 1}
+
     async def design(self, state):
         await self.line_open(state)
         p = await self.guard(state["research_id"])
@@ -752,21 +884,31 @@ class ResearchEngine:
             "deadline_at": p["deadline_at"], "direction_epoch": state["direction_epoch"],
             "instruction": "设计完整实验，必须包含所有固定设置与允许调整边界", "previous_verifications": self.store.list("verification", research_id, cycle_id=state["cycle_id"])}
         context["implementation_revision_requests"] = self.store.list("spec_revision_request", research_id, line_id=line_id)
+        context["line_instructions"] = self.store.list("line_instruction", research_id, line_id=line_id)
         prefix = f"{state['task_id']}:revision-{revision}"
         exploration_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
             research_id, f"{line_id}/exploration", prefix + ":exploration-inbox", state["cycle_id"], self.control)}
         critic_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
             research_id, f"{line_id}/critic", prefix + ":critic-inbox", state["cycle_id"], self.control)}
         exploration = await self.discussions.run(research_id, prefix + ":exploration", "exploration", self.members(p, "exploration", line_id), exploration_context, line_id)
+        if exploration.get("protocol_version") == 2:
+            return await self.design_discussion_v2(state, p, prefix, exploration, exploration_context, critic_context)
         self.store.update_line(research_id, line_id, phase="critic")
         critic = await self.discussions.run(research_id, prefix + ":critic", "critic", self.members(p, "critic", line_id), {**critic_context, "exploration": exploration}, line_id)
+        exploration = critic.get("revised_exploration", exploration)
         response = await self.turn(research_id, self.members(p, "exploration", line_id)[0], "exploration", prefix, "respond_to_critic", Proposal,
             {**exploration_context, "instruction": "向 Critic 逐项回应实际审查意见，记录修订及纳入实验的分歧", "exploration": exploration, "critic": critic},
             conversation_id=prefix + ":cross_group", line_id=line_id,
             recipients=[{"type": "group", "id": f"{line_id}/critic"}], edge_id=f"{line_id}/exploration->{line_id}/critic")
         spec_id = prefix + ":spec"
+        execution_requirements = {}
+        for source in (exploration, critic):
+            for issue in source.get("issues", []):
+                if issue.get("acceptance_stage") == "execution":
+                    execution_requirements[issue["issue_id"]] = Issue.model_validate({k: v for k, v in issue.items() if k != "raised_by"}).model_dump()
         spec = await self.turn(research_id, self.members(p, "critic", line_id)[0], "critic", prefix, "freeze_spec", ExperimentSpec,
-            {**critic_context, "instruction": "根据两组决议和回应冻结可执行 ExperimentSpec；必须修正项均解决，分歧映射到实验", "exploration": exploration, "critic": critic, "exploration_response": response, "spec_id": spec_id, "spec_version": revision},
+            {**critic_context, "instruction": "根据两组决议和回应冻结可执行 ExperimentSpec；设计必改项均解决，分歧映射到实验；完整原样保留 execution_requirements，交给运行后 Verify 核查", "exploration": exploration, "critic": critic, "exploration_response": response, "spec_id": spec_id, "spec_version": revision,
+                "execution_requirements": list(execution_requirements.values())},
             conversation_id=prefix + ":cross_group", line_id=line_id, message_kind="handoff",
             recipients=[{"type": "agent", "id": f"{line_id}/implementation"}], edge_id=f"{line_id}/critic->{line_id}/implementation")
         if spec["spec_id"] != spec_id or spec["version"] != revision or spec["deadline_at"] != p["deadline_at"]:
@@ -899,7 +1041,6 @@ class ResearchEngine:
             "implementation_agent_id": f"{state['line_id']}/implementation", "spec_id": spec.spec_id, "spec_version": spec.version,
             "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"], "memory_bytes": impl["memory_mb"] * 1024 * 1024,
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
-
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
             advice = await self.organizer_graph.run({"research_id": state["research_id"], "id": request["resource_request_id"],

@@ -20,7 +20,7 @@ class DependencyService:
         known = {line["line_id"] for line in self.store.lines(request["research_id"])}
         explicit = decision.get("dependency_line_ids", [])
         if explicit and (len(set(explicit)) != len(explicit) or set(explicit) - known or request["line_id"] in explicit):
-            raise ValueError("Dependencies must identify other existing research lines")
+            raise ValueError(f"Dependencies must identify other existing research lines: got {explicit!r}; allowed dependency_line_ids={sorted(known - {request['line_id']})!r}. This line's future Runner output is not a cross-line dependency; revise the design acceptance stage instead.")
         if explicit:
             return sorted(explicit)
         # Compatibility for already-frozen decisions: only exact registered line

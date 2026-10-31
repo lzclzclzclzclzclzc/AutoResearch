@@ -9,7 +9,7 @@ from langgraph.types import Command
 
 from backend.adapters.dsh import RuntimeBlocked
 from backend.graphs.tasks import ScopeResolved, TaskSuspended, current_task, recovery_suffix
-from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, digest, majority, validate_issue_transition, validate_vote
+from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, design_blocker, digest, majority, validate_issue_transition, validate_vote
 
 
 def merge_records(left, right):
@@ -52,6 +52,7 @@ class DiscussionState(TypedDict, total=False):
     resolution: dict
     recovery_chain_id: str
     failed_synthesis: dict
+    revised_exploration: dict
 
 
 class GroupDiscussionGraph:
@@ -132,8 +133,15 @@ class GroupDiscussionGraph:
         return list(latest.values())
 
     def blockers(self, state):
-        return [i for i in self.issues(state) if (i["category"] == "must_fix" and not i["resolved"]) or
-                (i["category"] == "experimental_disagreement" and not i["experiment_mapping"])]
+        return [i for i in self.issues(state) if design_blocker(i)]
+
+    def retain_execution_requirements(self, state, result):
+        # A summary may omit an unresolved runtime requirement in prose, but it
+        # cannot erase the member-owned acceptance contract passed to the plan.
+        required = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"}
+            for i in self.issues(state) if i.get("acceptance_stage") == "execution"}
+        result["issues"] = [i for i in result.get("issues", []) if i["issue_id"] not in required] + list(required.values())
+        return result
 
     async def member_turn(self, state):
         phase, member = state["phase"], state["member"]
@@ -182,7 +190,7 @@ class GroupDiscussionGraph:
         if phase == "proposal":
             return {"phase": "review", "round": 1}
         if phase == "review":
-            issue_progress = [{k: i[k] for k in ("raised_by", "issue_id", "category", "resolved", "experiment_mapping")}
+            issue_progress = [{k: i.get(k, "design" if k == "acceptance_stage" else None) for k in ("raised_by", "issue_id", "category", "resolved", "experiment_mapping", "acceptance_stage")}
                               for i in sorted(self.issues(state), key=lambda i: (i["raised_by"], i["issue_id"]))]
             fingerprint = digest({"candidates": state["candidates"], "issues": issue_progress,
                 "reviews": {m: {k: v[k] for k in ("ready_for_vote", "new_evidence")} for m, v in current.items()}})
@@ -220,8 +228,11 @@ class GroupDiscussionGraph:
         speaking = {}
         if self.blockers({**state, "records": {**state["records"], **records}}):
             return {**speaking, "records": records, "winner": None, "phase": "review", "round": state["round"] + 1}
+        self.retain_execution_requirements({**state, "records": {**state["records"], **records}}, result)
         result["selected_payload"] = candidate
         result["decision_source"] = state.get("decision_source", "majority")
+        if state.get("revised_exploration"):
+            result["revised_exploration"] = state["revised_exploration"]
         self.engine.store.put("discussion", state["discussion_id"], {"members": state["members"], "records": state["records"],
             "candidates": state["candidates"], "winner": state["winner"], "authored_by_agent_id": host, "result": result}, state["research_id"])
         if state.get("recovery_chain_id"):
@@ -256,7 +267,11 @@ class GroupDiscussionGraph:
             "discussion": messages, "phase": state["phase"], "round": state["round"],
             "winner": state.get("winner"), "diagnostic": state.get("arbitration_diagnostic"),
             "failed_synthesis": state.get("failed_synthesis"), "focused": state.get("focused", False)}
-        context["dependency_catalog"] = [{k: line.get(k) for k in ("line_id", "phase", "direction_epoch", "cycle_id")}
+        if (state["role"] == "critic" and state.get("line_id") and state["context"].get("exploration")
+                and state["arbitration_reason"] in {"design_deadlock", "decision_blocked"}):
+            context["revision_routes"] = {"exploration": "revise_exploration"}
+        # Transient phases are not a new scientific scene on retry.
+        context["dependency_catalog"] = [{k: line.get(k) for k in ("line_id", "direction_epoch", "cycle_id")}
             for line in self.engine.store.lines(rid)]
         summary_repair = state["arbitration_reason"] == "invalid_group_decision"
         def validate_summary(result):
@@ -299,8 +314,11 @@ class GroupDiscussionGraph:
             if action == "repair_output" and self.blockers({**state,
                     "records": {**state["records"], "synthesis:god:god": result}}):
                 raise RuntimeBlocked("invalid_group_decision", "仲裁修复总结仍有未解决必改项，禁止采用")
+            self.retain_execution_requirements(state, result)
             source = state.get("decision_source", "majority") if action == "repair_output" else "god"
             result.update(selected_payload=candidate, decision_source=source, arbitration_id=state["arbitration_id"])
+            if state.get("revised_exploration"):
+                result["revised_exploration"] = state["revised_exploration"]
             if action == "repair_output":
                 result["summary_source"] = "god"
             await self.engine.arbitration.apply(state["arbitration_id"], decision)
@@ -315,7 +333,25 @@ class GroupDiscussionGraph:
             self.engine.store.close_recovery_chain(state["recovery_chain_id"])
             return {"result": result, "winner": winner, "decision_source": source, "arbitration_reason": None}
         if action == "request_revision":
-            await self.engine.arbitration.apply(state["arbitration_id"], decision)
+            if decision["target_role"] != state["role"]:
+                if not (state["role"] == "critic" and decision["target_role"] == "exploration"
+                        and state.get("line_id") and state["context"].get("exploration")
+                        and state["arbitration_reason"] in {"design_deadlock", "decision_blocked"}):
+                    raise ValueError("No registered group revision route")
+                await self.engine.arbitration.apply(state["arbitration_id"], decision, effect_kind="request_revision")
+                project = await self.engine.guard(rid)
+                # The original critic records stay in this checkpoint. Exploration
+                # authors its own revision; only the critic can resolve its issues.
+                revised = await self.run(rid, state["discussion_id"] + ":revision:" + state["arbitration_id"],
+                    "exploration", self.engine.members(project, "exploration", state["line_id"]),
+                    {**state["context"], "god_revision": decision, "critic_issues": self.issues(state),
+                        "instruction": "根据 Critic 原始必改项和 God 修订要求完整修订本组方案；保留依据，不替 Critic 宣称问题已解决。"},
+                    state["line_id"])
+                return {"context": {**state["context"], "exploration": revised, "god_revision": decision},
+                    "revised_exploration": revised, "winner": None, "phase": "review",
+                    "round": state["round"] + 1, "prior_review_hash": "", "reviewed_candidates": {},
+                    "arbitration_reason": None, "resolution": {}}
+            await self.engine.arbitration.apply(state["arbitration_id"], decision, effect_kind="request_revision")
             if state["arbitration_reason"] == "invalid_group_decision":
                 return {"context": {**state["context"], "god_revision": decision},
                     "round": state["round"] + 1, "arbitration_reason": None, "resolution": {}}
@@ -338,9 +374,21 @@ class GroupDiscussionGraph:
 
     async def run(self, research_id, discussion_id, role, members, context, line_id=None):
         async with self.locks.setdefault((research_id, role, line_id), asyncio.Lock()):
-            discussion_id += recovery_suffix() + ":serial-v2"
-            config = {"configurable": {"thread_id": f"research/{research_id}/discussion/{discussion_id}"}, "recursion_limit": 100000}
+            base_id = discussion_id + recovery_suffix()
+            legacy_id = base_id + ":serial-v2"
+            config = {"configurable": {"thread_id": f"research/{research_id}/discussion/{legacy_id}"}, "recursion_limit": 100000}
             snapshot = await self.graph.aget_state(config)
+            # A saved legacy checkpoint keeps its original semantics. New instances
+            # have an explicit separate identity and cannot mix old/new ballots.
+            if (self.engine.store.get("discussion_state", discussion_id + ":group-v3")
+                    or (not snapshot.values and context.get("discussion_protocol") != 1)):
+                from backend.graphs.discussion_v2 import MemberDiscussion
+                # Recovery generations are technical retries of this same
+                # discussion: they must not clear failed votes or freeze state.
+                new_id = discussion_id + ":group-v3"
+                return await MemberDiscussion(self.engine).run(research_id, new_id, role, members,
+                    context, line_id, speaking_order(members, digest(new_id)))
+            discussion_id = legacy_id
             has_interrupt = any(t.interrupts for t in snapshot.tasks)
             initial = None if snapshot.values and (snapshot.next or has_interrupt) else {"research_id": research_id, "discussion_id": discussion_id,
                 "role": role, "members": members, "context": context, "line_id": line_id, "records": {}, "phase": "proposal", "round": 1}

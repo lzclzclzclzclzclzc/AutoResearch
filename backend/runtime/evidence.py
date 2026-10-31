@@ -13,6 +13,8 @@ def submission_sources(store, research_id, submission, line_id):
 
 
 def validate_execution_checks(store, research_id, submission, result, line_id):
+    if submission.get('spec', {}).get('discussion_protocol') == 2:
+        return validate_current_evidence(store, research_id, submission, result, line_id)
     required = {item['issue_id'] for item in submission.get('spec', {}).get('issues', [])
                 if item.get('acceptance_stage') == 'execution' and item['category'] == 'must_fix' and not item['resolved']}
     checks = result.get('execution_checks', [])
@@ -29,3 +31,19 @@ def validate_execution_checks(store, research_id, submission, result, line_id):
     satisfied = {check['issue_id'] for check in checks if check['passed']}
     if result['passed'] and required - satisfied:
         raise ValueError('Verify cannot pass before execution requirements are evidenced: '+', '.join(sorted(required-satisfied)))
+
+
+def validate_current_evidence(store, research_id, submission, result, line_id):
+    """New plans own acceptance; old issue identifiers impose no inherited gate."""
+    allowed = submission_sources(store, research_id, submission, line_id)
+    for evidence in [*result.get('evidence', []), *[e for check in result.get('execution_checks', []) for e in check.get('evidence', [])]]:
+        if evidence['source_id'] not in allowed or not store.source_exists(research_id, evidence['source_id']):
+            raise ValueError('Verify evidence must cite this submission or its traceable calculations')
+    if result.get('passed'):
+        runs = submission.get('runs') or ([submission['run']] if submission.get('run') else [])
+        if not any(run.get('state', run.get('status')) in {'completed', 'succeeded', 'early_stopped'} for run in runs):
+            raise ValueError('An unexecuted or failed experiment cannot become successful by removing review fields')
+        if result.get('scientific_observation') == 'execution_failed':
+            raise ValueError('An execution failure cannot be marked as a passed scientific result')
+        if not any(e.get('status') in {'observed', 'negative'} for e in result.get('evidence', [])):
+            raise ValueError('Passed verification requires observed results, including negative results')

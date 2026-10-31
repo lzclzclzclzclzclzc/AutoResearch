@@ -66,7 +66,7 @@ async def test_failed_verify_reaches_both_groups_then_boss_once_after_delivery_r
             store.finish_task(line["id"])
             assert verify_count == 2 and dispatch_count >= 3
             assert len(worker_deliveries) == 1
-            revisions = [entry for entry in seen if ":revision-2:" in entry["task_id"] and entry["schema"] == "Proposal"]
+            revisions = [entry for entry in seen if ":revision-2:" in entry["task_id"] and entry["schema"] == "DiscussionTurn"]
             assert {entry["role"] for entry in revisions} >= {"exploration", "critic"}
             for role in ("exploration", "critic"):
                 context = next(entry["context"] for entry in revisions if entry["role"] == role)
@@ -86,7 +86,7 @@ async def test_failed_verify_reaches_both_groups_then_boss_once_after_delivery_r
                 "submission_id": passed["submission_version_id"], "route": "boss", "revision": 2})
             assert store.list("inbox", project["id"]) == inbox_before
             await engine.boss(bosses[0])
-            boss_turn = next(entry for entry in reversed(seen) if entry["role"] == "boss" and entry["schema"] == "BossProposal")
+            boss_turn = next(entry for entry in reversed(seen) if entry["role"] == "boss" and entry["schema"] == "DiscussionTurn")
             assert len(boss_turn["context"]["received_handoffs"]) == 1
             assert boss_turn["context"]["received_handoffs"][0]["verification"]["passed"] is True
             assert len([task for task in store.list("task", project["id"]) if task["kind"] == "boss"]) == 1

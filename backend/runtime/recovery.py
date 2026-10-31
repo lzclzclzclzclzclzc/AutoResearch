@@ -17,6 +17,10 @@ def retryable_failure(error):
         return "storage_busy", "数据库写入暂时繁忙，保留检查点并自动重试"
     if getattr(error, "code", None) == "confirmation_pending":
         return "local_service_unavailable", "业务操作等待控制确认，自动重试"
+    if getattr(error, "code", None) == "direction_stop_pending":
+        return "local_service_unavailable", "等待旧研究方向的执行退出后自动落实新安排"
+    if getattr(error, "code", None) == "discussion_technical_failure":
+        return "local_service_unavailable", "当前讨论回复遇到技术故障，保留已收票并在原位置自动重试"
     if getattr(error, "code", None) == "stream_recorder_unavailable":
         return "stream_recorder_unavailable", "本机流式记录暂时不可用，确认旧执行退出后自动恢复"
     return None

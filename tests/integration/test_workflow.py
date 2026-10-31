@@ -57,11 +57,18 @@ async def test_complete_demo_workflow_is_labelled_and_runs_real_cpu(tmp_path):
             assert store.list("task", project["id"]) == tasks_before
             assert len(store.list("run", project["id"])) == 2
             for discussion in store.list("discussion", project["id"]):
-                records = discussion["records"]
-                for member in discussion["members"]:
-                    assert f"proposal:1:{member}" in records
-                    assert f"review:1:{member}" in records
-                    assert f"vote:1:{member}" in records
+                if discussion.get("protocol_version") == 2:
+                    state = store.get("discussion_state", discussion["id"])
+                    assert state["mode"] == "ended"
+                    assert state["votes"][-1]["type"] == "end"
+                    for vote in state["votes"]:
+                        assert set(vote["ballots"]) == set(discussion["members"])
+                else:
+                    records = discussion["records"]
+                    for member in discussion["members"]:
+                        assert f"proposal:1:{member}" in records
+                        assert f"review:1:{member}" in records
+                        assert f"vote:1:{member}" in records
             await engine.close()
     finally:
         runner.close()

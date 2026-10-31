@@ -134,10 +134,52 @@ async def test_legacy_protocol_error_is_recovered_only_from_latest_boundary_and_
     engine.control.terminate(p["id"])
     assert not await recover_infrastructure_tasks(store, engine.control)
 
+
 def line_state(store, p):
     store.put("cycle", "cycle", {"objective": "frozen baseline", "line_id": "line-01"}, p["id"])
     store.update_line(p["id"], "line-01", cycle_id="cycle")
     return dict(research_id=p["id"], line_id="line-01", cycle_id="cycle", task_id="root", direction_epoch=1, revision=1)
+
+
+async def test_critic_deadlock_routes_to_exploration_then_rechecks_original_issues_before_freezing(scene, monkeypatch):
+    store, p, engine = scene
+    # Replays the historical pre-unanimity deadlock/revision protocol.
+    original_run = engine.discussions.run
+    async def legacy_discussion(*args, **kwargs):
+        args[4]["discussion_protocol"] = 1
+        return await original_run(*args, **kwargs)
+    monkeypatch.setattr(engine.discussions, "run", legacy_discussion)
+    original, calls = engine.demo._produce_turn, []
+    async def produce(**args):
+        calls.append((args["role"], args["schema"].__name__, args["context"]))
+        if args["schema"].__name__ == "GodDecision":
+            request = args["context"]["arbitration_request"]
+            assert args["context"]["snapshot"]["revision_routes"] == {"exploration": "revise_exploration"}
+            assert '"revision_target_roles": ["critic", "exploration"]' in args["prompt"]
+            return {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"], "action": "request_revision",
+                "target_role": "exploration", "instructions": "correct the candidate", "allowed_changes": ["method"],
+                "acceptance_checks": ["critic must resolve original issue"], "content_markdown": "revise upstream", "rationale": "code defect"}
+        output = await original(**args)
+        if args["role"] == "exploration" and args["schema"].__name__ == "Proposal":
+            output["candidate"] = {"method": "fixed" if args["context"].get("god_revision") else "broken"}
+        if args["role"] == "critic" and args["schema"].__name__ == "Review":
+            fixed = args["context"]["exploration"]["selected_payload"]["method"] == "fixed"
+            output.update(ready_for_vote=fixed, new_evidence=[], issues=[{"issue_id": "cmf-004", "category": "must_fix",
+                "description": "result file is not written", "resolved": fixed, "resolution": "candidate now writes it" if fixed else ""}])
+        if args["schema"] is ExperimentSpec:
+            assert args["context"]["exploration"]["selected_payload"] == {"method": "fixed"}
+        return output
+    engine.demo._produce_turn = produce
+    result = await engine.design(line_state(store, p))
+    assert result["spec_id"] and len(store.list("spec", p["id"])) == 1
+    requests = store.list("arbitration_request", p["id"])
+    assert len(requests) == 1 and requests[0]["status"] == "applied"
+    discussion = next(d for d in store.list("discussion", p["id"])
+        if d["members"] == engine.members(p, "critic", "line-01"))
+    reviews = [r for k, r in discussion["records"].items() if k.startswith("review:")]
+    assert any(not r["issues"][0]["resolved"] for r in reviews) and any(r["issues"][0]["resolved"] for r in reviews)
+    assert len([c for c in calls if c[0] == "exploration" and c[1] == "Proposal"]) == 3
+
 
 @pytest.mark.parametrize("corrected", [True, False])
 async def test_implementation_gets_one_configuration_correction_before_design_revision(scene, corrected):

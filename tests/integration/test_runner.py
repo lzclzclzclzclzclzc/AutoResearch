@@ -305,6 +305,25 @@ def test_light_cpu_requires_actual_role_and_verify_evidence(setup_runtime):
     with pytest.raises(ValueError):runner.light_cpu.execute({**base,"role":"exploration"})
 
 
+def test_light_cpu_supervised_csv_analysis_supports_safe_data_methods(setup_runtime, tmp_path):
+    store, _, runner, request = setup_runtime
+    source = tmp_path / "sample.csv"
+    source.write_text("id,text,target\n1,Hello,1\n2,hello,0\n3,World,1\n", encoding="utf-8")
+    artifact = store.register_artifact(request["research_id"], source, "text/csv")
+    result = runner.light_cpu.execute({"research_id": request["research_id"], "agent_id": "line-01/verify", "role": "verify",
+        "execution_id": "light-csv", "parent_execution_id": "verify-attempt", "control_generation": 1,
+        "evidence_ids": [artifact["id"]], "code": f"""rows = evidence[{artifact['id']!r}]['data']
+counts = {{}}
+for row in rows:
+    text = row['text'].strip().lower()
+    counts[text] = counts.get(text, 0) + 1
+result = {{'counts': counts, 'positive': sum(int(row['target']) for row in rows)}}
+"""})
+    assert result["state"] == "completed", result
+    assert result["result"] == {"counts": {"hello": 2, "world": 1}, "positive": 2}
+    assert result["process_tree_exited"]
+
+
 def test_light_cpu_nonfinite_result_is_explicit_and_json_serializable(setup_runtime):
     _,_,runner,request=setup_runtime
     result=runner.run_light_cpu({"research_id":request["research_id"],"agent_id":"line-01/exploration/member-01",

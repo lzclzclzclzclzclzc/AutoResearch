@@ -37,6 +37,9 @@ async def test_concurrent_boss_memory_merges_disjoint_updates_and_redeliberates_
                 original_discussion = engine.discussions.run
                 arrived, both_ready = [], asyncio.Event()
                 async def discuss(*args, **kwargs):
+                    # This fixture exercises historical candidate/memory conflict
+                    # semantics; the new protocol has its own operation tests.
+                    args[4]["discussion_protocol"] = 1
                     arrived.append(args[4]["memory_index"])
                     if len(arrived) == 2:
                         both_ready.set()

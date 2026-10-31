@@ -14,10 +14,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
-from backend.persistence.event_views import ACTIVITY_FILTER, project_tool_calls
+from backend.persistence.event_views import ACTIVITY_FILTER, project_tool_calls, message_search_text
 from backend.persistence.arbitration_store import ArbitrationStoreMixin
 from backend.persistence.resilience import is_storage_busy
 from backend.persistence.runtime_recovery import RuntimeRecoveryStoreMixin
+from backend.persistence.discussion_store import DiscussionStoreMixin
 
 
 _writer_locks = {}
@@ -56,7 +57,7 @@ DEFAULT_TEAM = {"n": 2, "m1": 2, "m2": 2, "k": 3, "boss_members": 3,
                 "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1}
 
 
-class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
+class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMixin):
     def __init__(self, data_dir: str | Path = "data"):
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +163,7 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
         if existing and research_id and existing.get("research_id") not in {None, research_id}:
             raise StoreError("cross_project_reference", "记录不属于当前研究", 403)
         if existing and kind in {"submission", "spec", "experiment_spec", "memory_version", "verification", "report_snapshot",
-                                 "arbitration_snapshot", "arbitration_decision", "arbitration_effect"}:
+                                 "arbitration_snapshot", "arbitration_decision", "arbitration_effect", "discussion_finalization_snapshot"}:
             ignore = {"id", "research_id"} if kind in {"spec", "experiment_spec"} else {"version", "id", "research_id"}
             original = {k:v for k,v in existing.items() if k not in ignore}
             supplied = {k:v for k,v in data.items() if k not in ignore}
@@ -492,6 +493,8 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
             "conversation_id": conversation_id, "sender": sender if isinstance(sender, dict) else {"type": "agent", "id": sender},
             "content_markdown": content_markdown, "recipients": [], "kind": "discussion",
             "status": "complete", "created_at": now(), "source_system": source_system, "source_event_id": source_id, **fields}
+        if msg.get("kind") == "discussion_vote":
+            msg["search_text"] = message_search_text(msg)
         conversation = self._get(c, "conversation", conversation_id)
         participants = {canonical(p): p for p in conversation.get("participants", []) + [msg["sender"]] + msg["recipients"]}
         groups = set(conversation.get("group_ids", []))
@@ -746,7 +749,7 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
     def _message_page(self, c, sql, args, limit, q=None, at_seq=None):
         if at_seq is None:
             if q:
-                sql += " AND instr(lower(json_extract(data,'$.content_markdown')),lower(?))>0"
+                sql += " AND instr(lower(COALESCE(json_extract(data,'$.search_text'),COALESCE(json_extract(data,'$.content_markdown'),'') || ' ' || COALESCE(json_extract(data,'$.vote'),''))),lower(?))>0"
                 args = [*args, q]
             rows = c.execute(sql + " ORDER BY cursor DESC LIMIT ?", [*args, limit+1]).fetchall()
             items = [{**json.loads(row["data"]), "cursor": row["cursor"]} for row in rows]
@@ -759,7 +762,8 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
                 if not rows:
                     break
                 for message in self._messages_at(c, rows, at_seq):
-                    if not q or q.casefold() in message.get("content_markdown", "").casefold():
+                    searchable = message_search_text(message)
+                    if not q or q.casefold() in searchable.casefold():
                         items.append(message)
                         if len(items) > limit:
                             break

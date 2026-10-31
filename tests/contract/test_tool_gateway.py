@@ -148,6 +148,48 @@ def test_god_reads_only_its_frozen_snapshot_with_explicit_pagination(gateway):
         gateway.call(capability(gateway, role="boss"), {"name": "read_arbitration_context", "arguments": {"section": "discussion"}})
 
 
+def test_suppressed_v2_ballot_chat_retains_role_tools_and_private_scores_stay_isolated(gateway):
+    token = capability(gateway, role="boss")
+    gateway.capabilities[token].update(suppress_chat=True, discussion_protocol=2)
+    assert "memory_version" in gateway.call(token, {"name": "read_shared_memory", "arguments": {}})
+    gateway.call(token, {"name": "record_stream_event", "arguments": {"stream_id": 1, "cursor": 1,
+        "chunk": {"type": "text-delta", "text": '{"approve":true}'}}})
+    assert not gateway.store.messages("conversation")["items"]
+    # Hiding JSON does not broaden this role's capabilities.
+    with pytest.raises(PermissionError):
+        gateway.call(token, {"name": "run_light_cpu", "arguments": {"code": "result=1"}})
+
+
+def test_god_finalization_reads_full_frozen_material_and_evidence_without_scientific_tools(gateway, tmp_path):
+    from packages.contracts.research import digest
+    rid = gateway.project["id"]
+    source = tmp_path / "actual.txt"
+    source.write_text("observed-evidence\n" * 2000, encoding="utf-8")
+    artifact = gateway.store.register_artifact(rid, source, line_id="line-01")
+    section = "evidence:" + artifact["id"]
+    sections = {"discussion": "完整成员原文" * 6000, section: {
+        "artifact_id": artifact["id"], "sha256": artifact["sha256"], "size_bytes": artifact["size_bytes"]}}
+    snapshot_hash = digest(sections)
+    gateway.store.put("discussion_finalization_snapshot", "final", {"sections": sections, "snapshot_hash": snapshot_hash}, rid)
+    token = gateway.register(research_id=rid, role="god", agent_id="god/final", control_generation=1,
+        execution_id="god-final", task_id="final", conversation_id=rid + ":god:final",
+        discussion_protocol=2, suppress_chat=True, finalization_id="final", snapshot_hash=snapshot_hash)
+    first = gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion"}})
+    second = gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion", "offset": first["next_offset"]}})
+    # The complete text spans multiple pages, and every page reports one hash.
+    assert first["sha256"] == second["sha256"]
+    assert (first["text"] + second["text"]) == sections["discussion"][:32768]
+    evidence = gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": section}})
+    assert evidence["sha256"] == artifact["sha256"] and evidence["total_length"] == artifact["size_bytes"]
+    assert evidence["text"].startswith("observed-evidence")
+    for name in ("read_research_evidence", "run_light_cpu", "read_shared_memory", "send_research_message"):
+        with pytest.raises(PermissionError, match="only read"):
+            gateway.call(token, {"name": name, "arguments": {}})
+    gateway.capabilities[token]["snapshot_hash"] = "tampered"
+    with pytest.raises(PermissionError, match="binding mismatch"):
+        gateway.call(token, {"name": "read_arbitration_context", "arguments": {"section": "discussion"}})
+
+
 def test_gateway_busy_response_preserves_cursor_and_hides_database_exception(gateway, monkeypatch):
     import json
     import urllib.request

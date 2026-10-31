@@ -44,7 +44,7 @@ async def test_explicit_retry_reads_new_input_in_fresh_scene_and_preserves_histo
                 if scope == "turn":
                     return await engine.turn(p["id"], "paper", "paper", task["id"], "read", MessageReply, {})
                 return await engine.discussions.run(p["id"], "design", "exploration",
-                    engine.members(p, "exploration", "line-01"), {}, "line-01")
+                    engine.members(p, "exploration", "line-01"), {"discussion_protocol": 1}, "line-01")
             graph = PaperGraph(operation, saver)
             root = store.add_task(p["id"], "paper", {}, "external-root")
             token = current_task.set(root)

@@ -269,6 +269,31 @@ def test_revision_cannot_expand_role_and_evidence_refs_are_snapshot_scoped(fixtu
             "action": "request_evidence", "target_role": "implementation", "source_refs": ["other-project-artifact"]})
 
 
+def test_only_advertised_critic_discussion_can_request_same_line_exploration_revision(fixture):
+    store, project = fixture
+    service = ArbitrationService(Engine(store))
+    request = {"id": "arb-route", "snapshot_hash": "hash", "scope_kind": "discussion",
+        "reason_code": "design_deadlock", "line_id": "line-01", "allowed_actions": ["request_revision", "request_evidence", "select_candidate"]}
+    context = {"role": "critic", "task": {"exploration": {"selected_payload": {"method": "old"}}},
+        "revision_routes": {"exploration": "revise_exploration"}, "blockers": [{"issue_id": "cmf-004"}],
+        "candidates": {"member": {}}}
+    decision = {"arbitration_id": request["id"], "snapshot_hash": "hash", "action": "request_revision", "target_role": "exploration"}
+    service.validate_decision(request, context, decision)
+    for target in ("implementation", "boss", "verify"):
+        with pytest.raises(ValueError, match="role permissions"):
+            service.validate_decision(request, context, {**decision, "target_role": target})
+    with pytest.raises(ValueError, match="role permissions"):
+        service.validate_decision(request, {**context, "revision_routes": {}}, decision)
+    with pytest.raises(ValueError, match="role permissions"):
+        service.validate_decision({**request, "scope_kind": "turn_output"}, context, decision)
+    with pytest.raises(ValueError, match="role permissions"):
+        service.validate_decision({**request, "reason_code": "invalid_group_decision"}, context, decision)
+    with pytest.raises(ValueError, match="role permissions"):
+        service.validate_decision(request, context, {**decision, "action": "request_evidence"})
+    with pytest.raises(ValueError, match="unresolved blockers"):
+        service.validate_decision(request, context, {**decision, "action": "select_candidate", "selected_candidate_id": "member"})
+
+
 async def test_hard_restart_reconciles_unexpired_running_god_lease(fixture):
     from backend.runtime.worker import recover_arbitration_leases
     store, project = fixture
