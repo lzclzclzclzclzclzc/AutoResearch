@@ -1,7 +1,7 @@
 import type { Data } from './api';
 
 export const arbitrationStatuses: Record<string, string> = {
-  requested: '等待模型容量', running: 'God 正在仲裁', retry_wait: '等待仲裁重试',
+  requested: '等待仲裁', running: 'God 正在仲裁', retry_wait: '等待仲裁重试',
   decided: '已裁决，等待应用', applying: '正在应用仲裁', applied: '已采用', stale: '现场已变化',
   cancelled: '已取消', exhausted: '自动恢复已耗尽', needs_external_input: '缺少外部条件',
 };
@@ -22,6 +22,51 @@ const transitionStatuses: Record<string, string> = {
   'arbitration.needs_external_input':'needs_external_input',
 };
 const capacityPhases: Record<string, string> = {'arbitration.capacity_wait':'waiting_capacity','arbitration.capacity_acquired':'judging'};
+
+/** Old runs saved both stream and final messages. Pair them without merging attempts. */
+export function deduplicateGodMessages(messages: Data[]): Data[] {
+  const streams = new Map<string, Data[]>();
+  const finals = new Map<string, Data[]>();
+  for (const message of messages) {
+    if (!message.sender?.id?.startsWith('god/') || !message.content_markdown) continue;
+    const key = `${message.conversation_id}\0${message.content_markdown}`;
+    const target = message.source_system === 'god_generation' ? finals : message.source_system === 'dsh' ? streams : null;
+    if (target) target.set(key, [...(target.get(key) || []), message]);
+  }
+  const hidden = new Set<string>();
+  for (const [key, candidates] of streams) {
+    const count = Math.min(candidates.length, finals.get(key)?.length || 0);
+    candidates.sort((a,b) => Number(a.event_seq || 0) - Number(b.event_seq || 0));
+    for (const message of candidates.slice(0,count)) hidden.add(message.message_id);
+  }
+  return messages.filter(message => !hidden.has(message.message_id));
+}
+
+export const godValidationLabels: Record<string, string> = {
+  pending: '已生成，等待校验', accepted: '已通过校验，等待应用', applied: '裁决已采用', rejected: '本次回复未采用',
+};
+
+/** Derive legacy attempt outcomes only from the request visible at this replay cursor. */
+export function godMessageValidation(message: Data, requests: Data[], executions: Data[]): Data {
+  const sender = message.sender?.id || '';
+  if (!sender.startsWith('god/') || message.validation_status && message.validation_status !== 'pending') return message;
+  const request = requests.find(item => (item.arbitration_id || item.id) === sender.slice(4));
+  if (!request) return message;
+  const execution = executions.find(item => item.execution_attempt_id === message.execution_id || item.message_id === message.message_id);
+  const turn = /(?:^|:)judge:(\d+)$/.exec(message.source_event_id || '') || /(?:^|:)judge:(\d+)$/.exec(execution?.turn_id || '');
+  const attempt = message.arbitration_attempt || Number(turn?.[1]);
+  if (!attempt) return message;
+  const attempts = request.attempts || [];
+  const rejected = attempts.find((item: Data) => item.attempt === attempt && item.type === 'arbitration.retry_wait');
+  const lastAttempt = Math.max(0,...attempts.map((item: Data) => Number(item.attempt || 0)));
+  let status = rejected ? 'rejected' : 'pending';
+  if (attempt === lastAttempt) {
+    if (request.status === 'exhausted') status = 'rejected';
+    else if (request.status === 'applied') status = 'applied';
+    else if (request.decided_event_seq) status = 'accepted';
+  }
+  return {...message, validation_status:status, validation_diagnostic:rejected?.reason || (status === 'rejected' ? request.diagnostic : undefined)};
+}
 
 /** Reconstruct arbitration state from committed transitions, never current live fields. */
 export function projectArbitrations(requests: Data[], events: Data[], seq: number): Data[] {
@@ -47,7 +92,10 @@ export function projectArbitrations(requests: Data[], events: Data[], seq: numbe
     result.history = history;
     result.latest_event_seq = refs.at(-1)?.seq || history.at(-1).event_seq;
     result.attempts = transitions.filter(event => ['arbitration.started','arbitration.retry_wait'].includes(event.type))
-      .map(event => ({type:event.type,event_seq:event.seq,occurred_at:event.occurred_at,...event.payload}));
+      .map(event => ({type:event.type,event_seq:event.seq,occurred_at:event.occurred_at,...event.payload,
+        ...(event.type === 'arbitration.retry_wait' && !event.payload?.reason ? {
+          reason:request.attempts?.find((attempt:Data)=>attempt.event_seq === event.seq)?.reason} : {})}));
+    if (result.status === 'exhausted' && request.status === 'exhausted') result.diagnostic = request.diagnostic;
     for (const state of ['decided','applied']) {
       const event = [...transitions].reverse().find(event => event.type === `arbitration.${state}`);
       if (event) {

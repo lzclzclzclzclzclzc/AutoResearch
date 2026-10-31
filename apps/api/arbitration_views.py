@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime
 
 REQUEST_FIELDS = (
     "id", "arbitration_id", "schema_version", "policy_version", "research_id", "source_task_id",
@@ -21,6 +22,21 @@ TRANSITION_STATUSES = {
     "arbitration.needs_external_input": "needs_external_input", "arbitration.exhausted": "exhausted",
 }
 CAPACITY_PHASES = {"arbitration.capacity_wait": "waiting_capacity", "arbitration.capacity_acquired": "judging"}
+
+
+def saved_attempt_reason(request, event):
+    """Older transition events omitted diagnostics that their attempt retained."""
+    for attempt in request.get("attempts", []):
+        if attempt.get("attempt") != event.get("payload", {}).get("attempt") or not attempt.get("finished_at"):
+            continue
+        try:
+            finished = datetime.fromisoformat(attempt["finished_at"].replace("Z", "+00:00"))
+            visible = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if finished <= visible:
+            return attempt.get("diagnostic")
+    return None
 
 
 def arbitration_events(store, research_id, at_seq=None):
@@ -49,6 +65,10 @@ def project_request(request, events, at_seq=None):
                         history[-1]["status"] if history else request.get("status", "requested"))
     if last and last.get("payload", {}).get("reason"):
         result["diagnostic"] = last["payload"]["reason"]
+    elif last and last["type"] in {"arbitration.retry_wait", "arbitration.exhausted"}:
+        reason = saved_attempt_reason(request, last)
+        if reason:
+            result["diagnostic"] = reason
     if at_seq is None:
         for field in ("status", "retry_not_before", "generation_attempts", "error", "diagnostic", "resolution_status"):
             if field in request:
@@ -63,6 +83,12 @@ def project_request(request, events, at_seq=None):
                                "attempt", "generation_attempts", "lease_epoch", "agent_id", "execution_id", "reason",
                                "error", "retry_not_before"}}}
                           for e in refs if e["type"] in {"arbitration.started", "arbitration.retry_wait"}]
+    for attempt in result["attempts"]:
+        if attempt["type"] == "arbitration.retry_wait" and not attempt.get("reason"):
+            event = next(e for e in refs if e["seq"] == attempt["event_seq"])
+            reason = saved_attempt_reason(request, event)
+            if reason:
+                attempt["reason"] = reason
     for status in ("decided", "applied"):
         transition = next((e for e in reversed(refs) if e["type"] == f"arbitration.{status}"), None)
         if transition:

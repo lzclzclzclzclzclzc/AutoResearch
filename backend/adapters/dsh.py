@@ -154,16 +154,18 @@ class DshRuntimeAdapter:
     @asynccontextmanager
     async def _admission(self, research_id, generation, runtime_context, *gates):
         acquired = []
+        announced = False
+        wait_started = asyncio.get_running_loop().time()
         try:
             for gate in gates:
                 waiting = asyncio.create_task(gate.acquire())
-                announced = False
                 try:
                     while not waiting.done():
                         self._assert_arbitration_open(runtime_context)
                         if not await asyncio.to_thread(self.control.allows_progress, research_id, generation):
                             raise ResearchStopped("等待模型容量期间研究已停止")
-                        if runtime_context.get("arbitration_id") and not announced:
+                        if (runtime_context.get("arbitration_id") and not announced and not waiting.done()
+                                and asyncio.get_running_loop().time() - wait_started >= 0.25):
                             self.store.emit(research_id, "arbitration.capacity_wait", {
                                 "arbitration_id": runtime_context["arbitration_id"], "execution_phase": "waiting_capacity"})
                             announced = True
@@ -180,7 +182,7 @@ class DshRuntimeAdapter:
             self._assert_arbitration_open(runtime_context)
             if project["status"] in {"pausing", "paused", "blocked"}:
                 raise RuntimeBlocked("research_paused", "研究暂停期间不启动新的模型回合")
-            if runtime_context.get("arbitration_id"):
+            if runtime_context.get("arbitration_id") and announced:
                 self.store.emit(research_id, "arbitration.capacity_acquired", {
                     "arbitration_id": runtime_context["arbitration_id"], "execution_phase": "judging"})
             yield

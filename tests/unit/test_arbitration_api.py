@@ -140,6 +140,25 @@ def test_capacity_events_only_change_execution_phase_in_live_and_historical_view
     assert decided["status"] == "decided" and "execution_phase" not in decided
 
 
+def test_legacy_attempt_diagnostics_appear_only_after_their_failure_event():
+    from apps.api.arbitration_views import project_request
+    def event(seq, kind, attempt):
+        return {"seq": seq, "type": "arbitration." + kind, "occurred_at": f"2026-10-29T09:00:0{seq}Z",
+            "payload": {"arbitration_id": "arb", "attempt": attempt}}
+    events = [event(1, "requested", 0), event(2, "started", 1), event(3, "retry_wait", 1),
+        event(4, "started", 2), event(5, "exhausted", 2)]
+    request = {"id": "arb", "research_id": "r", "status": "exhausted", "diagnostic": "final failure",
+        "attempts": [{"attempt": 1, "finished_at": events[2]["occurred_at"], "diagnostic": "first failure"},
+                     {"attempt": 2, "finished_at": events[4]["occurred_at"], "diagnostic": "final failure"}]}
+    running = project_request(request, events[:2], 2)
+    assert "diagnostic" not in running and not running["attempts"][0].get("reason")
+    retry = project_request(request, events[:3], 3)
+    assert retry["diagnostic"] == retry["attempts"][-1]["reason"] == "first failure"
+    second = project_request(request, events[:4], 4)
+    assert "diagnostic" not in second
+    assert project_request(request, events, 5)["diagnostic"] == "final failure"
+
+
 def test_internal_dependency_status_keeps_historical_external_judgment_and_wait_timing(tmp_path):
     client, store, rid = setup(tmp_path)
     _, _, _, applied = seed(store, rid)

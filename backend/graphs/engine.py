@@ -532,10 +532,15 @@ class ResearchEngine:
                 "snapshot_hash": request["snapshot_hash"], "max_output_tokens": max_output_tokens})
         output = bind_metadata(GodDecision, output, context)
         # The service validates the action and only then publishes an applied summary.
-        self.store.create_message(request["research_id"], cid, agent_id,
-            output.get("content_markdown", json.dumps(output, ensure_ascii=False)), source_system="god_generation",
-            source_event_id=f"{aid}:judge:{attempt}", kind="arbitration", structured=output,
-            line_id=request.get("line_id"), arbitration_id=aid, decision_source="god", demo=project["mode"] == "demo")
+        message_id = adapter.message_reference(request["research_id"], agent_id, aid + ":judge", f"judge:{attempt}") if hasattr(adapter, "message_reference") else None
+        fields = dict(source_system="god_generation", source_event_id=f"{aid}:judge:{attempt}", kind="arbitration",
+            structured=output, line_id=request.get("line_id"), arbitration_id=aid, decision_source="god",
+            validation_status="pending", arbitration_attempt=attempt, demo=project["mode"] == "demo")
+        content = output.get("content_markdown", json.dumps(output, ensure_ascii=False))
+        if message_id:
+            self.store.complete_stream_message(message_id, content, **fields)
+        else:
+            self.store.create_message(request["research_id"], cid, agent_id, content, **fields)
         return output
 
     async def recover_action(self, request, decision, *, schema=None, context=None, agent_id=None, role=None,

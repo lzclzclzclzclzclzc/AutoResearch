@@ -60,16 +60,43 @@ class ArbitrationStoreMixin:
         payload = {k: value.get(k) for k in ("arbitration_id", "source_task_id", "scope_kind", "scope_id",
             "reason_code", "snapshot_id", "snapshot_hash", "source_event_seq", "decision_id", "decision_hash",
             "effect_id", "attempt", "lease_epoch", "retry_not_before", "reason") if value.get(k) is not None}
+        diagnostic = changes.get("diagnostic", changes.get("reason"))
+        if diagnostic:
+            payload["reason"] = diagnostic
         event = self._emit(c, value["research_id"], "arbitration." + event_name, payload,
             line_id=value.get("line_id"), conversation_id=f"{value['research_id']}:god:{value['arbitration_id']}")
         value[status + "_event_seq"] = event["seq"]
         value["history"] = [*request.get("history", []), {"status": status,
-            "occurred_at": event["occurred_at"], "event_seq": event["seq"], "reason": changes.get("reason")}]
+            "occurred_at": event["occurred_at"], "event_seq": event["seq"], "reason": diagnostic}]
         if value.get("attempts") and status in {"retry_wait", "decided", "cancelled", "stale", "exhausted"}:
             value["attempts"] = [dict(attempt) for attempt in value["attempts"]]
             value["attempts"][-1].update(finished_at=event["occurred_at"], status=status,
                 diagnostic=changes.get("diagnostic", changes.get("reason")), retry_not_before=value.get("retry_not_before"))
+        validation = {"decided": "accepted", "applied": "applied", "retry_wait": "rejected", "exhausted": "rejected"}.get(status)
+        if validation:
+            self._annotate_god_messages(c, value, validation, diagnostic)
         return self._put(c, "arbitration_request", value["arbitration_id"], value, value["research_id"])
+
+    def _annotate_god_messages(self, c, request, validation, diagnostic):
+        """Generation completion is not decision acceptance; keep cursor history."""
+        import json
+        from backend.persistence.store import canonical
+        aid, rid, attempt = request["arbitration_id"], request["research_id"], request.get("attempt", 1)
+        execution = self._get(c, "execution", digest([rid, "god/" + aid, aid + ":judge", f"judge:{attempt}"])) or {}
+        execution_id = execution.get("execution_attempt_id", "")
+        rows = c.execute("SELECT data FROM messages WHERE research_id=? AND conversation_id=? "
+            "AND (source_event_id=? OR json_extract(data,'$.execution_id')=?)",
+            (rid, f"{rid}:god:{aid}", f"{aid}:judge:{attempt}", execution_id)).fetchall()
+        for row in rows:
+            message = json.loads(row[0])
+            message.update(validation_status=validation, validation_diagnostic=diagnostic,
+                arbitration_id=aid, arbitration_attempt=attempt)
+            event = self._stream_event(c, "message.completed", message,
+                {"message_id": message["message_id"], "message": message, "replace": True})
+            message["latest_event_seq"] = event["seq"]
+            c.execute("UPDATE messages SET data=? WHERE message_id=?", (canonical(message), message["message_id"]))
+            event["payload"]["message"] = message
+            c.execute("UPDATE events SET data=? WHERE research_id=? AND seq=?", (canonical(event), rid, event["seq"]))
 
     def _assert_arbitration_scope(self, c, request):
         """Scope checks share the effect transaction, closing check/apply races."""

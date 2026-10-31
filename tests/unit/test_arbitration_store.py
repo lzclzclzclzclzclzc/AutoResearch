@@ -70,6 +70,25 @@ def test_model_action_union_is_flat_and_ignores_unrelated_fields(records):
     assert GodDecision.model_validate({**decision(request), "output": {"score": 100}}).model_dump() == value
 
 
+def test_rejected_god_generation_has_a_reason_without_leaking_it_into_past_replay(records):
+    store, request, snapshot = records
+    rid, aid = request["research_id"], request["arbitration_id"]
+    store.create_arbitration(request, snapshot)
+    claimed = store.claim_arbitration(aid, "worker")
+    store.create_message(rid, f"{rid}:god:{aid}", "god/" + aid, "候选回复", source_system="god_generation",
+        source_event_id=f"{aid}:judge:1", arbitration_id=aid, validation_status="pending")
+    before = store.events(rid)[-1]["seq"]
+    rejected = store.transition_arbitration(aid, "retry_wait", owner="worker", lease_epoch=claimed["lease_epoch"],
+        diagnostic="target_role must be critic")
+    current = store.messages(f"{rid}:god:{aid}")["items"]
+    assert len(current) == 1 and current[0]["validation_status"] == "rejected"
+    assert current[0]["validation_diagnostic"] == "target_role must be critic"
+    assert rejected["history"][-1]["reason"] == "target_role must be critic"
+    past = store.messages(f"{rid}:god:{aid}", at_seq=before)["items"]
+    assert past[0]["validation_status"] == "pending"
+    assert not past[0].get("validation_diagnostic")
+
+
 def test_expired_lease_requires_exit_reconciliation(records):
     store, request, snapshot = records
     store.create_arbitration(request, snapshot)
