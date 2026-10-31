@@ -230,6 +230,30 @@ def test_boss_effect_replay_never_resets_cycle_or_increments_epoch_twice(busines
     assert len([t for t in s.list("task", rid) if t.get("boss_decision_id") == "decision-1"]) == 2
 
 
+def test_report_freezes_referenced_artifacts_and_keeps_boss_trigger_policy(business, tmp_path):
+    s, rid, _ = business
+    ctrl = ConfirmingControl()
+    file = tmp_path / "input.txt"
+    file.write_text("observed", encoding="utf-8")
+    artifact = s.register_artifact(rid, file)
+    foreign = s.create_project({"topic": "other", "client_request_id": "other-report"})
+    other = s.register_artifact(foreign["id"], file)
+    for request_report in (False, True):
+        key = f"report-policy-{request_report}"
+        decision = {"action": "report", "assignments": [], "request_report": request_report, "rationale": "Boss decides timing"}
+        s.commit_boss_decision(rid, key, decision, ctrl)
+        frozen = {"decision": {**decision, "memory_updates": [{"source": artifact["id"] + "; " + other["id"]}]}, "submission": None}
+        s.apply_boss_effects(rid, key, snapshot=frozen, control=ctrl)
+        snapshot = s.get("report_snapshot", key + ":report")
+        if not request_report:
+            assert snapshot is None
+        else:
+            assert snapshot["evidence_ids"] == [artifact["id"]]
+            assert snapshot["artifacts"][0]["artifact_id"] == artifact["id"]
+            assert snapshot["artifacts"][0]["sha256"] == artifact["sha256"]
+            assert s.get("task", key + ":report")["kind"] == "paper"
+
+
 def test_boss_effect_projection_transaction_rolls_back_and_recovers(business, monkeypatch):
     s, rid, _ = business
     ctrl = ConfirmingControl()

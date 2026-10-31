@@ -1540,10 +1540,13 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin):
                 task(cycle_id + ":line", "line", {"line_id": identity, "cycle_id": cycle_id, "direction_epoch": cycle["direction_epoch"]})
                 cycles.append(cycle_id)
             if candidate["request_report"]:
+                from backend.persistence.reporting import report_artifacts
                 snapshot_id = decision_task_id + ":report"
                 frozen = candidate["report_snapshot"]
                 evidence = [frozen["submission"]["id"]] if isinstance(frozen.get("submission"), dict) and frozen["submission"].get("id") else []
-                self._put(c, "report_snapshot", snapshot_id, {"snapshot": frozen, "evidence_ids": evidence}, research_id)
+                artifacts = report_artifacts(frozen, lambda identity: self._get(c, "artifact", identity), research_id)
+                self._put(c, "report_snapshot", snapshot_id, {"snapshot": frozen,
+                    "evidence_ids": evidence + [a["artifact_id"] for a in artifacts], "artifacts": artifacts}, research_id)
                 task(snapshot_id, "paper", {"snapshot_id": snapshot_id})
             self._apply_confirmed_arbitration_finish(c, research_id, decision_task_id, candidate,
                 receipt, operation["id"], dispatch_allowed)
