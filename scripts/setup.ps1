@@ -7,7 +7,7 @@ if (-not (Test-Path -LiteralPath '.venv/Scripts/python.exe')) {
     uv venv --python '>=3.12' .venv
     if ($LASTEXITCODE) { throw 'Python 环境创建失败' }
 }
-$extras = if ($SkipDsh) { '.[test]' } else { '.[test,dsh]' }
+$extras = if ($SkipDsh) { '.' } else { '.[dsh]' }
 $lockPath = Join-Path $projectRoot 'requirements.lock'
 if ($SkipDsh) {
     New-Item -ItemType Directory -Force .cache | Out-Null
