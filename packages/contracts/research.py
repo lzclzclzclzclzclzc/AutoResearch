@@ -425,7 +425,13 @@ class GodDecision(RootModel[Annotated[SelectCandidateDecision | RepairOutputDeci
 
 def assert_spec_unchanged(spec: ExperimentSpec, implementation: Implementation) -> None:
     if implementation.actual_config is not None and implementation.actual_config != spec.fixed:
-        raise ValueError("spec_revision_required: actual scientific configuration differs from frozen fixed fields")
+        actual = implementation.actual_config
+        added = sorted(set(actual) - set(spec.fixed))
+        missing = sorted(set(spec.fixed) - set(actual))
+        changed = sorted(k for k in set(actual) & set(spec.fixed) if actual[k] != spec.fixed[k])
+        raise ValueError("spec_revision_required: actual scientific configuration differs from frozen fixed fields; "
+            f"unexpected keys={added[:20]!r}; missing keys={missing[:20]!r}; changed keys={changed[:20]!r}. "
+            "Return actual_config exactly as spec.fixed and keep the source code consistent with it.")
 
 
 def validate_vote(vote: dict, voter_id: str, members: list[str], candidates: set[str]) -> None:

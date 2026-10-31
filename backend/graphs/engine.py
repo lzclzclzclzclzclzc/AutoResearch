@@ -802,12 +802,36 @@ class ResearchEngine:
                 await self.recover_action(request, marker["decision"], context={"spec": spec.model_dump()}, line_id=state["line_id"])
         result = recovery["output"] if recovery else await self.turn(state["research_id"], f"{state['line_id']}/implementation", "implementation", implementation_id, "code", Implementation,
             {"instruction": "完整实现或修复冻结计划，返回相对路径源文件与 Python 入口，禁止改动固定配置。修复必须根据真实失败证据恢复既定方案", "spec": spec.model_dump(), "spec_hash": digest(spec.model_dump()), "direction_epoch": state["direction_epoch"],
+
              "resource_feedback": self.store.get("resource_feedback", state["spec_id"]),
              "prior_runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
              "prior_runs": [run for run in self.store.list("run", state["research_id"]) if run.get("spec_id") == state["spec_id"]]},
             conversation_id=implementation_id, line_id=state["line_id"])
         implementation = Implementation.model_validate(bind_metadata(Implementation, result, {"spec": spec.model_dump()}))
         await self.line_open(state)
+        try:
+            assert_spec_unchanged(spec, implementation)
+        except ValueError as error:
+            # A malformed configuration echo should be corrected by its author
+            # before reopening both scientific design groups. Never overwrite it.
+            repair_id = implementation_id + ":config-repair" + recovery_suffix()
+            if not self.store.get("implementation_config_repair", repair_id):
+                self.store.put("implementation_config_repair", repair_id, {"spec_id": state["spec_id"],
+                    "original_output": result, "reason": str(error), "status": "requested"}, state["research_id"])
+                self.store.emit(state["research_id"], "implementation.config_repair_requested",
+                    {"implementation_id": implementation_id, "spec_id": state["spec_id"]}, line_id=state["line_id"])
+            result = await self.turn(state["research_id"], f"{state['line_id']}/implementation", "implementation",
+                implementation_id, "code:config-repair", Implementation,
+                {"instruction": "纠正上次实现与冻结配置的不一致。actual_config 如提供应与 spec.fixed 一致，不得混入其他字段；系统哈希由程序填写。同步核查并修正源代码，禁止只改配置声明掩盖代码偏离。若认为冻结方案无法实现，保留真实不一致，交原设计组处理。返回完整实现。",
+                    "spec": spec.model_dump(), "spec_hash": digest(spec.model_dump()),
+
+                    "configuration_error": str(error), "prior_implementation": result,
+                    "direction_epoch": state["direction_epoch"]},
+                conversation_id=implementation_id, line_id=state["line_id"])
+            implementation = Implementation.model_validate(bind_metadata(Implementation, result, {"spec": spec.model_dump()}))
+            self.store.patch("implementation_config_repair", repair_id,
+                status="corrected" if implementation.spec_hash == digest(spec.model_dump()) and implementation.actual_config == spec.fixed else "requires_design_revision")
+            await self.line_open(state)
         try:
             assert_spec_unchanged(spec, implementation)
         except ValueError as error:

@@ -134,3 +134,38 @@ async def test_legacy_protocol_error_is_recovered_only_from_latest_boundary_and_
     engine.control.terminate(p["id"])
     assert not await recover_infrastructure_tasks(store, engine.control)
 
+def line_state(store, p):
+    store.put("cycle", "cycle", {"objective": "frozen baseline", "line_id": "line-01"}, p["id"])
+    store.update_line(p["id"], "line-01", cycle_id="cycle")
+    return dict(research_id=p["id"], line_id="line-01", cycle_id="cycle", task_id="root", direction_epoch=1, revision=1)
+
+@pytest.mark.parametrize("corrected", [True, False])
+async def test_implementation_gets_one_configuration_correction_before_design_revision(scene, corrected):
+    store, p, engine = scene
+    state = line_state(store, p)
+    spec = ExperimentSpec(spec_id="spec", version=1, question="q", hypothesis="h", fixed={"seed": 42, "methods": "word"},
+        baseline="b", data={}, metrics=["f1"], design={}, monitoring={}, completion_criteria="done", deadline_at=p["deadline_at"])
+    store.put("spec", "spec", spec.model_dump(), p["id"])
+    state["spec_id"] = "spec"
+    original, calls = engine.demo._produce_turn, []
+    async def produce(**args):
+        calls.append(args["turn_id"])
+        assert args["context"]["spec"]["fixed"] == spec.fixed
+        output = await original(**args)
+        if len(calls) == 1 or not corrected:
+            output["actual_config"] = {**copy.deepcopy(spec.fixed), "methods": "char", "data": {}}
+        return output
+    engine.demo._produce_turn = produce
+    result = await engine.implement(state)
+    assert calls == ["code", "code:config-repair"]
+    repair = store.list("implementation_config_repair", p["id"])[0]
+    assert repair["original_output"]["actual_config"]["methods"] == "char"
+    assert "unexpected keys=['data']" in repair["reason"] and "changed keys=['methods']" in repair["reason"]
+    if corrected:
+        assert result["implementation_route"] == "organize" and repair["status"] == "corrected"
+        assert store.list("implementation", p["id"])[0]["actual_config"] == spec.fixed
+        assert not store.list("spec_revision_request", p["id"])
+    else:
+        assert result["implementation_route"] == "design" and repair["status"] == "requires_design_revision"
+        assert len(store.list("spec_revision_request", p["id"])) == 1
+        assert not store.list("implementation", p["id"])
