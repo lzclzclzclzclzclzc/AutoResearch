@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 class RuntimeRecoveryStoreMixin:
     def retry_failed_tasks(self, research_id):
-        """Explicit human retry creates a new scene only for external blockers."""
+        """Human retry refreshes externally blocked or exhausted arbitration scenes."""
         with self.connect(True) as c:
             self.assert_progress(self._project(c, research_id))
             for task in self.list("task", research_id):
@@ -12,10 +12,15 @@ class RuntimeRecoveryStoreMixin:
                     continue
                 changes = {"status": "pending", "owner": None, "error": None,
                     "last_error": task.get("error")}
-                if (task.get("error") or {}).get("code") == "arbitration_needs_external_input":
+                if (task.get("error") or {}).get("code") in {"arbitration_needs_external_input", "arbitration_exhausted"}:
                     changes.update(recovery_generation=task.get("recovery_generation", 0) + 1,
                         recovery_marker=None, dependency_recovery_id=None, recovery_outcome=None)
-                    self._emit(c, research_id, "task.external_input_retry", {"task_id": task["id"],
+                    event = "task.arbitration_retry" if (task.get("error") or {}).get("code") == "arbitration_exhausted" else "task.external_input_retry"
+                    self._emit(c, research_id, event, {"task_id": task["id"],
+                        "recovery_generation": changes["recovery_generation"]})
+                elif (task.get("error") or {}).get("code") in {"model_response_invalid", "model_execution_failed"}:
+                    changes["recovery_generation"] = task.get("recovery_generation", 0) + 1
+                    self._emit(c, research_id, "task.model_retry", {"task_id": task["id"],
                         "recovery_generation": changes["recovery_generation"]})
                 self._put(c, "task", task["id"], {**task, **changes}, research_id)
 

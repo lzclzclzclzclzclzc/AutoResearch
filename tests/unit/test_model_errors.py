@@ -32,7 +32,10 @@ def turn_error(code, status=None, **extra):
     ("HTTP_500", 500, "model_transport_error"),
     ("TRANSPORT", None, "model_transport_error"),
     ("TIMEOUT", None, "model_timeout"),
-    ("MALFORMED_RESPONSE", None, "model_execution_failed"),
+    ("MALFORMED_RESPONSE", None, "model_response_invalid"),
+    ("EMPTY_RESPONSE", None, "model_response_invalid"),
+    ("INVALID_RESPONSE", None, "model_response_invalid"),
+    ("STREAM_CLOSED", None, "model_response_invalid"),
     ("ABORTED", None, "model_execution_failed"),
     ("HTTP_418", 418, "model_execution_failed"),
 ])

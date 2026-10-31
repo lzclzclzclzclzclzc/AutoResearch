@@ -263,7 +263,7 @@ class ArbitrationService:
                         attempt=max(0, attempt - 1), retry_not_before=now(),
                         diagnostic="模型容量等待期间研究暂停，God 回合尚未发起")
                     raise
-                if error.code not in {"model_output_truncated", "rate_limited", "model_transport_error", "model_timeout"}:
+                if error.code not in {"model_output_truncated", "rate_limited", "model_transport_error", "model_timeout", "model_response_invalid"}:
                     raise
                 if error.code == "model_output_truncated":
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)

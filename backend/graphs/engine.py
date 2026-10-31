@@ -13,6 +13,7 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from backend.adapters.demo import DemoRuntimeAdapter
+from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
 from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
@@ -312,6 +313,11 @@ class ResearchEngine:
         delay, last_error = 1.0, None
         token_limit = output_tokens(not publish_message)
         while True:
+            response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
+            response_retry = self.store.get("model_response_retry", response_retry_id) or {}
+            if response_retry.get("failures", 0) >= MAX_RESPONSE_ATTEMPTS:
+                raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
+                    provider_error_code=response_retry.get("provider_error_code"))
             try:
                 result = await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
                     task_id=task_id, turn_id=turn_id, prompt=prompt, schema=wire_contract, direction_epoch=context.get("direction_epoch", 1),
@@ -327,6 +333,27 @@ class ResearchEngine:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
             except RuntimeBlocked as error:
+                if error.code == "model_response_invalid":
+                    await self.guard(research_id)
+                    failures = response_retry.get("failures", 0) + 1
+                    self.store.put("model_response_retry", response_retry_id, {"failures": failures,
+                        "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id,
+                        "provider_error_code": error.provider_error_code}, research_id)
+                    if failures >= MAX_RESPONSE_ATTEMPTS:
+                        raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
+                            http_status=error.http_status, provider_error_code=error.provider_error_code) from error
+                    # Adapter admission requires exit proof before a replacement.
+                    # Keep the logical turn so completed tools and session history can be reused.
+                    delay = min(2 ** (failures - 1), 4)
+                    self.store.emit(research_id, "agent.retry_wait", {"delay_seconds": delay,
+                        "code": error.code, "provider_error_code": error.provider_error_code,
+                        "attempt": failures, "max_attempts": MAX_RESPONSE_ATTEMPTS}, agent_id=agent_id)
+                    prompt += "\n上次响应的结束协议异常，未被接受。沿用已保存的工具结果，不重复已完成的操作，重新返回完整 JSON。"
+                    until = asyncio.get_running_loop().time() + delay
+                    while asyncio.get_running_loop().time() < until:
+                        await self.guard(research_id)
+                        await asyncio.sleep(min(0.4, max(0, until - asyncio.get_running_loop().time())))
+                    continue
                 if error.code == "model_output_truncated":
                     await self.guard(research_id)
                     if token_limit >= MAX_OUTPUT_TOKENS:

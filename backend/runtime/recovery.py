@@ -6,6 +6,7 @@ import sqlite3
 import psutil
 
 from backend.persistence.resilience import is_storage_busy
+from backend.adapters.model_errors import classify_model_failure
 
 
 def retryable_failure(error):
@@ -38,13 +39,20 @@ def legacy_failure(store, task):
                     return "storage_busy", "已从旧检查点确认数据库锁冲突，自动恢复"
     if error.get("code") == "model_execution_failed":
         with store.connect() as c:
-            rows = c.execute("SELECT data FROM events WHERE research_id=? AND json_extract(data,'$.payload.notification.payload.event.type')='turn/end' AND json_extract(data,'$.task_id') LIKE ? ORDER BY seq DESC LIMIT 8", (task["research_id"], task["id"] + "%"))
+            prefix = task["id"] + ":"
+            rows = c.execute("SELECT data FROM events WHERE research_id=? AND json_extract(data,'$.payload.notification.payload.event.type')='turn/end' AND (json_extract(data,'$.task_id')=? OR substr(json_extract(data,'$.task_id'),1,?)=?) ORDER BY seq DESC LIMIT 1",
+                (task["research_id"], task["id"], len(prefix), prefix))
             for row in rows:
                 event = json.loads(row[0])
                 reason = event["payload"]["notification"]["payload"]["event"]["data"].get("reason", {})
                 if reason.get("kind") == "error" and reason.get("error", {}).get("message") in {
                     "Research stream recorder is unavailable or stopped", "AUTORESEARCH_STREAM_RECORDER_UNAVAILABLE"}:
                     return "stream_recorder_unavailable", "旧记录确认本机流式记录失败，自动恢复"
+                # Only the final boundary of this failed task may authorize recovery.
+                failure = classify_model_failure([event["payload"]["notification"]["payload"]["event"]])
+                if failure["code"] == "model_response_invalid":
+                    return "model_response_invalid", "旧记录确认模型响应协议异常，执行退出对账后有限重试"
+                return None
     return None
 
 
