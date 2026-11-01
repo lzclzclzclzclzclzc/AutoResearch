@@ -81,8 +81,12 @@ DISCUSSION = """本次使用 discussion_protocol=2。普通讨论按程序提供
 
 
 def discussion_prompt(role: str | Role, mode: str = "discussion") -> str:
+    import json
+    from packages.contracts.handoffs import discussion_handoff_requirements
     role = Role(role)
     instructions = role_prompt(role, discussion_protocol=2) + "\n" + DISCUSSION
+    instructions += "\n按接收方共用的必填项：" + json.dumps(discussion_handoff_requirements(role.value), ensure_ascii=False)
+    instructions += "\n开票仅检查正文和公共结构，各方向缺项是预览提示；成员可自由选择方向。收票只校验真实成员自己的票；全票同向后才检查绑定产物能否交接。产物缺项计一次结束失败，保留真实同意票并由原组修订；不能让某位投票人重投来补另一份冻结产物。"
     if mode in {"ordinary_vote", "poll", "ordinary_ballot"}:
         instructions += "\n当前只投普通票：从本次给出的 options 选择原文 option，并给出 reason。只代表自己，不更改问题或选项。"
     elif mode in {"end_vote", "end_ballot"}:

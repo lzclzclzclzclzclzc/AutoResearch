@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from packages.contracts.research import digest
+
 
 class DiscussionStoreMixin:
     def initialize_discussion(self, discussion_id, state):
@@ -34,6 +36,11 @@ class DiscussionStoreMixin:
                 return current
             updated = self._put(c, "discussion_state", did,
                 {**deepcopy(state), "revision": previous["revision"] + 1}, rid)
+            if state.get("mode") == "god":
+                finalization_id = "gfinal-" + digest(did)[:32]
+                if not self._get(c, "discussion_finalization", finalization_id):
+                    self._put(c, "discussion_finalization", finalization_id, {"discussion_id": did,
+                        "status": "pending", "votes": deepcopy(state.get("votes", []))}, rid)
             for message in messages:
                 fields = dict(message)
                 sender = fields.pop("sender", {"type": "system", "id": "discussion"})

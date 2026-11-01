@@ -20,7 +20,7 @@ def retryable_failure(error):
     if getattr(error, "code", None) == "direction_stop_pending":
         return "local_service_unavailable", "等待旧研究方向的执行退出后自动落实新安排"
     if getattr(error, "code", None) == "discussion_technical_failure":
-        return "local_service_unavailable", "当前讨论回复遇到技术故障，保留已收票并在原位置自动重试"
+        return "discussion_output_correction", "当前成员回复未通过字段校验，保留已收票，在原逻辑回合内有限纠正"
     if getattr(error, "code", None) == "stream_recorder_unavailable":
         return "stream_recorder_unavailable", "本机流式记录暂时不可用，确认旧执行退出后自动恢复"
     return None
@@ -28,7 +28,7 @@ def retryable_failure(error):
 
 def legacy_failure(store, task):
     error = task.get("error") or {}
-    if error.get("code") in {"storage_busy", "stream_recorder_unavailable", "local_service_unavailable"}:
+    if error.get("code") in {"storage_busy", "stream_recorder_unavailable", "local_service_unavailable", "discussion_output_correction"}:
         return error["code"], error.get("message", "基础设施恢复")
     if error.get("code") == "OperationalError":
         path = store.data_dir / "checkpoints.sqlite"

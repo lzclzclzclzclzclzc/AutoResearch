@@ -339,14 +339,27 @@ class ResearchEngine:
         adapter = self.demo if project["mode"] == "demo" else self.live
         delay, last_error = 1.0, None
         token_limit = output_tokens(private_score)
+        generation_budget = None
+        generation_turn = turn_id
+        if context.get("generation_budget"):
+            from backend.runtime.generation_budget import GenerationBudget
+            generation_budget = GenerationBudget(self.store, research_id, context["generation_budget"])
+            corrections = generation_budget.corrections()
+            if corrections:
+                prompt += "\n同一逻辑回合的先前尝试未获采纳，请根据具体错误更正完整 JSON：" + json.dumps(corrections, ensure_ascii=False)
         while True:
+            generation_attempt = None
             response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
             response_retry = self.store.get("model_response_retry", response_retry_id) or {}
-            if response_retry.get("failures", 0) >= MAX_RESPONSE_ATTEMPTS:
+            if not generation_budget and response_retry.get("failures", 0) >= MAX_RESPONSE_ATTEMPTS:
                 raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
                     provider_error_code=response_retry.get("provider_error_code"))
             try:
-                result = await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
+                cached_generation = None
+                if generation_budget:
+                    generation_attempt, cached_generation = generation_budget.acquire(agent_id, task_id, generation_turn)
+                    turn_id = generation_attempt["turn_id"]
+                result = cached_generation if cached_generation is not None else await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
                     task_id=task_id, turn_id=turn_id, prompt=prompt, schema=wire_contract, direction_epoch=context.get("direction_epoch", 1),
                     model=project["config_snapshot"]["provider"], context=context,
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
@@ -354,21 +367,35 @@ class ResearchEngine:
                         "discussion_protocol": context.get("discussion_protocol", 1), "private_score": private_score,
                         **{key: context[key] for key in ("finalization_id", "snapshot_hash", "context_sections") if key in context},
                         "max_output_tokens": token_limit})
+                if generation_budget:
+                    generation_budget.record(generation_attempt, "returned", output=result)
                 result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
+                if generation_budget:
+                    generation_budget.record(generation_attempt, "accepted", output=result)
                 break
             except (ConnectionError, TimeoutError) as error:
+                if generation_budget and generation_attempt:
+                    generation_budget.release_unstarted_service_failure(generation_attempt, error)
                 await self.guard(research_id)
                 self.store.emit(research_id, "agent.retry_wait", {"delay_seconds": delay, "code": type(error).__name__}, agent_id=agent_id)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
             except RuntimeBlocked as error:
+                unstarted_service_failure = (generation_budget and generation_attempt and
+                    error.code in {"rate_limited", "model_transport_error", "model_timeout"} and
+                    generation_budget.release_unstarted_service_failure(generation_attempt, error))
+                if generation_budget and generation_attempt and not unstarted_service_failure and error.code not in {"execution_unknown", "generation_budget_exhausted"}:
+                    generation_budget.record(generation_attempt, "rejected", error=str(error), error_code=error.code)
+                if generation_budget and error.code == "invalid_output":
+                    prompt += "\n上次输出校验失败，请更正并完整返回 JSON：" + str(error)
+                    continue
                 if error.code == "model_response_invalid":
                     await self.guard(research_id)
                     failures = response_retry.get("failures", 0) + 1
                     self.store.put("model_response_retry", response_retry_id, {"failures": failures,
                         "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id,
                         "provider_error_code": error.provider_error_code}, research_id)
-                    if failures >= MAX_RESPONSE_ATTEMPTS:
+                    if failures >= MAX_RESPONSE_ATTEMPTS and not generation_budget:
                         raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
                             http_status=error.http_status, provider_error_code=error.provider_error_code) from error
                     # Adapter admission requires exit proof before a replacement.
@@ -385,7 +412,7 @@ class ResearchEngine:
                     continue
                 if error.code == "model_output_truncated":
                     await self.guard(research_id)
-                    if token_limit >= MAX_OUTPUT_TOKENS:
+                    if token_limit >= MAX_OUTPUT_TOKENS and not generation_budget:
                         from backend.graphs.arbitration import ArbitrationRequired
                         raise ArbitrationRequired("model_output_truncated", f"模型输出在 {token_limit} token 上限下仍被截断", max_output_tokens=token_limit, original_error=str(error)) from error
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
@@ -406,7 +433,10 @@ class ResearchEngine:
                 delay = min(delay * 2, 30)
             except (ValueError, json.JSONDecodeError) as error:
                 signature = str(error)[:500]
-                if signature == last_error:
+                if generation_budget and generation_attempt:
+                    generation_budget.record(generation_attempt, "rejected", error=signature,
+                        output=result if "result" in locals() else None)
+                if signature == last_error and not generation_budget:
                     from backend.graphs.arbitration import ArbitrationRequired
                     raise ArbitrationRequired("invalid_output", "相同输出校验错误未取得进展：" + signature,
                         validation_error=signature, source_output=result if "result" in locals() else None) from error
@@ -792,32 +822,14 @@ class ResearchEngine:
 
     def validate_discussion_output(self, role, final_output, context, next_step=None):
         """Check only the data actually needed to execute a chosen handoff."""
-        from packages.contracts.research import allowed_next_steps
-        from backend.graphs.boss_operations import normalize_operations
-        if not isinstance(final_output, dict) or not str(final_output.get("content_markdown", "")).strip():
-            raise ValueError("结束投票必须绑定一份包含 content_markdown 的完整产物")
-        if next_step is not None and next_step not in allowed_next_steps(role):
-            raise ValueError("推进方向不在当前角色的目录中")
-        if role == "critic" and (next_step == "implementation" or "experiment_spec" in final_output or "fixed" in final_output):
-            raw = final_output.get("experiment_spec", final_output)
-            if not isinstance(raw, dict):
-                raise ValueError("转 Implementation 必须提供 experiment_spec 实验计划")
-            ExperimentSpec.model_validate({**raw, "discussion_protocol": 2,
-                "spec_id": context.get("spec_id", "pending-spec"), "version": context.get("spec_version", 1),
-                "deadline_at": context["deadline_at"]})
-        if role == "boss":
+        from packages.contracts.handoffs import validate_discussion_handoff
+        validate_discussion_handoff(role, final_output, context, next_step)
+        if role == "boss" and next_step is not None:
             from packages.contracts.research import SharedKnowledge
             for update in final_output.get("memory_updates", []):
                 knowledge = SharedKnowledge.model_validate(update)
                 if any(not self.store.source_exists(context["research_id"], source) for source in knowledge.source_ids):
                     raise ValueError("共享知识必须引用本项目实际存在的来源")
-            # Before the vote only explicit operations are checked; shortcuts
-            # become concrete after all members choose the same direction.
-            step = next_step or ("dispatch" if final_output.get("operations") else None)
-            if step:
-                normalize_operations(final_output, step, context["lines"])
-            elif next_step is None and final_output.get("targets") is not None:
-                normalize_operations(final_output, "finish_lines", context["lines"])
         return final_output
 
     async def apply_discussion_boss(self, task, discussion, context):
