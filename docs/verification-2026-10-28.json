@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-28",
+  "python": {
+    "command": ".venv/Scripts/python.exe -m pytest -q --basetemp .test-data/pytest-feature-final --tb=short",
+    "passed": 196,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 178.79
+  },
+  "frontend": {
+    "history_tests_passed": 2,
+    "typescript": "passed",
+    "production_build": "passed"
+  },
+  "real_api": {
+    "runtime": "official full DSH SDK",
+    "private_score": 50,
+    "private_chat_messages": 0,
+    "public_candidate": {
+      "ok": true
+    },
+    "public_chat_messages": 1,
+    "execution_dedup": "passed",
+    "full_user_research": "not_run"
+  },
+  "browser": {
+    "cpu_demo": "completed",
+    "history_import": "passed",
+    "manual_name": "passed",
+    "delete_and_restore": "passed",
+    "desktop_width": 1440,
+    "narrow_width": 390,
+    "narrow_horizontal_overflow": false
+  },
+  "production": {
+    "port": 8000,
+    "health": "ok",
+    "history_config_endpoint": 200,
+    "old_research": "terminated_time_limit_reached"
+  }
+}

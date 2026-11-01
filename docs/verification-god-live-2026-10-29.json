@@ -1,0 +1,28 @@
+{
+  "checked_at": "2026-10-29T02:37:48.891209Z",
+  "mode": "live",
+  "model": "DeepSeek-V4.1-Flash",
+  "research_id": "research-ab00d69e3a364082b71011274930eb08",
+  "status": "passed",
+  "json_decisions": 3,
+  "concurrent_overlap": true,
+  "independent_sessions": true,
+  "arbitrations": [
+    {
+      "arbitration_id": "arb-c212a2b809e6c6aba4afbe72e2c39341d3d365a3",
+      "action": "select_candidate",
+      "selected_candidate_id": "boss/member-01"
+    },
+    {
+      "arbitration_id": "arb-e9d826da6d505743e3e6e2071509a709801cbaff",
+      "action": "select_candidate",
+      "selected_candidate_id": "boss/member-01"
+    },
+    {
+      "arbitration_id": "arb-e29cbe3bd096451c05e12f4c1daa3f5c362d4e5e",
+      "action": "select_candidate",
+      "selected_candidate_id": "boss/member-01"
+    }
+  ],
+  "generation_attempts": 7
+}

@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="0.548" timestamp="2026-10-26T10:33:07.265197+08:00" hostname="lzc"><testcase classname="tests.integration.test_workflow" name="test_control_restart_resyncs_already_terminated_project_without_reopening" time="0.226" /></testsuite></testsuites>

@@ -1,0 +1,77 @@
+{
+  "recorded_at": "2026-10-26T02:37:08.314805+00:00",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.13.0",
+  "node": "v24.21.0",
+  "python_suite": {
+    "tests": "122",
+    "errors": "0",
+    "failures": "0",
+    "skipped": "0",
+    "time": "107.234"
+  },
+  "frontend_history": {
+    "passed": 2,
+    "failed": 0
+  },
+  "production_build": "passed",
+  "sdk": {
+    "package": "deepseek-harness-sdk",
+    "version": "0.2.1rc2",
+    "runtime": "bundled_native",
+    "runtime_version": "0.2.1rc2",
+    "real_local_protocol_fixture": "passed",
+    "external_deepseek_calls": "not_requested"
+  },
+  "browser_demo": {
+    "research_id": "research-32f3d138b7ac4b09aa67a66c82243f94",
+    "mode": "explicit_demo",
+    "status": "completed",
+    "logical_agents": 17,
+    "actual_cpu_runs": 2,
+    "successful_exits": 2,
+    "verifications": 2,
+    "reports": 2,
+    "memory_nodes": 2,
+    "outbox_states": [
+      "delivered",
+      "delivered"
+    ],
+    "inbox_states": [
+      "consumed",
+      "consumed"
+    ],
+    "delivery_states": [
+      "acknowledged",
+      "acknowledged"
+    ]
+  },
+  "browser_stop": {
+    "research_id": "research-53cf345b55024934a2f7cdb94833f176",
+    "status": "terminated",
+    "verifications_after_stop": 0,
+    "reports_after_stop": 0,
+    "resynchronized_after_control_restart": true,
+    "running_stage_indicator_after_exit": false
+  },
+  "layout_widths_css_px": [
+    390,
+    768,
+    1440
+  ],
+  "not_validated": [
+    "external DeepSeek model acceptance",
+    "real GPU training",
+    "100 expanded nodes and 100000 messages load target",
+    "P95 whole-system latency target",
+    "physical mobile hardware"
+  ],
+  "production_projects": 0,
+  "additional_restart_regression": {
+    "tests": "1",
+    "errors": "0",
+    "failures": "0",
+    "skipped": "0",
+    "time": "0.548"
+  }
+}
