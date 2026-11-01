@@ -94,10 +94,9 @@ def test_creation_membership_and_group_recipient_are_visible_before_member_speec
     assert conversation_list(store, rid, identity=actor, at_seq=first["event_seq"])[0]["conversation_id"] == "group-handoff"
     added_actor = "line-01/critic/member-2"
     updated = store.create_conversation(rid, "assigned", participants=[{"type": "agent", "id": added_actor}])
-    assert conversation_list(store, rid, identity=added_actor, at_seq=initial["created_event_seq"]) == [
-        view for view in conversation_list(store, rid, identity=added_actor, at_seq=initial["created_event_seq"]) if False]
+    assert conversation_list(store, rid, identity=added_actor, at_seq=initial["created_event_seq"]) == []
     assert any(view["conversation_id"] == updated["conversation_id"] for view in conversation_list(store, rid, identity=added_actor,
-        at_seq=store.events(rid)["items"][-1]["seq"]))
+        at_seq=store.events(rid)[-1]["seq"]))
 
 
 def test_other_member_execution_does_not_activate_unrelated_member_session(tmp_path, monkeypatch):
