@@ -325,7 +325,8 @@ class ResearchEngine:
             mode = {"DiscussionTurn": "discussion", "PollBallot": "ordinary_vote", "OrdinaryBallot": "ordinary_vote", "EndBallot": "end_vote"}[schema.__name__]
             instructions = discussion_prompt(Role(role), mode)
         prompt = identity + "\n" + instructions + "\n\n任务输入（只包含授权上下文）:\n" + json.dumps(context, ensure_ascii=False, default=str)
-        wire_contract = model_contract(schema, context)
+        wire_contract = model_contract(schema, context, repaired_validator=lambda result:
+            self.validate_output(research_id, agent_id, schema, result, context, output_validator))
         prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象（系统编号、版本和哈希由程序填写）:\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
         delay, last_error = 1.0, None

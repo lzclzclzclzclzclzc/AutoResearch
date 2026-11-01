@@ -33,6 +33,40 @@ class ResearchStopped(RuntimeError):
     pass
 
 
+def parse_final_object(response, schema, *, finish_reason, record_repair):
+    """Repair only one missing object terminator in a normally completed reply."""
+    try:
+        return schema.model_validate_json(response).model_dump()
+    except ValueError as original:
+        raw = response.rstrip()
+        if finish_reason != "completed" or not raw.startswith("{"):
+            raise
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as syntax:
+            if syntax.pos != len(raw):
+                raise original
+        else:
+            # Valid JSON with a contract error belongs to the usual correction path.
+            raise original
+        audit = {"original_response": response, "method": "append_single_right_brace",
+                 "adopted": False}
+        try:
+            candidate = json.loads(raw + "}")
+            if not isinstance(candidate, dict):
+                raise original
+            result = schema.model_validate(candidate).model_dump()
+            if validator := getattr(schema, "validate_repaired_output", None):
+                validator(result)
+        except ValueError as error:
+            audit["validation_error"] = str(error)
+            record_repair(audit)
+            raise error from original
+        audit["adopted"] = True
+        record_repair(audit)
+        return result
+
+
 @lru_cache(maxsize=8)
 def _external_runtime(path):
     resolved = Path(path).expanduser().resolve()
@@ -353,7 +387,11 @@ class DshRuntimeAdapter:
                 if final.get("finish_reason") == "max-tokens":
                     failure = truncated_output_error()
                     raise RuntimeBlocked(failure["code"], failure["message"])
-                result = schema.model_validate_json(final["final_response"]).model_dump()
+                result = parse_final_object(final["final_response"], schema,
+                    finish_reason=final.get("finish_reason"),
+                    record_repair=lambda audit: self.store.emit(research_id, "agent.json_repair", {
+                        **audit, "execution_attempt_id": execution_id},
+                        agent_id=agent_id, execution_id=execution_id, task_id=task_id))
                 message_id = self.gateway.last_message(capability) if capability else None
                 self.store.complete_model_turn(logical_key, result, session_id=session["id"],
                     fields={"finish_reason": final.get("finish_reason"), "message_id": message_id,
