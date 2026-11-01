@@ -33,7 +33,7 @@ class ResearchStopped(RuntimeError):
     pass
 
 
-def parse_final_object(response, schema, *, finish_reason, record_repair):
+def parse_final_object(response, schema, *, finish_reason, record_repair, validate_repaired=None):
     """Repair only one missing object terminator in a normally completed reply."""
     try:
         return schema.model_validate_json(response).model_dump()
@@ -58,6 +58,8 @@ def parse_final_object(response, schema, *, finish_reason, record_repair):
             result = schema.model_validate(candidate).model_dump()
             if validator := getattr(schema, "validate_repaired_output", None):
                 validator(result)
+            if validate_repaired is not None:
+                validate_repaired(result)
         except ValueError as error:
             audit["validation_error"] = str(error)
             record_repair(audit)
@@ -233,7 +235,8 @@ class DshRuntimeAdapter:
                 raise ResearchStopped("该 God 仲裁范围已经取消或失效")
 
     async def execute_turn(self, *, research_id, agent_id, role, task_id, turn_id,
-                           prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None):
+                           prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None,
+                           repaired_validator=None):
         runtime_context = runtime_context or {}
         private_score = bool(runtime_context.get("private_score", runtime_context.get("suppress_chat")
             and runtime_context.get("discussion_protocol") != 2))
@@ -390,6 +393,7 @@ class DshRuntimeAdapter:
                     raise RuntimeBlocked(failure["code"], failure["message"])
                 result = parse_final_object(final["final_response"], schema,
                     finish_reason=final.get("finish_reason"),
+                    validate_repaired=repaired_validator,
                     record_repair=lambda audit: self.store.emit(research_id, "agent.json_repair", {
                         **audit, "execution_attempt_id": execution_id},
                         agent_id=agent_id, execution_id=execution_id, task_id=task_id))
