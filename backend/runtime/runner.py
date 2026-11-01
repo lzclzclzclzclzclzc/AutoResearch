@@ -452,6 +452,7 @@ class RunnerSupervisor:
         self._processes: dict[str, ManagedProcess] = {}
         self._cancelled: set[str] = set()
         self._stop_reasons: dict[str, str] = {}
+        self._stop_operations: dict[str, dict] = {}
         self._stopped_projects: set[str] = set()
         self._unbound_reconciling: set[str] = set()
         self._shutdown = threading.Event()
@@ -464,6 +465,8 @@ class RunnerSupervisor:
         for record in records:
             if record.get("kind") == "cancel":
                 self._cancelled.add(record["experiment_run_id"])
+            elif record.get("kind") == "stop_operation":
+                self._stop_operations[record["operation_id"]] = record
         self._reconcile_restart()
         from .light_cpu import LightCpuService
         self.light_cpu = LightCpuService(self.data_dir,self.control,self.service,self.instance_id,self.generation)
@@ -699,7 +702,26 @@ class RunnerSupervisor:
                 self._operations[run_id].update(state="stopping", reconciliation_pending=True,
                     process_tree_exited=actual_exited, terminal_state=terminal_state)
 
-    def request_stop(self, run_id: str, reason: str = "early_stopped") -> dict:
+    def stop_receipt(self, operation_id: str) -> dict:
+        with self._state_lock:
+            receipt = copy.deepcopy(self._stop_operations.get(operation_id))
+        if not receipt:
+            return {"operation_id": operation_id, "state": "unknown"}
+        return {**receipt, "run": self.status(receipt["experiment_run_id"]), "state": "accepted"}
+
+    def request_stop(self, run_id: str, reason: str = "early_stopped", operation_id: str | None = None) -> dict:
+        if operation_id:
+            with self._state_lock:
+                previous = self._stop_operations.get(operation_id)
+                if previous:
+                    if previous["experiment_run_id"] != run_id or previous["reason"] != reason:
+                        raise ResourceConflict("Stop operation identity belongs to a different request")
+                    return self.status(run_id)
+                receipt = {"kind": "stop_operation", "record_id": operation_id, "operation_id": operation_id,
+                    "experiment_run_id": run_id, "research_id": self._operations.get(run_id, {}).get("research_id", "unknown"),
+                    "reason": reason, "accepted_at": iso_now()}
+                self.journal.append(receipt).result(timeout=8)
+                self._stop_operations[operation_id] = receipt
         # First step is an in-memory latch. It never waits for SQLite/journal.
         self._stop_reasons[run_id] = reason
         self._cancelled.add(run_id)
@@ -947,8 +969,11 @@ class RunnerClient:
     def collect(self, run_id: str, offset: int = 0, limit: int = 65536) -> dict:
         return _request(f"{self.base_url}/collect", {"run_id": run_id, "offset": offset, "limit": limit}, self.token)
 
-    def request_stop(self, run_id: str, reason: str = "early_stopped") -> dict:
-        return _request(f"{self.base_url}/request-stop", dict(run_id=run_id, reason=reason), self.token)
+    def request_stop(self, run_id: str, reason: str = "early_stopped", operation_id: str | None = None) -> dict:
+        return _request(f"{self.base_url}/request-stop", dict(run_id=run_id, reason=reason, operation_id=operation_id), self.token)
+
+    def stop_receipt(self, operation_id: str) -> dict:
+        return _request(f"{self.base_url}/stop-receipt", {"operation_id": operation_id}, self.token)
 
     def stop_project(self, research_id: str, reason: str = "user_requested") -> dict:
         return _request(f"{self.base_url}/stop-project", dict(research_id=research_id, reason=reason), self.token)
@@ -1024,6 +1049,10 @@ def create_app(data_dir: str | Path = "data", supervisor: RunnerSupervisor | Non
     @app.post("/request-stop")
     async def stop(payload: dict):
         return service.request_stop(**payload)
+
+    @app.post("/stop-receipt")
+    def stop_receipt(payload: dict):
+        return service.stop_receipt(**payload)
 
     @app.post("/stop-project")
     async def stop_project(payload: dict):

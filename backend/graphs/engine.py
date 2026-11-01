@@ -1124,33 +1124,91 @@ class ResearchEngine:
 
     async def monitor_run(self, state, run):
         run_id, rid = run["experiment_run_id"], state["research_id"]
+        await self.apply_monitor_stop(state, run_id)
         cursor = self.store.get("run_monitor_cursor", run_id) or {"round_no": 0, "next_offset": 0}
-        round_no = cursor["round_no"] + 1
+        observer = self.store.get("run_monitor_observer", run_id) or {"round_no": cursor["round_no"]}
+        round_no = max(cursor["round_no"] + 1, observer["round_no"])
         window_id = f"{run_id}:monitor-window:{round_no}"
         window = self.store.get("run_monitor_window", window_id)
+        if window and window.get("status") in {"accepted", "exhausted", "late"}:
+            logs = await self.collect_run_logs(run_id, cursor["next_offset"])
+            if window.get("status") in {"exhausted", "late"} and logs["next_offset"] <= window["next_offset"]:
+                return None
+            round_no += 1
+            window_id = f"{run_id}:monitor-window:{round_no}"
+            window = self.store.get("run_monitor_window", window_id)
         if not window:
             logs = await self.collect_run_logs(run_id, cursor["next_offset"])
-            window = self.store.put("run_monitor_window", window_id, {"logs": logs, "log_hash": digest(logs),
-                "round_no": round_no, "from_offset": cursor["next_offset"], "next_offset": logs["next_offset"]}, rid)
+            with self.store.connect(True) as c:
+                window = self.store._put(c, "run_monitor_window", window_id, {"logs": logs, "log_hash": digest(logs),
+                    "round_no": round_no, "status": "pending", "from_offset": cursor["next_offset"], "next_offset": logs["next_offset"]}, rid)
+                self.store._put(c, "run_monitor_observer", run_id, {"round_no": round_no}, rid)
         spec = self.spec(state)
-        monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
-            f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
-            "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
-            "rule_ids": [str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)]},
-            conversation_id=run_id + ":monitor", line_id=state["line_id"])
+        allowed = sorted({str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)} | {"execution_unusable"})
+        def validate_monitor(value):
+            if value["request_early_stop"] and (not isinstance(value.get("rule_id"), str) or value["rule_id"] not in allowed):
+                raise ValueError(f"rule_id={value.get('rule_id')!r}: request_early_stop=true 时必须填写合法编号 {allowed}；"
+                    "请结合固定日志窗口的真实观察证据重新输出完整 JSON，不能只在正文说明停止原因。")
+        try:
+            monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
+                f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
+                "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
+                "rule_ids": allowed, "no_arbitration": True, "generation_budget": {"kind": "monitor_generation", "key": window_id, "limit": 3}},
+                conversation_id=run_id + ":monitor", line_id=state["line_id"], output_validator=validate_monitor)
+        except RuntimeBlocked as error:
+            if error.code not in {"generation_budget_exhausted", "monitor_generation_exhausted"}:
+                raise
+            self.store.patch("run_monitor_window", window_id, status="exhausted", error={"code": error.code,
+                "message": "监控回复纠正失败", "detail": str(error)})
+            self.store.emit(rid, "monitor.correction_exhausted", {"run_id": run_id, "window_id": window_id,
+                "message": "监控回复纠正失败", "log_hash": window["log_hash"]}, line_id=state["line_id"])
+            return None
+        except (ResearchStopped, asyncio.CancelledError):
+            self.store.patch("run_monitor_window", window_id, status="late")
+            raise
         monitor["evidence_log_hash"] = window["log_hash"]
-        if monitor["request_early_stop"]:
-            allowed = {str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)} | {"execution_unusable"}
-            if monitor["rule_id"] not in allowed:
-                raise RuntimeBlocked("invalid_early_stop", "提前终止意见未绑定冻结规则与真实运行证据")
-            await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
-        await self.guard(rid)
+        validate_monitor(monitor)
+        current = await asyncio.to_thread(self.runner.status, run_id)
+        project = self.store.project(rid)
+        line = self.store.get("line", f"{rid}:{state['line_id']}")
+        if (current.get("state") != "running" or project["status"] != "running" or
+                (line and (line.get("finish_requested") or line.get("direction_stop_epoch") == line["direction_epoch"] or
+                    state.get("direction_epoch", line["direction_epoch"]) != line["direction_epoch"]))):
+            self.store.patch("run_monitor_window", window_id, status="late", late_decision=monitor)
+            return None
+        await self.guard(rid, allow_paused=True)
         # The cursor advances only with the accepted monitoring decision. A lost response
         # reuses this stored window and logical model turn, even if the log keeps growing.
         with self.store.connect(True) as c:
             self.store._put(c, "run_monitor", f"{run_id}:{round_no}", {**monitor, "window_id": window_id}, rid)
             self.store._put(c, "run_monitor_cursor", run_id, {"round_no": round_no, "next_offset": window["next_offset"]}, rid)
+            self.store._put(c, "run_monitor_window", window_id, {**window, "status": "accepted"}, rid)
+            if monitor["request_early_stop"]:
+                self.store._put(c, "run_stop_intent", f"{run_id}:monitor-stop:{round_no}", {"run_id": run_id,
+                    "round_no": round_no, "window_id": window_id, "direction_epoch": line["direction_epoch"],
+                    "line_id": state["line_id"], "status": "pending"}, rid)
+        await self.apply_monitor_stop(state, run_id)
         return monitor
+
+    async def apply_monitor_stop(self, state, run_id):
+        """Dispatch a committed stop intent; an acknowledgement loss reuses its receipt."""
+        rid = state["research_id"]
+        for intent in self.store.list("run_stop_intent", rid, run_id=run_id):
+            if intent["status"] != "pending":
+                continue
+            project = self.store.project(rid)
+            line = self.store.get("line", f"{rid}:{intent['line_id']}")
+            current = await asyncio.to_thread(self.runner.status, run_id)
+            if (project["status"] != "running" or current.get("state") != "running" or not line or
+                    line["direction_epoch"] != intent["direction_epoch"] or line.get("finish_requested") or
+                    line.get("direction_stop_epoch") == line["direction_epoch"]):
+                self.store.patch("run_stop_intent", intent["id"], status="cancelled", observed_state=current.get("state"))
+                continue
+            await self.guard(rid)
+            receipt = await asyncio.to_thread(self.runner.stop_receipt, intent["id"])
+            if receipt.get("state") == "unknown":
+                await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped", intent["id"])
+            self.store.patch("run_stop_intent", intent["id"], status="applied")
 
     async def run_experiment(self, state):
         await self.line_open(state)
@@ -1190,18 +1248,36 @@ class ResearchEngine:
             run = recovered
         self.store.put("run", run_id, run, state["research_id"])
         last_monitor = asyncio.get_running_loop().time()
-        while run.get("state", run.get("status")) not in {"completed", "succeeded", "failed", "execution_failed", "early_stopped", "cancelled", "terminated", "interrupted", "unknown"}:
-            await self.guard(state["research_id"], allow_paused=True)
-            await asyncio.sleep(0.5)
-            run = await asyncio.to_thread(self.runner.status, run_id)
-            self.store.put("run", run_id, run, state["research_id"])
-            current_project = self.store.project(state["research_id"])
-            line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
-            if line.get("finish_requested") and run.get("state") == "running":
-                await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
-            if not line.get("finish_requested") and current_project["status"] == "running" and run.get("state") == "running" and asyncio.get_running_loop().time() - last_monitor >= 5:
-                await self.monitor_run(state, run)
-                last_monitor = asyncio.get_running_loop().time()
+        monitor_task = None
+        try:
+            while run.get("state", run.get("status")) not in {"completed", "succeeded", "failed", "execution_failed", "early_stopped", "cancelled", "terminated", "interrupted", "unknown"}:
+                await asyncio.sleep(0.5)
+                run = await asyncio.to_thread(self.runner.status, run_id)
+                self.store.put("run", run_id, run, state["research_id"])
+                await self.guard(state["research_id"], allow_paused=True)
+                current_project = self.store.project(state["research_id"])
+                line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
+                if line.get("finish_requested") and run.get("state") == "running":
+                    await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
+                if monitor_task is not None and monitor_task.done():
+                    try:
+                        await monitor_task
+                    except ResearchStopped:
+                        pass
+                    except Exception as error:
+                        # A failed observation never transfers ownership of the process.
+                        self.store.emit(state["research_id"], "monitor.deferred", {"run_id": run_id,
+                            "code": getattr(error, "code", type(error).__name__), "message": str(error)}, line_id=state["line_id"])
+                    monitor_task = None
+                    last_monitor = asyncio.get_running_loop().time()
+                if (monitor_task is None and not line.get("finish_requested") and current_project["status"] == "running"
+                        and run.get("state") == "running" and asyncio.get_running_loop().time() - last_monitor >= 5):
+                    monitor_task = asyncio.create_task(self.monitor_run(state, run))
+        finally:
+            if monitor_task is not None:
+                if not monitor_task.done():
+                    monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
         if run.get("state") == "unknown":
             raise RuntimeBlocked("runner_unknown", "正式实验状态未知，保留资源并等待对账，禁止重复启动")
         return {"run_id": run_id}

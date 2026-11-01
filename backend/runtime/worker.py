@@ -61,6 +61,24 @@ async def sync_control_stops(store, control):
             continue
 
 
+async def sync_runner_states(store, runner):
+    """Observation has no model/control dependency, including for stopped projects."""
+    for saved in store.list("run"):
+        run_id = saved.get("experiment_run_id", saved["id"])
+        try:
+            current = await asyncio.to_thread(runner.status, run_id)
+            if current.get("state") == "unknown":
+                continue
+            if any(current.get(key) != saved.get(key) for key in
+                    ("research_id", "allocation_id", "start_operation_id", "spec_id", "code_version")):
+                continue
+            if current != {key: value for key, value in saved.items() if key not in {"id", "version"}}:
+                store.put("run", run_id, current, saved["research_id"])
+        except Exception:
+            # Failure to observe never authorizes replacement execution.
+            continue
+
+
 async def dispatch_pending_handoffs(store, control, limit=25):
     """Bound one drain; failed delivery remains durable for the next iteration."""
     try:
@@ -241,6 +259,7 @@ async def run_worker(data_dir, control_url, runner_url):
     # owner-death watchdog; unknown process identities keep execution blocked.
     await retry_startup(lambda: reconcile_worker_executions(store), stop)
     await retry_startup(lambda: recover_arbitration_leases(store, control), stop)
+    await retry_startup(lambda: sync_runner_states(store, runner), stop)
     await retry_startup(lambda: recover_running_tasks(store, control), stop)
 
     async with AsyncSqliteSaver.from_conn_string(str(Path(data_dir).resolve() / "checkpoints.sqlite")) as saver:
@@ -362,6 +381,7 @@ async def run_worker(data_dir, control_url, runner_url):
                     store.put("system", "worker", {"status": "running", "pid": os.getpid(), "owner": owner,
                         "heartbeat_at": now(), "active_tasks": len(active), "dsh": engine.live.availability()})
                     await sync_control_stops(store, control)
+                    await sync_runner_states(store, runner)
                     for task_id, (task, failure) in list(deferred_retries.items()):
                         p = store.project(task["research_id"])
                         if p["status"] in {"terminated", "terminating", "completed", "quarantined"}:

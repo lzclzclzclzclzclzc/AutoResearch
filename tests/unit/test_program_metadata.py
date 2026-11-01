@@ -44,9 +44,10 @@ async def test_monitor_uses_program_window_without_model_hash_echo(tmp_path):
     engine.store.put('spec','s',plan.model_dump(),project['id'])
     async def logs(*args): return {'text':'unusable run', 'next_offset':12}
     async def turn(*args,**kwargs): return {'request_early_stop':True,'rule_id':'execution_unusable'}
-    async def guard(*args): return project
+    async def guard(*args,**kwargs): return project
     stops=[]
     engine.collect_run_logs,engine.turn,engine.guard=logs,turn,guard
-    engine.runner=SimpleNamespace(request_stop=lambda *args:stops.append(args))
+    engine.runner=SimpleNamespace(request_stop=lambda *args:stops.append(args),
+        status=lambda *args: {'state':'running'}, stop_receipt=lambda *args: {'state':'unknown'})
     output=await engine.monitor_run({'research_id':project['id'],'line_id':'line-01','spec_id':'s'}, {'experiment_run_id':'r'})
-    assert output['evidence_log_hash'] and stops==[('r','early_stopped')]
+    assert output['evidence_log_hash'] and stops==[('r','early_stopped','r:monitor-stop:1')]
