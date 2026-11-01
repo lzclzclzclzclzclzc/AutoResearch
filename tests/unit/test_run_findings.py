@@ -8,7 +8,7 @@ from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.engine import ResearchEngine
 from backend.persistence.store import Store
 from backend.runtime.light_cpu import validate_numeric_code
-from packages.contracts.research import ExperimentSpec, Issue, Verification, validate_issue_transition
+from packages.contracts.research import ExperimentSpec, Issue, LegacyVerification as Verification, validate_issue_transition
 
 
 def execution_issue():

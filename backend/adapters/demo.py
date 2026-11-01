@@ -154,13 +154,16 @@ class DemoRuntimeAdapter:
         elif name == "Implementation":
             spec = context["spec"]
             value = {"content_markdown": content, "spec_hash": digest(spec), "files": {"experiment.py": DEMO_CODE}, "entrypoint": "experiment.py", "arguments": [], "actual_config": spec["fixed"], "cpu_cores": 1, "memory_mb": 128, "gpu_count": 0, "estimated_seconds": 10, "dependencies": []}
-        elif name == "Verification":
+        elif name in {"Verification", "LegacyVerification"}:
             metrics = context["submission"].get("metrics", {})
             ok = context["submission"].get("run", {}).get("state") in {"completed", "succeeded"} and all(metrics.get(k) == v for k, v in {"seed": 42, "samples": 200, "epochs": 120}.items())
             improved = ok and metrics.get("final_mse", float("inf")) < metrics.get("baseline_mse", 0)
             source_ids = context["submission"].get("run_ids", [])
             source_id = source_ids[-1] if source_ids else context["submission"]["id"]
             value = {"content_markdown": content + "\n仅根据真实 CPU 运行产物核查演示设置；不构成任何用户题目的科研结论。", "passed": ok, "scientific_observation": "improvement" if improved else "no_improvement" if ok else "execution_failed", "evidence": [{"source_id": source_id, "claim": "CPU 演示运行已完成，实际指标：" + str(metrics) if ok else "执行未正常完成或指标不完整", "status": "observed"}], "limitations": ["固定脚本演示，不含真实多 Agent 推理", "合成数据单次实验，不代表题目的有效科研证据"], "required_changes": []}
+            if name == "Verification":
+                value = {key: value[key] for key in ("content_markdown", "passed", "scientific_observation")}
+                value["content_markdown"] += "\n依据运行 " + source_id + "，实际指标：" + str(metrics) + "。局限：合成数据、单次脚本演示，不代表真实科研证据；未完成时需修订实现或补齐结果。"
         elif name == "BossDecision":
             value = boss_decision()
         elif name == "ResourceAdvice":

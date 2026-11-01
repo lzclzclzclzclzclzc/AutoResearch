@@ -54,7 +54,7 @@ async def test_failed_verify_reaches_both_groups_then_boss_once_after_delivery_r
                 if arguments["schema"].__name__ == "Verification":
                     verify_count += 1
                     if verify_count == 1:
-                        output.update(passed=False, required_changes=["HANDOFF_REQUIRED_CHANGE"],
+                        output.update(passed=False,
                             content_markdown="演示验证交接测试：HANDOFF_REPORT_MARKER；请补齐证据。")
                 return output
             engine.demo._produce_turn = fixture
@@ -72,7 +72,8 @@ async def test_failed_verify_reaches_both_groups_then_boss_once_after_delivery_r
                 context = next(entry["context"] for entry in revisions if entry["role"] == role)
                 assert len(context["received_handoffs"]) == 1
                 handoff = context["received_handoffs"][0]
-                assert handoff["verification"]["required_changes"] == ["HANDOFF_REQUIRED_CHANGE"]
+                assert "HANDOFF_REPORT_MARKER" in handoff["verification"]["content_markdown"]
+                assert "required_changes" not in handoff["verification"]
                 assert "HANDOFF_REPORT_MARKER" in handoff["message"]["content_markdown"]
                 assert handoff["payload"]["route"] == "exploration_and_critic"
             verifications = store.list("verification", project["id"])

@@ -1,66 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$defs": {
-    "Evidence": {
-      "properties": {
-        "source_id": {
-          "title": "Source Id",
-          "type": "string"
-        },
-        "claim": {
-          "title": "Claim",
-          "type": "string"
-        },
-        "status": {
-          "enum": [
-            "observed",
-            "inference",
-            "unverified",
-            "failed",
-            "negative"
-          ],
-          "title": "Status",
-          "type": "string"
-        }
-      },
-      "required": [
-        "source_id",
-        "claim",
-        "status"
-      ],
-      "title": "Evidence",
-      "type": "object"
-    },
-    "ExecutionCheck": {
-      "properties": {
-        "issue_id": {
-          "title": "Issue Id",
-          "type": "string"
-        },
-        "passed": {
-          "title": "Passed",
-          "type": "boolean"
-        },
-        "evidence": {
-          "items": {
-            "$ref": "#/$defs/Evidence"
-          },
-          "minItems": 1,
-          "title": "Evidence",
-          "type": "array"
-        }
-      },
-      "required": [
-        "issue_id",
-        "passed",
-        "evidence"
-      ],
-      "title": "ExecutionCheck",
-      "type": "object"
-    }
-  },
   "properties": {
     "content_markdown": {
+      "minLength": 1,
       "title": "Content Markdown",
       "type": "string"
     },
@@ -78,48 +20,12 @@
       ],
       "title": "Scientific Observation",
       "type": "string"
-    },
-    "evidence": {
-      "items": {
-        "$ref": "#/$defs/Evidence"
-      },
-      "title": "Evidence",
-      "type": "array"
-    },
-    "limitations": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Limitations",
-      "type": "array"
-    },
-    "required_changes": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Required Changes",
-      "type": "array"
-    },
-    "independent_replication": {
-      "const": false,
-      "default": false,
-      "title": "Independent Replication",
-      "type": "boolean"
-    },
-    "execution_checks": {
-      "items": {
-        "$ref": "#/$defs/ExecutionCheck"
-      },
-      "title": "Execution Checks",
-      "type": "array"
     }
   },
   "required": [
     "content_markdown",
     "passed",
-    "scientific_observation",
-    "evidence",
-    "limitations"
+    "scientific_observation"
   ],
   "title": "Verification",
   "type": "object"

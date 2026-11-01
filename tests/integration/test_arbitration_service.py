@@ -6,7 +6,7 @@ import pytest
 from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
 from backend.graphs.arbitration import ArbitrationService
 from backend.persistence import Store
-from packages.contracts.research import Verification, digest
+from packages.contracts.research import LegacyVerification as Verification, digest
 
 
 class Control:

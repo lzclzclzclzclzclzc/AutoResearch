@@ -20,10 +20,10 @@ from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
-from backend.runtime.evidence import validate_execution_checks
+from backend.runtime.evidence import validate_execution_checks, validate_report_facts
 from backend.persistence.store import StoreError
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
-    Role, RunAssessment, StageReport, Verification, Issue, assert_spec_unchanged, digest, validate_issue_transition)
+    Role, RunAssessment, StageReport, Verification, LegacyVerification, Issue, assert_spec_unchanged, digest, validate_issue_transition)
 from packages.prompts.roles import VERSION, role_prompt, discussion_prompt
 
 
@@ -257,6 +257,9 @@ class ResearchEngine:
                 if actual.get(required["issue_id"]) != Issue.model_validate(required).model_dump():
                     raise ValueError(f"ExperimentSpec must retain execution requirement {required['issue_id']} and its acceptance criteria")
         if schema is Verification:
+            validate_report_facts(self.store, research_id, context.get("submission", {}), result,
+                context.get("line_id") or agent_id.split("/")[0])
+        if schema is LegacyVerification:
             validate_execution_checks(self.store, research_id, context.get("submission", {}), result,
                 context.get("line_id") or agent_id.split("/")[0])
         return result
@@ -320,7 +323,7 @@ class ResearchEngine:
                 participants=[{"type": "agent", "id": agent_id}], line_id=line_id)
         identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
         private_score = not publish_message and context.get("discussion_protocol") != 2
-        instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
+        instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1), verification_contract_version=context.get("verification_contract_version", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
         if context.get("discussion_protocol") == 2 and schema.__name__ in {"DiscussionTurn", "PollBallot", "OrdinaryBallot", "EndBallot"}:
             mode = {"DiscussionTurn": "discussion", "PollBallot": "ordinary_vote", "OrdinaryBallot": "ordinary_vote", "EndBallot": "end_vote"}[schema.__name__]
             instructions = discussion_prompt(Role(role), mode)
@@ -1229,7 +1232,8 @@ class ResearchEngine:
         submission = {"cycle_id": state["cycle_id"], "line_id": state["line_id"], "spec_id": spec.spec_id, "spec_version": spec.version,
             "code_version": impl["code_version"], "code_versions": [item["code_version"] for item in implementations], "run_ids": [item.get("experiment_run_id", item["id"]) for item in runs], "runs": runs, "spec": spec.model_dump(), "run": run,
             "actual_config": impl["actual_config"], "artifacts": artifacts, "logs": collected, "run_logs": run_logs, "status": "awaiting_verification",
-            "runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"])}
+            "runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
+            "verification_contract_version": 2}
         final_metrics = Path(impl["cwd"]) / "metrics.json"
         if final_metrics.is_file():
             try:
@@ -1244,12 +1248,18 @@ class ResearchEngine:
         p = await self.guard(state["research_id"])
         self.store.update_line(state["research_id"], state["line_id"], phase="verify")
         submission = self.store.get("submission", state["submission_id"])
-        report = await self.turn(state["research_id"], f"{state['line_id']}/verify", "verify", state["submission_id"], "verify", Verification,
-            {"instruction": "核查冻结计划和已有结果，不复跑正式实验。有效负结果可以通过，边界与缺口必须明确", "submission": submission},
+        version = submission.get("verification_contract_version", 1)
+        schema = Verification if version == 2 else LegacyVerification
+        report = await self.turn(state["research_id"], f"{state['line_id']}/verify", "verify", state["submission_id"], "verify", schema,
+            {"instruction": "核查冻结计划和已有结果，不复跑正式实验。有效负结果可以通过，边界与缺口必须明确", "submission": submission,
+             "verification_contract_version": version},
             conversation_id=state["submission_id"] + ":verify", line_id=state["line_id"], message_kind="verification",
             edge_id=f"{state['line_id']}/implementation->{state['line_id']}/verify")
-        report = {**report, "checks": [report["content_markdown"]], "supported_conclusions": [e["claim"] for e in report["evidence"]],
-                  "unsupported_conclusions": report["limitations"], **{k: submission[k] for k in ("spec_id", "spec_version", "code_version", "run_ids")}}
+        if version == 1:
+            report = {**report, "checks": [report["content_markdown"]], "supported_conclusions": [e["claim"] for e in report["evidence"]],
+                      "unsupported_conclusions": report["limitations"]}
+        report = {**report, "verification_contract_version": version,
+                  **{k: submission[k] for k in ("spec_id", "spec_version", "code_version", "run_ids")}}
         transition = await asyncio.to_thread(self.store.commit_verification, state["cycle_id"], state["submission_id"], report, p["control_generation"], self.control)
         if transition["route"] == "awaiting_confirmation_sync":
             raise RuntimeBlocked("confirmation_pending", "验证等待控制确认，稍后自动重试")

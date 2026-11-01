@@ -1332,7 +1332,16 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             except StoreError:
                 self._put(c, "verification_archive", new_id("late"), {"report": report, "status": "verification_pending"}, research_id)
                 return {"route": "halted"}
-            if type(report.get("passed")) is not bool or not report.get("checks"):
+            version = submission.get("verification_contract_version", 1)
+            if version == 2:
+                from packages.contracts.research import Verification
+                from backend.runtime.evidence import validate_report_facts
+                try:
+                    Verification.model_validate(report)
+                    validate_report_facts(self, research_id, submission, report, cycle.get("line_id"))
+                except ValueError as error:
+                    raise StoreError("invalid_verification", str(error), 422) from error
+            if type(report.get("passed")) is not bool or (version == 1 and not report.get("checks")):
                 raise StoreError("invalid_verification", "验证报告需要通过状态与检查依据", 422)
             if cycle.get("status", "active") not in {"active", "verifying"}:
                 raise StoreError("cycle_inactive", "当前周期不能接受验证")

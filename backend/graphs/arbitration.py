@@ -338,14 +338,15 @@ class ArbitrationService:
                 raise ValueError("God repair must match the original target schema")
             if schema.__name__ == "Vote":
                 raise ValueError("God cannot generate a member Vote")
-            if schema.__name__ == "Verification":
+            if schema.__name__ in {"Verification", "LegacyVerification"}:
                 source = context.get("diagnostic", {}).get("source_output")
                 if isinstance(source, str):
                     try:
                         source = json.loads(source)
                     except ValueError:
                         source = None
-                factual_fields = ("passed", "scientific_observation", "evidence", "limitations", "required_changes")
+                factual_fields = (("content_markdown", "passed", "scientific_observation") if schema.__name__ == "Verification"
+                    else ("passed", "scientific_observation", "evidence", "limitations", "required_changes"))
                 if not isinstance(source, dict) or any(field not in source for field in factual_fields):
                     raise ValueError("Verification repair requires the original complete verification facts; request Verify revision")
                 if any(decision["output"].get(field) != source.get(field) for field in

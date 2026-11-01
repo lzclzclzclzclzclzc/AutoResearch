@@ -31,7 +31,9 @@ ROLES = {
 }
 
 
-def role_prompt(role: Role, discussion_protocol: int = 1) -> str:
+def role_prompt(role: Role, discussion_protocol: int = 1, verification_contract_version: int = 1) -> str:
+    if role == Role.VERIFY and verification_contract_version == 2:
+        return CURRENT_COMMON + "\n" + CURRENT_ROLES[role] + " 只输出 content_markdown、passed、scientific_observation。正文说明查阅的运行/产物、结论、局限和需要的修订；不要求固定标题。不输出结构化 evidence、independent_replication、execution_checks、required_changes 或 limitations。"
     if discussion_protocol == 2:
         if role == Role.GOD:
             return god_final_prompt()
