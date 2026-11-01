@@ -157,8 +157,8 @@ def test_create_snapshot_timeline_and_frozen_settings(tmp_path):
     rid = project["research_id"]
     assert c.post("/api/research", json=body).json()["research_id"] == rid
     snapshot = c.get(f"/api/research/{rid}/snapshot").json()
-    assert snapshot["topology"]["agent_count"] == 17
-    assert len(snapshot["agents"]) == 17
+    assert snapshot["topology"]["agent_count"] == 18
+    assert len(snapshot["agents"]) == 18
     assert snapshot["project"]["mode"] == "demo"
     assert snapshot["snapshot_seq"] == 1
     timeline = c.get(f"/api/research/{rid}/timeline?after=0").json()

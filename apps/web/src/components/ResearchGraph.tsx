@@ -3,7 +3,7 @@ import { Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow,
 import type { Node, NodeProps, NodeChange } from '@xyflow/react';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import { create } from 'zustand';
-import { ChevronDown, ChevronRight, Expand, FileText, FlaskConical, GitBranch, ListChecks, MessageSquare, Network, Play, Scale, Users } from 'lucide-react';
+import { ChevronDown, ChevronRight, Expand, Eye, FileText, FlaskConical, GitBranch, ListChecks, MessageSquare, Network, Play, Scale, Users } from 'lucide-react';
 import type { Data } from '../api';
 import { label } from '../api';
 import { activeArbitration, arbitrationPhase } from '../arbitrations';
@@ -11,9 +11,9 @@ import { activeArbitration, arbitrationPhase } from '../arbitrations';
 type ViewState = { selected: string | null; selectionKind: 'node' | 'edge'; collapsed: Record<string, boolean>; select: (id: string | null, kind?: 'node' | 'edge') => void; toggle: (id: string) => void };
 export const useGraphView = create<ViewState>(set => ({ selected: null, selectionKind: 'node', collapsed: {}, select: (id, kind = 'node') => set({ selected: id, selectionKind: kind }), toggle: id => set(state => ({ collapsed: { ...state.collapsed, [id]: !state.collapsed[id] } })) }));
 const elk = new ELK();
-const names: Record<string, string> = { boss: 'Boss Group', exploration: 'Exploration', critic: 'Critic', implementation: 'Implementation', verify: 'Verify', organizer: 'Organizer', paper: 'Paper', god: 'God' };
-const subtitles: Record<string, string> = { boss: '全局决策与共享记忆', exploration: '假设与实验设计', critic: '质疑与交叉审查', implementation: '实现、运行与监控', verify: '证据与结论验证', organizer: '本机资源安排', paper: '阶段实验报告', god:'组外自动仲裁与恢复' };
-const icons: Record<string, typeof Users> = { boss: Users, exploration: GitBranch, critic: ListChecks, implementation: Play, verify: FlaskConical, organizer: Network, paper: FileText, god: Scale };
+const names: Record<string, string> = { boss: 'Boss Group', exploration: 'Exploration', critic: 'Critic', implementation: 'Implementation', verify: 'Verify', organizer: 'Organizer', paper: 'Paper', god: 'God', watchdog: 'Watch Dog' };
+const subtitles: Record<string, string> = { boss: '全局决策与共享记忆', exploration: '假设与实验设计', critic: '质疑与交叉审查', implementation: '实现、运行与监控', verify: '证据与结论验证', organizer: '本机资源安排', paper: '阶段实验报告', god:'组外自动仲裁与恢复', watchdog:'定时巡检、诊断与在线修复' };
+const icons: Record<string, typeof Users> = { boss: Users, exploration: GitBranch, critic: ListChecks, implementation: Play, verify: FlaskConical, organizer: Network, paper: FileText, god: Scale, watchdog: Eye };
 const RoleNode = memo(function RoleNode({ id, data, selected }: NodeProps) {
   const toggle = useGraphView(s => s.toggle);
   const role = String(data.role || ''); const member = role.endsWith('_member');
@@ -28,7 +28,7 @@ const RoleNode = memo(function RoleNode({ id, data, selected }: NodeProps) {
 });
 const nodeTypes = { role: RoleNode };
 
-export default function ResearchGraph({ topology, lines, agents, arbitrations = [], researchId, executionStopped = false, onChoose }: { topology: Data; lines: Data[]; agents: Data[]; arbitrations?: Data[]; researchId: string; executionStopped?: boolean; onChoose?: () => void }) {
+export default function ResearchGraph({ topology, lines, agents, arbitrations = [], watchdogEvents = [], researchId, executionStopped = false, onChoose }: { topology: Data; lines: Data[]; agents: Data[]; arbitrations?: Data[]; watchdogEvents?: Data[]; researchId: string; executionStopped?: boolean; onChoose?: () => void }) {
   const collapsed = useGraphView(s => s.collapsed); const select = useGraphView(s => s.select);
   const selected = useGraphView(s => s.selected); const kind = useGraphView(s => s.selectionKind);
   const [nodes, setNodes] = useState<Node[]>([]); const [layoutError, setLayoutError] = useState(false);
@@ -61,7 +61,7 @@ export default function ResearchGraph({ topology, lines, agents, arbitrations = 
       const globalHeight = Math.max(94,...roots.filter(n => !n.data.line_id).map(height));
       const topNodes = roots.map(n => {
         let pos: Data;
-        if (!n.data.line_id) pos = {x:Math.max(0,['boss','organizer','paper','god'].indexOf(n.id))*218,y:0};
+        if (!n.data.line_id) pos = {x:Math.max(0,['boss','organizer','paper','god','watchdog'].indexOf(n.id))*218,y:0};
         else { const lane = lanes.indexOf(n.data.line_id); const spot = results[lane]?.children?.find(p => p.id === n.id); pos = {x:lane*218 + (spot?.x || 0),y:globalHeight+48+(spot?.y || 0)}; }
         return makeNode(n,saved[n.id] || pos);
       });
@@ -81,12 +81,13 @@ export default function ResearchGraph({ topology, lines, agents, arbitrations = 
     const active = arbitrations.filter(activeArbitration);
     const scopeRequest = arbitrations.filter(request => activeArbitration(request) || ['waiting_children','waiting_dependencies'].includes(request.resolution_status)).find(request => request.scope_id === n.id || request.scope_id?.includes(`:${n.id}:`) ||
       (request.line_id === n.data.line_id && request.scope_kind === role));
-    const resolvedStatus = n.id === 'god' ? active.length ? 'running' : 'idle' : scopeRequest ? 'arbitrating' : agent?.status || (phaseRole[phase] === role ? 'running' : current.status || 'idle');
+    const watchdogState = watchdogEvents.some(event => event.status === 'diagnosing') ? 'running' : watchdogEvents.some(event => event.status === 'needs_attention') ? 'blocked' : 'idle';
+    const resolvedStatus = n.id === 'watchdog' ? watchdogState : n.id === 'god' ? active.length ? 'running' : 'idle' : scopeRequest ? 'arbitrating' : agent?.status || (phaseRole[phase] === role ? 'running' : current.status || 'idle');
     const status = executionStopped && !['completed','failed','interrupted','cancelled'].includes(resolvedStatus) ? 'stopped' : resolvedStatus;
     return { ...n, selected: kind === 'node' && selected === n.id, data: { ...n.data, ...current, active_arbitrations:active.length,
       arbitration_phase:scopeRequest && !executionStopped ? arbitrationPhase(scopeRequest) : undefined,
       unread:Math.max(0,Number(current.message_count||0)-(readMarks[n.id]?.count||0)), expanded:!!collapsed[n.id], status } };
-  }), [nodes, raw, lines, agents, arbitrations, selected, kind, collapsed,readMarks,executionStopped]);
+  }), [nodes, raw, lines, agents, arbitrations, watchdogEvents, selected, kind, collapsed,readMarks,executionStopped]);
   const edges = useMemo(() => rawEdges.filter(e => nodes.some(n => n.id === e.source) && nodes.some(n => n.id === e.target)).map(e => ({ ...e, id: e.id, source: e.source, target: e.target, type: 'smoothstep', label: selected === e.id ? e.label : e.data?.message_count ? String(e.data.message_count) : '', selected: kind === 'edge' && selected === e.id, markerEnd: { type: MarkerType.ArrowClosed, width: 13, height: 13 }, style: { stroke: selected === e.id ? '#1b6c80' : '#b7c4c7', strokeWidth: selected === e.id ? 2 : 1.2 }, labelStyle: { fontSize: 11, fill: '#5d5f60' }, labelBgStyle: { fill: '#fbfcfc' }, interactionWidth: 22 })), [rawEdges, nodes, selected, kind]);
   const changes = (changes: NodeChange[]) => setNodes(ns => applyNodeChanges(changes, ns));
   return <div className="graph-wrap"><div className="graph-caption"><span><span className="connection-dot"/>研究组织</span><select aria-label="查看研究线" value={activeScope} onChange={e => setScope(e.target.value)}><option value="all">全部研究线</option>{lineIds.map(l => <option key={l} value={l}>{l.replace('line-','研究线 ')}</option>)}</select></div>{layoutError && <div className="notice">自动布局不可用，已使用基础布局。</div>}<ReactFlow key={activeScope} nodes={stateNodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={changes} onNodeClick={(_, n) => { select(n.id); onChoose?.(); }} onEdgeClick={(_, e) => { select(e.id, 'edge'); onChoose?.(); }} onPaneClick={() => select(null)} onNodeDragStop={(_, n) => { if (n.parentId) return; const storageKey=`autoresearch:layout-v2:${researchId}:${activeScope}`; const saved = JSON.parse(localStorage.getItem(storageKey) || '{}'); saved[n.id] = n.position; localStorage.setItem(storageKey, JSON.stringify(saved)); }} fitView fitViewOptions={{ padding: 0.12 }} minZoom={0.2} maxZoom={1.6} nodesConnectable={false} deleteKeyCode={null} proOptions={{ hideAttribution: true }}><Background color="#d7dfe0" gap={20} size={1}/><Controls showInteractive={false}/><MiniMap pannable zoomable nodeColor={n => n.data.status === 'running' ? '#1b6c80' : '#d8dfe0'} maskColor="rgba(244,247,247,.7)"/></ReactFlow><div className="graph-legend"><span><Users size={13}/>Group 可展开成员</span><span><MessageSquare size={13}/>连线关联实际交接</span><span className="text-button"><Expand size={13}/>拖动调整布局</span></div></div>;

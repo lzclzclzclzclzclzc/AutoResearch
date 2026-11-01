@@ -208,9 +208,9 @@ def test_stop_final_state_and_event_rollback_together(business, monkeypatch):
 def test_default_topology_has_seventeen_real_agent_identities(business):
     s, rid, _ = business
     snapshot = s.snapshot(rid)
-    assert snapshot["topology"]["agent_count"] == 17
-    assert len(snapshot["agents"]) == 17
-    assert len({x["agent_id"] for x in snapshot["agents"]}) == 17
+    assert snapshot["topology"]["agent_count"] == 18
+    assert len(snapshot["agents"]) == 18
+    assert len({x["agent_id"] for x in snapshot["agents"]}) == 18
 
 
 def test_boss_effect_replay_never_resets_cycle_or_increments_epoch_twice(business):

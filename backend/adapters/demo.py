@@ -164,6 +164,10 @@ class DemoRuntimeAdapter:
             if name == "Verification":
                 value = {key: value[key] for key in ("content_markdown", "passed", "scientific_observation")}
                 value["content_markdown"] += "\n依据运行 " + source_id + "，实际指标：" + str(metrics) + "。局限：合成数据、单次脚本演示，不代表真实科研证据；未完成时需修订实现或补齐结果。"
+        elif name == "WatchdogDecision":
+            tasks = context.get("event", {}).get("observation", {}).get("tasks", [])
+            value = {"content_markdown": content + "\n演示巡检发现缺少实际执行，从原任务检查点接续。",
+                "actions": [{"action": "resume_task", "target_id": tasks[0]["id"]}] if tasks else []}
         elif name == "BossDecision":
             value = boss_decision()
         elif name == "ResourceAdvice":

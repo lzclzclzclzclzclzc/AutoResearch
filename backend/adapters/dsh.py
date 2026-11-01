@@ -214,7 +214,8 @@ class DshRuntimeAdapter:
                         gate.release()
             project = await asyncio.to_thread(self.store.project, research_id)
             self._assert_arbitration_open(runtime_context)
-            if project["status"] in {"pausing", "paused", "blocked"}:
+            watchdog_recovery = runtime_context.get("watchdog_event_id") and project.get("blocked_reason") == "all_lines_blocked"
+            if project["status"] in {"pausing", "paused", "blocked"} and not (project["status"] == "blocked" and watchdog_recovery):
                 raise RuntimeBlocked("research_paused", "研究暂停期间不启动新的模型回合")
             if runtime_context.get("arbitration_id") and announced:
                 self.store.emit(research_id, "arbitration.capacity_acquired", {

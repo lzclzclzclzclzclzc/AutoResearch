@@ -54,7 +54,7 @@ class _DispatchDeferred(Exception):
 
 TERMINAL = {"terminating", "terminated", "completed", "quarantined"}
 DEFAULT_TEAM = {"n": 2, "m1": 2, "m2": 2, "k": 3, "boss_members": 3,
-                "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1}
+                "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1, "watchdog_interval_minutes": 10}
 
 
 class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMixin):
@@ -903,7 +903,7 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             if outbox and outbox.get("status") == "pending":
                 self._put(c, "outbox", outbox_id, {**outbox, "last_dispatch_error": reason}, outbox["research_id"])
 
-    def dispatch_outbox(self, control, limit=100, research_id=None):
+    def dispatch_outbox(self, control, limit=100, research_id=None, *, only_outbox_id=None, scope_guard=None):
         """At-least-once Verify delivery with idempotent durable recipient inboxes.
 
         The message is committed first. Its acknowledgement, all inbox receipts,
@@ -917,6 +917,9 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             if research_id is not None:
                 sql += " AND research_id=?"
                 args.append(research_id)
+            if only_outbox_id is not None:
+                sql += " AND id=?"
+                args.append(only_outbox_id)
             # Interleave projects and rotate attempts so an unavailable project's
             # old messages cannot monopolize every bounded Worker pass.
             candidates = [json.loads(row[0]) for row in c.execute("SELECT data FROM (" + sql +
@@ -926,12 +929,16 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             outbox_id, rid = candidate["id"], candidate["research_id"]
             try:
                 with self.connect(True) as c:
+                    if scope_guard:
+                        scope_guard(c)
                     current = self._get(c, "outbox", outbox_id)
                     if not current or current.get("status") != "pending":
                         continue
                     candidate = self._put(c, "outbox", outbox_id, {**current, "dispatch_attempted_at": now(),
                         "dispatch_attempts": current.get("dispatch_attempts", 0)+1}, rid)
                 with self.connect() as c:
+                    if scope_guard:
+                        scope_guard(c)
                     cycle, line, report = self._verification_handoff(c, candidate)
                 gate = self._handoff_gate(control, rid, candidate["control_generation"])
                 if gate != "allow":
@@ -946,6 +953,8 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                     cycle_id=cycle["id"], line_id=line_id, edge_id=edge_id, outbox_id=outbox_id,
                     submission_id=submission_id, artifact_refs=[], structured={"transition": payload, "verification": report})
                 with self.connect(True) as c:
+                    if scope_guard:
+                        scope_guard(c)
                     outbox = self._get(c, "outbox", outbox_id)
                     if not outbox or outbox.get("status") != "pending":
                         result["delivered" if outbox and outbox.get("status") == "delivered" else "cancelled"].append(outbox_id)
@@ -1716,6 +1725,7 @@ def build_topology(team):
         node(f"boss/member-{i:02d}", "boss_member", f"Boss {i}", "boss")
     node("organizer", "organizer", machine_shared=True)
     node("paper", "paper")
+    node("watchdog", "watchdog", "Watch Dog")
     edge("boss", "paper", "报告任务")
     for n in range(1, team["n"]+1):
         line = f"line-{n:02d}"
@@ -1731,4 +1741,4 @@ def build_topology(team):
             (f"{line}/implementation", "organizer", "申请与授权"), (f"{line}/implementation", f"{line}/verify", "送验"),
             (f"{line}/verify", "boss", "验证汇报"), (f"{line}/verify", f"{line}/exploration", "修订意见")):
             edge(source,target,label)
-    return {"nodes": nodes, "edges": edges, "agent_count": team["n"]*(team["m1"]+team["m2"]+2)+team["boss_members"]+2}
+    return {"nodes": nodes, "edges": edges, "agent_count": team["n"]*(team["m1"]+team["m2"]+2)+team["boss_members"]+3}

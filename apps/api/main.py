@@ -41,6 +41,7 @@ class Team(Input):
     max_runtime_seconds: int = Field(default=3600, ge=1, le=31536000)
     model_concurrency: int = Field(default=4, ge=1)
     experiment_concurrency: int = Field(default=1, ge=1)
+    watchdog_interval_minutes: int = Field(default=10, ge=1, strict=True)
 
 
 class Research(Input):
@@ -409,6 +410,10 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         nodes = topology.setdefault("nodes", [])
         if not any(node["id"] == "god" for node in nodes):
             nodes.append({"id": "god", "type": "role", "data": {"role": "god", "label": "God", "status": "idle"}})
+        if not any(node["id"] == "watchdog" for node in nodes):
+            nodes.append({"id": "watchdog", "type": "agent", "data": {"role": "watchdog", "label": "Watch Dog", "status": "idle"}})
+        result["watchdog_events"] = s.list("watchdog_event", research_id)
+        result["watchdog_actions"] = s.list("watchdog_action", research_id)
         return _public(result)
 
     @app.get("/api/research/{research_id}/arbitrations")

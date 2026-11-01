@@ -300,6 +300,10 @@ class ResearchEngine:
                    publish_message=True, reply_to=None, output_validator=None):
         project = await self.guard(research_id)
         context = dict(context)
+        root_task = current_task.get() or {}
+        task_record = self.store.get("task", root_task.get("id", "")) or {}
+        if task_record.get("watchdog_prompts"):
+            context["watchdog_repair_instructions"] = task_record["watchdog_prompts"]
         plan = context.get("spec") or context.get("submission", {}).get("spec", {})
         if plan.get("discussion_protocol") == 2:
             context.setdefault("discussion_protocol", 2)
@@ -370,6 +374,10 @@ class ResearchEngine:
                 if generation_budget:
                     generation_budget.record(generation_attempt, "returned", output=result)
                 result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
+                for instruction in context.get("watchdog_repair_instructions", []):
+                    operation = self.store.get("watchdog_action", instruction["operation_id"])
+                    if operation and not operation.get("consumed_by"):
+                        self.store.patch("watchdog_action", operation["id"], consumed_by={"agent_id": agent_id, "task_id": task_id, "turn_id": turn_id})
                 if generation_budget:
                     generation_budget.record(generation_attempt, "accepted", output=result)
                 break

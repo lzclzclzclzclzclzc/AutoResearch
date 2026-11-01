@@ -264,6 +264,8 @@ async def run_worker(data_dir, control_url, runner_url):
 
     async with AsyncSqliteSaver.from_conn_string(str(Path(data_dir).resolve() / "checkpoints.sqlite")) as saver:
         engine = ResearchEngine(store, control, runner, credentials, saver)
+        from backend.runtime.watchdog import WatchdogService
+        watchdog = WatchdogService(engine)
         graphs = {"supervisor": ResearchSupervisorGraph(engine.supervisor, saver),
                   "boss": BossDecisionGraph(engine.boss, saver), "paper": PaperGraph(engine.paper, saver),
                   "communication": CommunicationGraph(engine.communication, saver),
@@ -439,6 +441,7 @@ async def run_worker(data_dir, control_url, runner_url):
                                 if hasattr(control, "complete_project"):
                                     await asyncio.to_thread(control.complete_project, project["id"])
                                 store.emit(project["id"], "research.completed", {})
+                    await watchdog.poll({task_id for task_id, task in active.items() if not task.done()})
                 except Exception as error:
                     # Busy or unavailable business storage never blocks the independent stop service.
                     print(json.dumps({"event": "worker_storage_unavailable", "code": type(error).__name__}), flush=True)
@@ -447,6 +450,7 @@ async def run_worker(data_dir, control_url, runner_url):
                 except asyncio.TimeoutError:
                     pass
         finally:
+            await watchdog.close()
             for task in list(active.values()):
                 task.cancel()
             await asyncio.gather(*list(active.values()), return_exceptions=True)

@@ -1,5 +1,6 @@
 import type { Data } from './api';
 import { activeArbitration, projectArbitrations } from './arbitrations.ts';
+import { projectWatchdog } from './watchdog.ts';
 
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) : Number.NaN;
 const ident = (x: Data) => x.run_id || x.experiment_run_id || x.id;
@@ -8,6 +9,7 @@ const ident = (x: Data) => x.run_id || x.experiment_run_id || x.id;
 export function projectHistory(snapshot: Data, allEvents: Data[], seq: number): Data {
   const events = allEvents.filter(e => e.seq <= seq);
   const arbitrations = projectArbitrations(snapshot.arbitrations || [], allEvents, seq);
+  const watchdog = projectWatchdog(allEvents, seq);
   const asOf = at(events.at(-1)?.occurred_at || snapshot.project?.created_at);
   const phase = (id: string) => events.filter(e => e.line_id === id && e.type === 'line.phase_changed').at(-1)?.payload || {};
   const executions = (snapshot.executions || []).filter((x: Data) => at(x.started_at || x.created_at) <= asOf).map((x: Data) => {
@@ -44,7 +46,7 @@ export function projectHistory(snapshot: Data, allEvents: Data[], seq: number): 
   return {...snapshot,project:{...snapshot.project,status,
       error:status === 'blocked' ? lifecycleEvent?.payload?.error : undefined,
       blocked_reason:status === 'blocked' ? lifecycleEvent?.payload?.reason : undefined},snapshot_seq:seq,recent_events:events,
-    topology:{...snapshot.topology,nodes,edges},agents,executions,runs,submissions,arbitrations,
+    topology:{...snapshot.topology,nodes,edges},agents,executions,runs,submissions,arbitrations,...watchdog,
     lines:(snapshot.lines || []).map((l: Data) => {
       const state = phase(l.line_id); const verify = events.filter(e => e.line_id === l.line_id && e.type === 'verification.completed').at(-1)?.payload;
       return {...l,...state,phase:state.phase || 'idle',direction_epoch:state.direction_epoch || 1,completed_verify_rounds:verify?.round_no || verify?.round || 0};
