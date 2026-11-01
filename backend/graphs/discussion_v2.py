@@ -9,6 +9,7 @@ import asyncio
 from copy import deepcopy
 
 from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
+from backend.persistence.conversation_views import conversation_metadata
 from packages.contracts.research import (
     DiscussionFinal, DiscussionTurn, EndBallot, OrdinaryBallot, allowed_next_steps, digest,
 )
@@ -95,7 +96,8 @@ class MemberDiscussion:
             raise ValueError("讨论必须登记非空且不重复的成员")
         self.store.create_conversation(research_id, discussion_id, kind="group_discussion",
             title=role + " 组内讨论", protocol_version=2,
-            participants=[{"type": "agent", "id": m} for m in members], line_id=line_id)
+            participants=[{"type": "agent", "id": m} for m in members], line_id=line_id,
+            summary_metadata=conversation_metadata(members[0], role, discussion_id, "discussion", context))
         state = self.store.initialize_discussion(discussion_id, {
             "protocol_version": 2, "research_id": research_id, "discussion_id": discussion_id,
             "role": role, "members": list(members), "order": order, "context": context,

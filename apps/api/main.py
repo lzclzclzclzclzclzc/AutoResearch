@@ -522,7 +522,11 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         for item in items:
             latest = s.messages(item["conversation_id"], limit=1, at_seq=at_seq)["items"]
             item["last_message"] = latest[-1] if latest else None
-        return _public({"items": items})
+        from backend.persistence.conversation_views import disambiguate_summaries, summarize_conversation
+        executions = s.list("execution", research_id) if at_seq is None else []
+        items = [summarize_conversation(item, [item["last_message"]] if item["last_message"] else [],
+            executions, state=s.get("discussion_state", item["conversation_id"]) if at_seq is None else None) for item in items]
+        return _public({"items": disambiguate_summaries(items)})
 
     @app.get("/api/conversations/{conversation_id:path}/messages")
     def conversation_messages(conversation_id: str, before: int | None = None, limit: int = 50, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):
