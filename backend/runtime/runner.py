@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -21,6 +22,38 @@ from .scientific_json import loads as scientific_loads,numeric_status
 
 HELD = ("granted", "starting", "running", "reconciling", "stopping", "releasing")
 TERMINAL = ("completed", "early_stopped", "execution_failed", "cancelled", "interrupted")
+
+
+def host_memory_failure(run: dict) -> dict | None:
+    """Only attributable host limit failures can request automatic expansion."""
+    if run.get("state") != "execution_failed" or not run.get("exit_code"):
+        return None
+    memory = run.get("memory_observation") or {}
+    limit = int(run.get("memory_bytes") or 0)
+    if not limit or memory.get("approved_memory_bytes") != limit:
+        return None
+    events = memory.get("memory_limit_events", [])
+    if events:
+        return {"kind": "host_memory_limit", "source": "windows_job_memory_limit", "events": events,
+            "approved_memory_bytes": limit, "peak_job_memory_bytes": memory.get("peak_job_memory_bytes"),
+            "experiment_run_id": run["experiment_run_id"]}
+    # Notifications are not guaranteed by Windows. A final unhandled host
+    # allocation exception and a measured Job commit peak near its cap together
+    # form a fallback; a log merely containing OOM or a GPU exception never does.
+    if int(memory.get("peak_job_memory_bytes") or 0) < limit * 0.85 or not run.get("log_path"):
+        return None
+    try:
+        with Path(run["log_path"]).open("rb") as stream:
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+            tail = stream.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if "Traceback (most recent call last):" in tail and re.search(
+            r"(?:^|\n)(?:MemoryError(?::[^\n]*)?|numpy\.[\w.]*_ArrayMemoryError:[^\n]*)$", tail):
+        return {"kind": "host_memory_limit", "source": "unhandled_host_allocation_exception",
+            "approved_memory_bytes": limit, "peak_job_memory_bytes": memory["peak_job_memory_bytes"],
+            "experiment_run_id": run["experiment_run_id"], "log_path": run["log_path"]}
+    return None
 
 
 def read_metrics(run:dict)->dict|list|None:
@@ -348,7 +381,8 @@ class ResourceService:
             if allocation["state"] == "released":
                 return current
             mutable=("pid","process_create_time","process_backend","started_at","exit_code","log_path","error",
-                "heartbeat_at","resource_sample","metrics_snapshot","metrics_sampled_at","metrics_numeric_status")
+                "heartbeat_at","resource_sample","metrics_snapshot","metrics_sampled_at","metrics_numeric_status",
+                "memory_observation","oom_evidence")
             details=proof.get("run_details",{})
             current.update({key:details[key] for key in mutable if key in details})
             current.update(state=final_state, terminal_proof=proof, stop_reason=reason, ended_at=iso_now())
@@ -668,6 +702,15 @@ class RunnerSupervisor:
         self._cancelled.add(run_id)
         actual_exited = exited
         terminal_state = run["state"]
+        process = self._processes.get(run_id)
+        if process and hasattr(process, "memory_snapshot"):
+            try:
+                run["memory_observation"] = process.memory_snapshot()
+            except OSError:
+                pass  # no verified limit evidence means no automatic expansion
+        oom = host_memory_failure(run)
+        if oom:
+            run["oom_evidence"] = oom
         metrics=read_metrics(run)
         if metrics is not None:
             run.update(metrics_snapshot=metrics,metrics_sampled_at=iso_now(),metrics_numeric_status=numeric_status(metrics))
@@ -685,7 +728,8 @@ class RunnerSupervisor:
         if exited:
             proof = self._proof(run, run.get("recovery_proof_reason", "process_tree_exited"))
             proof["run_details"]={key:run[key] for key in ("pid","process_create_time","process_backend","started_at","exit_code",
-                "log_path","error","heartbeat_at","resource_sample","metrics_snapshot","metrics_sampled_at","metrics_numeric_status") if key in run}
+                "log_path","error","heartbeat_at","resource_sample","metrics_snapshot","metrics_sampled_at","metrics_numeric_status",
+                "memory_observation","oom_evidence") if key in run}
             try:
                 final = self.service.release(proof, run["state"], run.get("stop_reason"))
                 with self._state_lock:
@@ -856,6 +900,9 @@ class RunnerSupervisor:
                     pass
             heartbeat = {"heartbeat_at": iso_now(), "resource_sample": {
                 "cpu_seconds": cpu, "memory_rss_bytes": rss, "process_count": count, "sampled_at": iso_now()}}
+            managed = self._processes.get(run["experiment_run_id"])
+            if managed and hasattr(managed, "memory_snapshot"):
+                heartbeat["memory_observation"] = managed.memory_snapshot()
             metrics=read_metrics(run)
             if metrics is not None:
                 heartbeat.update(metrics_snapshot=metrics,metrics_sampled_at=iso_now(),metrics_numeric_status=numeric_status(metrics))

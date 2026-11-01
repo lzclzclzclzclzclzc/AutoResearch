@@ -96,6 +96,8 @@ class LineState(TypedDict, total=False):
     implementation_route: str
     run_route: str
     implementation_recovery_id: str
+    experiment_attempt: int
+    memory_budget_bytes: int
 
 
 class ResearchEngine:
@@ -123,9 +125,9 @@ class ResearchEngine:
         for source, target in (("design", "implement"),
                                ("run_experiment", "assess_run"), ("package", "verify"), ("verify", "route_result")):
             graph.add_edge(source, target)
-        graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement"})
+        graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement", "package": "package"})
         graph.add_conditional_edges("implement", lambda state: state.get("implementation_route", "organize"), {"organize": "organize", "package": "package", "design": "design", "implement": "implement"})
-        graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package"})
+        graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package", "retry_memory": "organize"})
         graph.add_conditional_edges("route_result", lambda state: "design" if state["route"] == "exploration_and_critic" else END,
                                     {"design": "design", END: END})
         self.line_graph = graph.compile(checkpointer=checkpointer)
@@ -1065,16 +1067,20 @@ class ResearchEngine:
             if (chain.get("source_task_id") == state["task_id"] and chain.get("scope_id") == state["cycle_id"] and
                     chain.get("resume_point") == "line.implement" and chain["status"] not in {"fulfilled", "cancelled"}):
                 self.store.close_recovery_chain(chain["id"])
-        return {"implementation_id": implementation_id, "implementation_route": "organize", "implementation_recovery_id": ""}
+        return {"implementation_id": implementation_id, "implementation_route": "organize", "implementation_recovery_id": "",
+            "experiment_attempt": 1, "memory_budget_bytes": 0}
 
     async def organize(self, state):
         await self.line_open(state)
         p = await self.guard(state["research_id"])
         self.store.update_line(state["research_id"], state["line_id"], phase="organizer")
         spec, impl = self.spec(state), self.store.get("implementation", state["implementation_id"])
-        request = {"resource_request_id": state["implementation_id"] + ":resources", "research_id": state["research_id"], "line_id": state["line_id"],
+        attempt = state.get("experiment_attempt", 1)
+        request_id = state["implementation_id"] + (":resources" if attempt == 1 else f":attempt-{attempt}:resources")
+        request = {"resource_request_id": request_id, "research_id": state["research_id"], "line_id": state["line_id"],
             "implementation_agent_id": f"{state['line_id']}/implementation", "spec_id": spec.spec_id, "spec_version": spec.version,
-            "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"], "memory_bytes": impl["memory_mb"] * 1024 * 1024,
+            "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"],
+            "memory_bytes": state.get("memory_budget_bytes") or impl["memory_mb"] * 1024 * 1024, "experiment_attempt": attempt,
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
@@ -1083,6 +1089,10 @@ class ResearchEngine:
         request["priority"] = advice["priority"]
         allocation = await self.wait_for_allocation(state, request)
         if allocation["state"] == "unsatisfiable":
+            if attempt > 1:
+                self.store.put("memory_retry_stop", state["run_id"], {"reason": "capacity_changed",
+                    "allocation": allocation, "implementation_id": state["implementation_id"], "spec_id": state["spec_id"]}, state["research_id"])
+                return {"allocation_route": "package"}
             self.store.put("resource_feedback", state["spec_id"], allocation, state["research_id"])
             return {"allocation_route": "implement", "code_attempt": state.get("code_attempt", 1) + 1}
         return {"allocation_id": allocation["allocation_id"], "allocation_route": "run_experiment"}
@@ -1228,9 +1238,26 @@ class ResearchEngine:
             allocation = await self.wait_for_allocation(state, allocation)
         self.store.update_line(state["research_id"], state["line_id"], phase="running")
         impl = self.store.get("implementation", state["implementation_id"])
-        run_id = state["implementation_id"] + ":run-1"
+        attempt = state.get("experiment_attempt", 1)
+        run_id = state["implementation_id"] + f":run-{attempt}"
+        # Every new attempt has its own outputs. Replayed/admitted runs retain
+        # their actual original cwd, including pre-upgrade run-1 identities.
+        prior = await asyncio.to_thread(self.runner.status, run_id) if allocation.get("bound_run_id") else {}
+        workspace = Path(prior.get("cwd") or (Path(impl["cwd"]).parent / (Path(impl["cwd"]).name + "-runs") / f"attempt-{attempt}"))
+        if not prior.get("cwd"):
+            workspace.mkdir(parents=True, exist_ok=True)
+            for relative, source in impl["files"].items():
+                target = (workspace / relative).resolve()
+                if not target.is_relative_to(workspace.resolve()):
+                    raise RuntimeBlocked("unsafe_code_path", "实验尝试源文件越出工作区")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    if target.read_bytes() != source.encode("utf-8"):
+                        raise RuntimeBlocked("attempt_source_changed", "实验尝试源文件与原实现不一致")
+                else:
+                    target.write_bytes(source.encode("utf-8"))
         payload = {**allocation, "experiment_run_id": run_id, "start_operation_id": run_id + ":start", "command": [sys.executable, "-u", impl["entrypoint"], *impl["arguments"]],
-                   "cwd": impl["cwd"], "code_version": impl["code_version"]}
+                   "cwd": str(workspace), "code_version": impl["code_version"]}
         try:
             run = await asyncio.to_thread(self.runner.start, payload)
         except Exception:
@@ -1297,6 +1324,9 @@ class ResearchEngine:
         line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
         if run.get("state") in {"completed", "succeeded"} or line.get("finish_requested"):
             return {"run_route": "package"}
+        memory_retry = await self.memory_retry_decision(state, run)
+        if memory_retry:
+            return memory_retry
         logs = await self.collect_run_logs(state["run_id"])
         assessment = await self.turn(state["research_id"], f"{state['line_id']}/implementation", "implementation", state["run_id"], "assess_failure", RunAssessment,
             {"instruction": "保留全部失败与提前停止证据。仅实现错误可在固定科学设置内修复并重新申请资源；科学方案需修订则封包送验，不能偷改计划。无有用修复也封包送验。",
@@ -1304,6 +1334,36 @@ class ResearchEngine:
             conversation_id=state["run_id"] + ":assessment", line_id=state["line_id"])
         self.store.put("run_assessment", state["run_id"], {**assessment, "spec_id": state["spec_id"]}, state["research_id"])
         return {"run_route": "repair" if assessment["action"] == "repair_implementation" else "package", "code_attempt": state.get("code_attempt", 1) + 1}
+
+    async def memory_retry_decision(self, state, run):
+        evidence = run.get("oom_evidence") or {}
+        if (run.get("state") != "execution_failed" or evidence.get("kind") != "host_memory_limit" or
+                evidence.get("experiment_run_id") != state["run_id"] or evidence.get("approved_memory_bytes") != run.get("memory_bytes")):
+            return None
+        await self.line_open(state)
+        proof = run.get("terminal_proof") or {}
+        resources = await asyncio.to_thread(self.runner.resources)
+        allocation = next((a for a in resources.get("allocations", []) if a["allocation_id"] == run.get("allocation_id")), None)
+        if not proof.get("process_tree_exited") or not proof.get("start_operation_terminal") or not allocation or allocation["state"] != "released":
+            raise RuntimeBlocked("runner_unknown", "内存扩容等待前次进程树退出及旧授权释放证明")
+        current = int(run["memory_bytes"])
+        attempt = int(run.get("experiment_attempt") or state.get("experiment_attempt", 1))
+        cap = int(resources["capacity"]["memory_total_bytes"])
+        target = min(current * 2, cap)
+        reason = "retry_limit_reached" if attempt >= 3 else "capacity_limit_reached" if target <= current else None
+        proposed = {"implementation_id": state["implementation_id"], "spec_id": state["spec_id"],
+            "from_run_id": state["run_id"], "attempt": attempt, "approved_memory_bytes": current, "oom_evidence": evidence,
+            "target_attempt": attempt + 1, "target_memory_bytes": target, "stop_reason": reason,
+            "run_route": "package" if reason else "retry_memory"}
+        with self.store.connect(True) as c:
+            decision = self.store._get(c, "memory_retry", state["run_id"])
+            if not decision:
+                decision = self.store._put(c, "memory_retry", state["run_id"], proposed, state["research_id"])
+                self.store._emit(c, state["research_id"], "experiment.memory_retry_decided", proposed, line_id=state["line_id"])
+        if decision["run_route"] == "package":
+            return {"run_route": "package"}
+        return {"run_route": "retry_memory", "experiment_attempt": decision["target_attempt"],
+            "memory_budget_bytes": decision["target_memory_bytes"]}
 
     async def package(self, state):
         await self.guard(state["research_id"])
@@ -1324,19 +1384,23 @@ class ResearchEngine:
             log = await self.collect_run_logs(attempt_id)
             run_logs[attempt_id] = log
             for reference in log.get("artifacts", []):
-                if reference.get("kind") == "stdout_stderr" and reference.get("path"):
+                if reference.get("path"):
                     log_path = Path(reference["path"])
                     if log_path.is_file():
-                        artifacts.append(self.store.register_artifact(state["research_id"], log_path, "text/plain",
-                            line_id=state["line_id"], run_id=attempt_id, kind="experiment_log"))
+                        artifacts.append(self.store.register_artifact(state["research_id"], log_path,
+                            "application/json" if log_path.suffix == ".json" else "text/plain", line_id=state["line_id"],
+                            run_id=attempt_id, code_version=attempt_run["code_version"],
+                            kind="experiment_log" if reference.get("kind") == "stdout_stderr" else "experiment_artifact"))
         collected = run_logs[state["run_id"]]
         spec = self.spec(state)
         submission = {"cycle_id": state["cycle_id"], "line_id": state["line_id"], "spec_id": spec.spec_id, "spec_version": spec.version,
             "code_version": impl["code_version"], "code_versions": [item["code_version"] for item in implementations], "run_ids": [item.get("experiment_run_id", item["id"]) for item in runs], "runs": runs, "spec": spec.model_dump(), "run": run,
             "actual_config": impl["actual_config"], "artifacts": artifacts, "logs": collected, "run_logs": run_logs, "status": "awaiting_verification",
             "runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
-            "verification_contract_version": 2}
-        final_metrics = Path(impl["cwd"]) / "metrics.json"
+            "verification_contract_version": 2,
+            "memory_retries": [d for d in self.store.list("memory_retry", state["research_id"]) if d.get("spec_id") == state["spec_id"]],
+            "memory_retry_stops": self.store.list("memory_retry_stop", state["research_id"], spec_id=state["spec_id"])}
+        final_metrics = Path(run.get("cwd") or impl["cwd"]) / "metrics.json"
         if final_metrics.is_file():
             try:
                 from backend.runtime.scientific_json import loads as scientific_loads
