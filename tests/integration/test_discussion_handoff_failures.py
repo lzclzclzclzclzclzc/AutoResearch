@@ -12,7 +12,7 @@ from backend.persistence.store import Store
 from backend.runtime.control import ControlSupervisor
 from backend.runtime.generation_budget import GenerationBudget
 from packages.contracts.handoffs import validate_discussion_handoff
-from packages.contracts.research import EndBallot
+from packages.contracts.research import EndBallot, digest
 
 
 INCOMPLETE = {"content_markdown": "请补充实验设计，核查重复文本泄露。", "config_fingerprint": "abc", "key_metrics": {"f1": 0.8}}
@@ -97,6 +97,38 @@ async def test_incomplete_plan_can_return_to_exploration_without_becoming_execut
     result = await discuss(IncidentEngine(store, reply), project)
     assert result["next_step"] == "exploration"
     assert store.get("discussion_state", "incident-discussion")["failed_end_votes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_twenty_one_product_errors_do_not_erase_real_votes_or_consume_budget(tmp_path):
+    store = Store(tmp_path)
+    project = make_project(store)
+    interrupted = False
+    def reply(member, schema, context):
+        nonlocal interrupted
+        if schema == "DiscussionTurn":
+            return {"content_markdown": "原组修订", "end_vote": {
+                "final_output": COMPLETE if context["failed_end_votes"] else INCOMPLETE}}
+        if member == "C" and not interrupted:
+            interrupted = True
+            raise RuntimeBlocked("model_timeout", "legacy worker stopped here")
+        return {"approve": True, "next_step": "implementation"}
+    engine = IncidentEngine(store, reply)
+    with pytest.raises(RuntimeBlocked, match="legacy worker"):
+        await discuss(engine, project)
+    original = store.get("discussion_state", "incident-discussion")["active_vote"]
+    assert list(original["ballots"]) == ["A", "B"]
+    turn = "ballot:" + original["id"] + ":C"
+    key = digest(["incident-discussion", "C", turn, "EndBallot"])
+    store.put("discussion_model_call", key, {"technical_attempt": 21,
+        "last_error": "旧产物缺少 question、fixed、metrics"}, project["id"])
+    await discuss(engine, project)
+    state = store.get("discussion_state", "incident-discussion")
+    assert state["failed_end_votes"] == 1
+    assert state["votes"][0]["id"] == original["id"]
+    assert state["votes"][0]["output_hash"] == original["output_hash"]
+    assert state["votes"][0]["ballots"]["A"] == original["ballots"]["A"]
+    assert Counter(member for member, schema, _ in engine.calls if schema == "EndBallot") == {"A": 2, "B": 2, "C": 3}
 
 
 @pytest.mark.asyncio
