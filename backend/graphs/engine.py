@@ -319,15 +319,15 @@ class ResearchEngine:
             context["received_messages"] = await asyncio.to_thread(self.store.consume_agent_inbox, research_id,
                 agent_id, inbox_consumer, self.control, context.get("direction_epoch"))
         if publish_message:
-            self.store.create_conversation(research_id, conversation_id, kind=message_kind, title=context.get("instruction", role),
-                participants=[{"type": "agent", "id": agent_id}], line_id=line_id, summary_metadata=summary_metadata)
-        identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
-        private_score = not publish_message and context.get("discussion_protocol") != 2
             from backend.persistence.conversation_views import conversation_metadata
             summary_metadata = conversation_metadata(agent_id, role, task_id, turn_id, context)
             if role == "verify" and line_id:
                 summary_metadata["verify_round"] = next((line.get("completed_verify_rounds", 0) + 1
                     for line in self.store.lines(research_id) if line["line_id"] == line_id), None)
+            self.store.create_conversation(research_id, conversation_id, kind=message_kind, title=context.get("instruction", role),
+                participants=[{"type": "agent", "id": agent_id}], line_id=line_id, summary_metadata=summary_metadata)
+        identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
+        private_score = not publish_message and context.get("discussion_protocol") != 2
         instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1), verification_contract_version=context.get("verification_contract_version", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
         if context.get("discussion_protocol") == 2 and schema.__name__ in {"DiscussionTurn", "PollBallot", "OrdinaryBallot", "EndBallot"}:
             mode = {"DiscussionTurn": "discussion", "PollBallot": "ordinary_vote", "OrdinaryBallot": "ordinary_vote", "EndBallot": "end_vote"}[schema.__name__]
