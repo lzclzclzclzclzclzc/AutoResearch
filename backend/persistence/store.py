@@ -1673,7 +1673,10 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                 raise StoreError("artifact_identity_conflict", "产物身份已经绑定其他文件", 409)
             return existing
         # Mutable implementation workspaces are never the backing store for evidence.
-        destination = self.data_dir / "artifacts" / sha[:2] / sha[2:] / file_path.name
+        # Keep the original download name in metadata. Repeating a long run ID
+        # below a full content hash can exceed Windows' rename path limit.
+        # Existing artifact records continue to resolve their saved paths.
+        destination = self.data_dir / "artifacts" / sha[:2] / sha[2:] / ("content" + file_path.suffix)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             temporary = destination.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
