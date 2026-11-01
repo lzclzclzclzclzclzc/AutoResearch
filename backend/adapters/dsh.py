@@ -39,7 +39,7 @@ def parse_final_object(response, schema, *, finish_reason, record_repair, valida
         return schema.model_validate_json(response).model_dump()
     except ValueError as original:
         raw = response.rstrip()
-        if finish_reason != "completed" or not raw.startswith("{"):
+        if finish_reason != "completed" or not raw.lstrip().startswith("{"):
             raise
         try:
             json.loads(raw)

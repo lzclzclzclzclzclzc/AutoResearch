@@ -21,6 +21,7 @@ def test_single_missing_terminator_is_repaired_locally():
     assert audit == [{"original_response": '{"approve":true  \n',
                       "method": "append_single_right_brace", "adopted": True}]
     assert parse('{"approve":true}')[1] == []
+    assert parse('\n  {"approve":true')[0] == {"approve": True}
 
 
 @pytest.mark.parametrize("raw", [
