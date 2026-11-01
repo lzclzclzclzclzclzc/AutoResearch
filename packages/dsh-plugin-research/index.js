@@ -94,7 +94,8 @@ export function apply(ctx) {
   )
   const allowed = new Set([...(role === 'god' ? [] : ['web_search', 'web_fetch', 'todo_write']), ...definitions.map(([name]) => name)])
   // Monotonic guard also denies new tools accidentally added to future profiles.
-  ctx.tools.guard(execution => allowed.has(execution.name) ? undefined : 'This tool is outside the registered research role policy')
+  if (role !== 'watchdog')
+    ctx.tools.guard(execution => allowed.has(execution.name) ? undefined : 'This tool is outside the registered research role policy')
   for (const [name, description, parameters] of definitions) {
     ctx.tools.register({
       name, description, parameters,

@@ -64,6 +64,9 @@ async def sync_control_stops(store, control):
 async def sync_runner_states(store, runner):
     """Observation has no model/control dependency, including for stopped projects."""
     for saved in store.list("run"):
+        if (saved.get("state") in {"completed", "succeeded", "failed", "execution_failed", "early_stopped",
+                "cancelled", "terminated", "interrupted"} and saved.get("terminal_proof", {}).get("process_tree_exited")):
+            continue
         run_id = saved.get("experiment_run_id", saved["id"])
         try:
             current = await asyncio.to_thread(runner.status, run_id)

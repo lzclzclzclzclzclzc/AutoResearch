@@ -216,7 +216,10 @@ class DshRuntimeAdapter:
                         gate.release()
             project = await asyncio.to_thread(self.store.project, research_id)
             self._assert_arbitration_open(runtime_context)
-            watchdog_recovery = runtime_context.get("watchdog_event_id") and project.get("blocked_reason") == "all_lines_blocked"
+            watchdog_event = self.store.get("watchdog_event", runtime_context.get("watchdog_event_id", "")) or {}
+            watchdog_recovery = (watchdog_event.get("research_id") == research_id
+                and watchdog_event.get("status") == "diagnosing"
+                and watchdog_event.get("lease_token") == runtime_context.get("watchdog_lease_token"))
             if project["status"] in {"pausing", "paused", "blocked"} and not (project["status"] == "blocked" and watchdog_recovery):
                 raise RuntimeBlocked("research_paused", "研究暂停期间不启动新的模型回合")
             if runtime_context.get("arbitration_id") and announced:
@@ -228,6 +231,19 @@ class DshRuntimeAdapter:
                 gate.release()
 
     def _assert_arbitration_open(self, runtime_context):
+        wid = (runtime_context or {}).get("watchdog_event_id")
+        if wid:
+            event = self.store.get("watchdog_event", wid) or {}
+            if not event:
+                raise ResearchStopped("Watch Dog 诊断记录已经失效")
+            project = self.store.project(event.get("research_id", ""))
+            line = self.store.get("line", project["id"] + ":" + event.get("line_id", "")) or {}
+            if (event.get("status") != "diagnosing"
+                    or event.get("lease_token") != runtime_context.get("watchdog_lease_token")
+                    or project["status"] not in {"running", "blocked"} or project.get("stop_reason")
+                    or line.get("finish_requested") or line.get("direction_epoch") != event.get("direction_epoch")
+                    or line.get("cycle_id") != event.get("cycle_id")):
+                raise ResearchStopped("Watch Dog 诊断范围已经停止或失效")
         aid = (runtime_context or {}).get("arbitration_id")
         if aid:
             request = self.store.get("arbitration_request", aid)

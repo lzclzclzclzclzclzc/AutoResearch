@@ -158,6 +158,15 @@ class ResearchEngine:
         chain_id = kwargs.pop("recovery_chain_id", None)
         original_bound = inspect.signature(self._turn).bind(research_id, agent_id, *args, **kwargs)
         original_bound.apply_defaults()
+        root = current_task.get() or {}
+        watchdog_generation = root.get("watchdog_recovery_generation", 0)
+        if watchdog_generation:
+            original_bound.arguments["turn_id"] += f":watchdog-{watchdog_generation}"
+            context = dict(original_bound.arguments["context"])
+            if context.get("generation_budget"):
+                context["generation_budget"] = {**context["generation_budget"],
+                    "key": [context["generation_budget"]["key"], "watchdog", watchdog_generation]}
+            original_bound.arguments["context"] = context
         if recovery_suffix():
             original_bound.arguments["turn_id"] += recovery_suffix()
             original_bound.arguments["context"] = {**original_bound.arguments["context"],
@@ -305,7 +314,8 @@ class ResearchEngine:
         root_task = current_task.get() or {}
         task_record = self.store.get("task", root_task.get("id", "")) or {}
         if task_record.get("watchdog_prompts"):
-            context["watchdog_repair_instructions"] = task_record["watchdog_prompts"]
+            context["watchdog_repair_instructions"] = [instruction for instruction in task_record["watchdog_prompts"]
+                if not (self.store.get("watchdog_action", instruction["operation_id"]) or {}).get("consumed_by")]
         plan = context.get("spec") or context.get("submission", {}).get("spec", {})
         if plan.get("discussion_protocol") == 2:
             context.setdefault("discussion_protocol", 2)

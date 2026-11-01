@@ -69,12 +69,9 @@ class MemberDiscussion:
         saved = self.store.get("discussion_model_call", key) or {}
         if saved.get("output") is not None:
             return saved["output"]
-        # Legacy technical counters may include product defects (the incident
-        # had 21). Only this version's actual generations use the new budget.
-        attempt = saved.get("technical_attempt", 0) if saved.get("generation_contract_version") == 2 else 0
+        # GenerationBudget owns the limit. Recovery may version its binding
+        # without replacing this discussion or any previously accepted ballots.
         context = {**context, "generation_budget": {"kind": "discussion_generation", "key": key, "limit": 3}}
-        if attempt >= 3:
-            raise RuntimeBlocked("discussion_output_exhausted", "该成员同一逻辑回合的三次生成已耗尽：" + saved.get("last_error", ""))
         if schema is not DiscussionFinal and hasattr(self.engine, "control"):
             line = self.store.get("line", state["research_id"] + ":" + state["line_id"]) if state.get("line_id") else None
             context["received_messages"] = await asyncio.to_thread(self.store.consume_agent_inbox,
@@ -89,7 +86,7 @@ class MemberDiscussion:
         except RuntimeBlocked as error:
             if error.code == "generation_budget_exhausted":
                 self.store.put("discussion_model_call", key, {"generation_contract_version": 2,
-                    "technical_attempt": 3, "last_error": str(error), "member_id": member,
+                    "last_error": str(error), "member_id": member,
                     "logical_turn": turn_id}, state["research_id"])
                 self.store.commit_discussion_state(state, state, [self._message(state,
                     "generation-exhausted:" + key, "讨论回复纠正失败 · 成员 " + member + "：" + str(error),
@@ -99,11 +96,11 @@ class MemberDiscussion:
                 # A resumed technical call must be able to correct the current
                 # member's malformed response without recasting accepted ballots.
                 self.store.put("discussion_model_call", key,
-                    {"generation_contract_version": 2, "technical_attempt": attempt + 1,
+                    {"generation_contract_version": 2,
                         "last_error": str(error), "member_id": member, "logical_turn": turn_id}, state["research_id"])
                 raise RuntimeBlocked("discussion_technical_failure", str(error)) from error
             raise
-        self.store.put("discussion_model_call", key, {"generation_contract_version": 2, "technical_attempt": attempt,
+        self.store.put("discussion_model_call", key, {"generation_contract_version": 2,
             "output": output}, state["research_id"])
         return output
 

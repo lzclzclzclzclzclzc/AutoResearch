@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -24,9 +26,10 @@ class WatchdogDecision(Contract):
     actions: list[WatchdogAction] = Field(default_factory=list)
 
 
-WATCHDOG_PROMPT = """你是独立的 Watch Dog，不占科研组发言顺序。先分析本线阻塞快照、最后成功步骤、错误、票、产物版本、任务、Runner 和已试动作，再选择在线修复。
-可以跨组读取本项目状态和证据，通过 read_watchdog_state 分页读取。可组合注入原 Agent 下次生成的具体修订提示(inject_prompt，target_id 为原任务)、从原检查点恢复任务(resume_task)、补送已提交交接(redeliver_handoff)、按Runner真实回执同步运行(reconcile_run)。目标必须来自本项目快照。不要重复没有进展的动作；无法修复时说明待补条件。
-不能代投、修改冻结产物、改写科学结论或编造实验结果。用户停止、暂停、总截止时间和方向失效优先。仅输出指定 JSON，正文说明诊断依据和每项动作的目的。"""
+WATCHDOG_PROMPT = """你是独立的 Watch Dog。程序已发现一条研究线没有有效活动步骤，下面只提供定位线索和本地路径。请使用本地文件、搜索和命令工具自行调查原因，按需读取数据库、事件、会话、日志、代码和执行现场，再在线修复。
+business.sqlite 的 documents 表保存 kind/id/research_id/data(JSON)，events 和 messages 表保存事件和消息。可读取仓库里的 Store、Runner 和图执行代码了解记录及恢复接口。查询当前项目和方向，写入业务数据时优先复用现有事务及幂等操作。
+五种修复动作可通过 apply_watchdog_action 使用，也可用本地工具采取其他合适的修复方式。注入提示和恢复任务的 target_id 是原任务ID；重建丢失任务用研究线ID，补送交接用outbox ID，同步运行用run ID。结合实际记录说明原因、动作和验证结果，保留原票和真实实验历史。用户停止、暂停、总截止时间及方向失效优先。
+返回指定 JSON。actions 可为空，正文说明调查结果、本地工具已做的修复及待补条件。"""
 
 
 def clock_time():
@@ -44,14 +47,26 @@ class WatchdogService:
         self.active = {}
 
     def allowed(self, project):
-        return (project['status'] == 'running' or project['status'] == 'blocked'
-                and project.get('blocked_reason') == 'all_lines_blocked') and not project.get('stop_reason') and (
+        return project['status'] in {'running', 'blocked'} and not project.get('stop_reason') and (
                 parse_time(project.get('deadline_at')) is not None and parse_time(project['deadline_at']) > self.clock())
 
-    def snapshot(self, rid):
-        kinds = ('line', 'task', 'execution', 'run', 'allocation', 'outbox', 'discussion', 'discussion_state', 'group_discussion',
-                 'discussion_model_call', 'generation_budget', 'verification', 'submission', 'watchdog_action', 'watchdog_event')
-        return {kind: self.store.list(kind, rid) for kind in kinds}
+    def diagnostic_context(self, project, event):
+        line = self.store.get('line', project['id'] + ':' + event['line_id']) or {}
+        root = self.store.data_dir
+        observation = event.get('observation', {})
+        return {'location': {'event_id': event['id'], 'research_id': project['id'],
+            'project_title': project.get('title'), 'project_status': project['status'],
+            'project_error': project.get('error'), 'line_id': event['line_id'],
+            'direction_epoch': event['direction_epoch'], 'cycle_id': event.get('cycle_id'),
+            'spec_id': line.get('active_spec_id'), 'deadline_at': project.get('deadline_at'),
+            'phase': line.get('phase'), 'reason': observation.get('reason'),
+            'tasks': observation.get('tasks', []), 'outbox_ids': observation.get('outboxes', []),
+            'run_ids': [run.get('experiment_run_id', run.get('id')) for run in observation.get('runs', [])]},
+            'paths': {'repository': str(Path(__file__).resolve().parents[2]),
+                'data_dir': str(root), 'business_db': str(self.store.path),
+                'checkpoints_db': str(root / 'checkpoints.sqlite'),
+                'project_dir': str(root / 'projects' / project['id']),
+                'input_dir': project.get('workspace_path'), 'python': sys.executable}}
 
     @staticmethod
     def _current_scope(item, line):
@@ -152,8 +167,10 @@ class WatchdogService:
         # A pending/running label alone does not establish activity. The Worker
         # gets another scheduling pass before the second independent inspection.
         return {'state': 'stalled', 'reason': 'no_live_step', 'tasks': [
-            {key: t.get(key) for key in ('id', 'version', 'kind', 'status', 'error')} for t in tasks],
-            'outboxes': [o['id'] for o in self.store.list('outbox', rid) if o.get('status') == 'pending'],
+            {key: t.get(key) for key in ('id', 'kind', 'status', 'error', 'created_at', 'completed_at', 'retry_not_before')}
+            for t in tasks if t['status'] not in {'completed', 'cancelled'}],
+            'outboxes': [o['id'] for o in self.store.list('outbox', rid) if o.get('status') == 'pending'
+                and (self.store.get('cycle', o.get('payload', {}).get('cycle_id', '')) or {}).get('line_id') == lid],
             'line_phase': line.get('phase')}
 
     def _assert_scope(self, connection, event, lease_token=None):
@@ -227,8 +244,11 @@ class WatchdogService:
                 for event in list(pending):
                     operations = [self.store.get('watchdog_action', aid) or {} for aid in event.get('action_ids', [])]
                     progress = next((op for op in operations if self._actual_progress(op)), None)
-                    if progress:
-                        updated = self.store.patch('watchdog_event', event['id'], status='repaired', verified_progress=progress['id'])
+                    native_progress = (event.get('status') == 'awaiting_progress'
+                        and observation['state'] in {'active', 'skip'})
+                    if progress or native_progress:
+                        updated = self.store.patch('watchdog_event', event['id'], status='repaired',
+                            verified_progress=progress['id'] if progress else observation)
                         self.store.emit(rid, 'watchdog.progress_verified', {'event': updated}, line_id=line['line_id'])
                         pending.remove(event)
                 if observation['state'] != 'stalled':
@@ -256,7 +276,7 @@ class WatchdogService:
                             continue
                         if parse_time(event.get('lease_until')) and parse_time(event['lease_until']) > self.clock():
                             continue
-                    event = self.store._put(c, 'watchdog_event', event_id, {**event, 'status': 'diagnosing',
+                    event = self.store._put(c, 'watchdog_event', event_id, {**event, 'status': 'diagnosing', 'observation': observation,
                         'lease_token': secrets.token_hex(16),
                         'lease_until': (self.clock() + timedelta(minutes=interval)).isoformat()}, rid)
                     self.store._emit(c, rid, 'watchdog.diagnosing', {'event': event}, line_id=line['line_id'])
@@ -290,9 +310,7 @@ class WatchdogService:
         round_no = event.get('diagnosis_round', 0) + 1
         binding = {'kind': 'watchdog_generation', 'key': [eid, round_no], 'limit': 3}
         budget = GenerationBudget(self.store, rid, binding)
-        from backend.graphs.engine import god_prompt_context
-        context = {'event': event, 'project_state': god_prompt_context(self.snapshot(rid)),
-                   'read_instruction': '完整项目记录使用 read_watchdog_state(section, offset) 分页，snapshot_manifest 的 section 名即读取参数。'}
+        context = self.diagnostic_context(project, event)
         adapter = self.engine.demo if project['mode'] == 'demo' else self.engine.live
         prompt = WATCHDOG_PROMPT + '\n' + json.dumps(context, ensure_ascii=False, default=str) + '\n' + json.dumps(WatchdogDecision.model_json_schema(), ensure_ascii=False)
         if budget.corrections():
@@ -317,6 +335,10 @@ class WatchdogService:
                         'watchdog_lease_token': event.get('lease_token'), 'line_id': event['line_id'], 'max_output_tokens': token_limit})
                 budget.record(attempt, 'returned', output=raw)
                 decision = WatchdogDecision.model_validate(raw).model_dump()
+                for action in decision['actions']:
+                    if not self._diagnostic_current(event):
+                        return
+                    await asyncio.to_thread(self.apply, eid, action, event.get('lease_token'))
                 budget.record(attempt, 'accepted', output=decision)
                 break
             except (ConnectionError, TimeoutError) as error:
@@ -349,11 +371,6 @@ class WatchdogService:
         if not self._diagnostic_current(event):
             return
         self.store.create_message(rid, conversation, 'watchdog', decision['content_markdown'], source_event_id=eid + ':' + str(round_no), kind='watchdog')
-        applied = []
-        for action in decision['actions']:
-            if not self._diagnostic_current(event):
-                return
-            applied.append(await asyncio.to_thread(self.apply, eid, action, event.get('lease_token')))
         action_ids = [a['id'] for a in self.store.list('watchdog_action', rid, event_id=eid)]
         updated = self._commit_diagnostic(event, status='awaiting_progress', diagnosis_round=round_no,
                          action_ids=list(dict.fromkeys(event.get('action_ids', []) + action_ids)))
@@ -436,10 +453,13 @@ class WatchdogService:
                         if not action['content_markdown'].strip():
                             raise ValueError('注入必须说明具体字段或修订要求')
                         prompts.append({'operation_id': aid, 'content_markdown': action['content_markdown']})
+                    generation = current.get('watchdog_recovery_generation', 0)
+                    if action['action'] == 'inject_prompt' or current['status'] in {'failed', 'blocked'}:
+                        generation += 1
                     after = self.store._put(c, 'task', current['id'], {**current, 'status': 'pending', 'owner': None,
-                        'error': None, 'watchdog_prompts': prompts}, rid)
+                        'error': None, 'watchdog_prompts': prompts, 'watchdog_recovery_generation': generation}, rid)
                 self.store._put(c, 'watchdog_action', aid, {**operation, 'status': 'applied', 'after': after}, rid)
-                if project['status'] == 'blocked' and project.get('blocked_reason') == 'all_lines_blocked':
+                if project['status'] == 'blocked':
                     self.store._update_project(c, rid, status='running', blocked_reason=None, error=None)
         elif kind == 'run':
             after = self.runner.status(target.get('experiment_run_id', target['id']))

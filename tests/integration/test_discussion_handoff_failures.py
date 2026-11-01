@@ -192,6 +192,65 @@ async def test_generation_budget_covers_repeated_field_errors_and_restart(tmp_pa
     assert all(item["output"] == {"approve": "true"} and item["error"] for item in budget["attempts"])
 
 
+@pytest.mark.asyncio
+async def test_watchdog_injection_recovers_exhausted_member_without_recasting_votes(tmp_path):
+    from backend.graphs.tasks import current_task
+    from backend.runtime.watchdog import WatchdogService
+    store = Store(tmp_path)
+    project = make_project(store)
+    rid = project['id']
+    control = ControlSupervisor(tmp_path / 'control')
+    control.register_project(rid, project['deadline_at'])
+    task = store.add_task(rid, 'line', {'line_id': 'line-01', 'direction_epoch': 1}, 'root-task')
+    calls = []
+    corrected = False
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / 'checkpoints.sqlite')) as saver:
+        engine = ResearchEngine(store, control, None, None, saver)
+        async def model(**arguments):
+            member = arguments['agent_id']
+            schema = arguments['schema'].__name__
+            calls.append((member, schema))
+            if schema == 'DiscussionTurn':
+                return {'content_markdown': 'Ready', 'end_vote': {'final_output': COMPLETE}}
+            if member == 'C' and not corrected:
+                return {'approve': 'true'}
+            if member == 'C':
+                assert 'Choose implementation' in arguments['prompt']
+            return {'approve': True, 'next_step': 'implementation'}
+        engine.demo._produce_turn = model
+        token = current_task.set(task)
+        try:
+            with pytest.raises(RuntimeBlocked) as error:
+                await discuss(engine, project)
+            assert error.value.code == 'discussion_output_exhausted'
+        finally:
+            current_task.reset(token)
+        original = store.get('discussion_state', 'incident-discussion')['active_vote']
+        assert list(original['ballots']) == ['A', 'B']
+        store.patch('task', task['id'], status='failed', error={'code': 'discussion_output_exhausted'})
+        event = store.put('watchdog_event', 'event', {'line_id': 'line-01', 'direction_epoch': 1,
+            'cycle_id': None, 'status': 'diagnosing'}, rid)
+        service = WatchdogService(engine)
+        action = {'action': 'inject_prompt', 'target_id': task['id'], 'content_markdown': 'Choose implementation'}
+        service.apply(event['id'], action)
+        service.apply(event['id'], action)
+        corrected = True
+        token = current_task.set(store.get('task', task['id']))
+        try:
+            result = await discuss(engine, project)
+            assert result['next_step'] == 'implementation'
+            assert Counter(member for member, schema in calls if schema == 'EndBallot') == {'A': 1, 'B': 1, 'C': 4}
+            state = store.get('discussion_state', 'incident-discussion')
+            assert state['failed_end_votes'] == 0
+            assert state['votes'][0]['output_hash'] == original['output_hash']
+            assert state['votes'][0]['ballots']['A'] == original['ballots']['A']
+            assert len(store.list('watchdog_action', rid)) == 1
+        finally:
+            current_task.reset(token)
+            await engine.close()
+            control.close()
+
+
 def test_unconfirmed_occupied_slots_consume_budget_and_demo_receipt_is_reused(tmp_path):
     store = Store(tmp_path)
     project = make_project(store)

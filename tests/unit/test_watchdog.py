@@ -83,7 +83,42 @@ async def test_one_busy_line_does_not_hide_other_stalled_line(scene):
     clock[0] += timedelta(minutes=10)
     await service.poll({task['id']})
     await asyncio.gather(*service.active.values())
-    assert len(calls) == 1 and calls[0]['context']['event']['line_id'] == 'line-02'
+    assert len(calls) == 1 and calls[0]['context']['location']['line_id'] == 'line-02'
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_project_level_failure_is_diagnosed_and_resumed(scene):
+    service, store, project, clock, calls = scene
+    rid = project['id']
+    task = store.add_task(rid, 'boss', {}, 'failed-boss')
+    store.patch('task', task['id'], status='failed')
+    store.update_project(rid, status='blocked', error={'code': 'discussion_output_exhausted'})
+    await service.poll()
+    clock[0] += timedelta(minutes=10)
+    await service.poll()
+    await asyncio.gather(*service.active.values())
+    assert calls and calls[0]['context']['location']['project_status'] == 'blocked'
+    event = store.list('watchdog_event', rid)[0]
+    store.patch('watchdog_event', event['id'], status='diagnosing')
+    service.apply(event['id'], {'action': 'resume_task', 'target_id': task['id']}, event['lease_token'])
+    assert store.project(rid)['status'] == 'running'
+    assert store.get('task', task['id'])['status'] == 'pending'
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_native_repair_progress_is_verified_without_builtin_action(scene):
+    service, store, project, clock, calls = scene
+    await service.poll()
+    clock[0] += timedelta(minutes=10)
+    await service.poll()
+    await asyncio.gather(*service.active.values())
+    task = store.add_task(project['id'], 'line', {'line_id': 'line-01'}, 'native-restored')
+    store.claim_task(task['id'], 'worker')
+    clock[0] += timedelta(minutes=10)
+    await service.poll({task['id']})
+    assert store.list('watchdog_event', project['id'], line_id='line-01')[0]['status'] == 'repaired'
     await service.close()
 
 
@@ -135,7 +170,7 @@ def test_watchdog_tools_are_project_scoped_and_only_for_bound_diagnosis(scene):
         with pytest.raises(PermissionError):
             gateway.call(ordinary, {'name': 'read_watchdog_state', 'arguments': {'section': 'line'}})
         with pytest.raises(ValueError):
-            gateway.call(token, {'name': 'read_watchdog_state', 'arguments': {'section': 'credentials'}})
+            gateway.call(token, {'name': 'read_watchdog_state', 'arguments': {'section': 'task', 'offset': -1}})
         store.patch('watchdog_event', 'event', status='repaired')
         with pytest.raises(PermissionError):
             gateway.call(token, {'name': 'read_watchdog_state', 'arguments': {'section': 'line'}})

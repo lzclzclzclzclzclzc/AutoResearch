@@ -131,6 +131,39 @@ def current_line(store, project):
     return store.update_line(project['id'], 'line-01', cycle_id='cycle-2', direction_epoch=2, active_spec_id='spec-2')
 
 
+@pytest.mark.asyncio
+async def test_action_failure_is_corrected_and_successful_actions_are_not_reapplied(scene):
+    service, store, project, event, calls, returned, _ = scene
+    rid = project['id']
+    task = store.add_task(rid, 'line', {'line_id': 'line-01'}, 'repair-target')
+    store.patch('task', task['id'], status='failed')
+    resume = {'action': 'resume_task', 'target_id': task['id']}
+    returned.extend([
+        {'content_markdown': 'Resume then inject', 'actions': [resume,
+            {'action': 'inject_prompt', 'target_id': task['id']}]},
+        {'content_markdown': 'Correct injection', 'actions': [resume,
+            {'action': 'inject_prompt', 'target_id': task['id'], 'content_markdown': 'Fill next_step'}]},
+    ])
+    await service.diagnose(event)
+    assert len(calls) == 2 and '注入必须说明' in calls[1]['prompt']
+    assert store.get('task', task['id'])['watchdog_recovery_generation'] == 2
+    assert store.get('watchdog_event', event['id'])['status'] == 'awaiting_progress'
+    assert [item['status'] for item in store.list('generation_budget', rid)[0]['attempts']] == ['rejected', 'accepted']
+
+
+@pytest.mark.asyncio
+async def test_initial_context_only_contains_location_and_paths(scene):
+    service, store, project, event, calls, _, _ = scene
+    store.add_task(project['id'], 'boss', {'unrelated_history': 'not-in-initial-prompt' * 1000}, 'history')
+    await service.diagnose(event)
+    context = calls[0]['context']
+    assert set(context) == {'location', 'paths'}
+    assert context['paths']['business_db'] == str(store.path)
+    assert 'not-in-initial-prompt' not in calls[0]['prompt']
+    assert 'read_arbitration_context' not in calls[0]['prompt']
+    assert 'snapshot_manifest' not in calls[0]['prompt']
+
+
 @pytest.mark.parametrize('changed', [{'direction_epoch': 1}, {'cycle_id': 'cycle-1'}, {'spec_id': 'spec-1'}])
 def test_old_runner_scope_and_allocations_cannot_mask_current_stall(scene, changed):
     service, store, project, _, _, _, _ = scene

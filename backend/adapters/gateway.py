@@ -153,11 +153,10 @@ class ToolGateway:
                 raise PermissionError("Watch Dog diagnostic lease is stale")
             if name == "apply_watchdog_action":
                 return service.apply(event["id"], args, context.get("watchdog_lease_token"))
-            snapshot = service.snapshot(research_id)
             section, offset = args.get("section"), args.get("offset", 0)
-            if section not in snapshot or type(offset) is not int or offset < 0:
+            if not isinstance(section, str) or not section or type(offset) is not int or offset < 0:
                 raise ValueError("Invalid project state section or offset")
-            text = json.dumps(snapshot[section], ensure_ascii=False, sort_keys=True)
+            text = json.dumps(self.store.list(section, research_id), ensure_ascii=False, sort_keys=True)
             page = text[offset:offset + 16384]
             return {"section": section, "offset": offset, "next_offset": offset + len(page), "total_length": len(text), "text": page}
         if name in {"read_watchdog_state", "apply_watchdog_action"}:

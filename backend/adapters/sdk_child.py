@@ -18,8 +18,8 @@ from backend.adapters.model_errors import classify_model_failure
 from backend.adapters.token_limits import SEARCH_OUTPUT_TOKENS, output_tokens, truncated_output_error
 
 
-# Disable unsafe entry points in the full sdk tree, including paths which can
-# create undeclared agents, discover user skills, or upload session logs.
+# Ordinary research roles use gateway tools. Watch Dog uses the full native
+# SDK profile to investigate and repair local state.
 DISABLED_ROWS = ["tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-fs-search",
     "tool-working-directory", "tool-subagent", "tool-subagent-fork", "tool-subagent-control",
     "tool-subagent-list-agents", "tool-workflow", "workflow-ptc", "ptc-runtime",
@@ -28,8 +28,11 @@ DISABLED_ROWS = ["tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-fs-sear
     "session-log-deepseek", "session-telemetry-otel"]
 
 
-def policy_text():
-    return ("\n".join(f"- id: {row}\n  disabled: true" for row in DISABLED_ROWS)
+def policy_text(role=None):
+    rows = DISABLED_ROWS
+    if role == "watchdog":
+        rows = ["session-log-deepseek", "session-telemetry-otel"]
+    return ("\n".join(f"- id: {row}\n  disabled: true" for row in rows)
         + f"\n- id: web-search-deepseek\n  config:\n    maxTokens: {SEARCH_OUTPUT_TOKENS}\n")
 
 
@@ -67,7 +70,7 @@ def main():
     payload = json.loads(sys.stdin.readline())
     secret = payload.pop("api_key")
     patch = Path(payload["home"]) / "autoresearch-policy.patch.yml"
-    content = policy_text()
+    content = policy_text(payload.get("role"))
     if payload.get("plugin_entry"):
         entry = Path(payload["plugin_entry"]).resolve().as_posix().replace("'", "''")
         content += f"- insert:\n    - id: autoresearch-tools\n      name: '{entry}'\n"
@@ -100,7 +103,8 @@ def main():
                 env={"AUTORESEARCH_TOOL_GATEWAY": payload.get("gateway_url", ""),
                      "AUTORESEARCH_TOOL_CAPABILITY": payload.get("gateway_token", ""), "AUTORESEARCH_ROLE": payload.get("role", ""),
                      "AUTORESEARCH_HAS_INPUTS": "1" if payload.get("has_inputs") else "0",
-                     "AUTORESEARCH_PRIVATE_TURN": "1" if payload.get("auxiliary") else "0"},
+                     "AUTORESEARCH_PRIVATE_TURN": "1" if payload.get("auxiliary") else "0",
+                     **({"DSH_PERMISSION_MODE": "danger-full-access"} if payload.get("role") == "watchdog" else {})},
                 shutdown_timeout_seconds=1.0) as harness:
             session = harness.resume_session(payload["session_id"]) if payload["resume"] else harness.start_session(payload["session_id"])
             def notification(item):

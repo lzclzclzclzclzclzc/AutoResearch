@@ -10,6 +10,7 @@ from backend.adapters.dsh import DshRuntimeAdapter, runtime_availability
 from backend.persistence.store import Store
 from backend.runtime.control import ControlSupervisor
 from packages.contracts.research import DiscussionFinal, DiscussionTurn, Willingness, digest
+from backend.runtime.watchdog import WatchdogDecision
 
 
 class LocalCredential:
@@ -19,7 +20,7 @@ class LocalCredential:
 
 @pytest.mark.skipif(not runtime_availability().get("available"), reason="Optional locked official SDK/runtime unavailable")
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["member", "god", "private-score"])
+@pytest.mark.parametrize("mode", ["member", "god", "private-score", "watchdog"])
 async def test_suppressed_control_json_retains_authorized_tools_but_private_scores_cannot_use_them(tmp_path, mode):
     requests = []
     material = "BOUND-EVIDENCE-FOR-" + mode
@@ -35,6 +36,15 @@ async def test_suppressed_control_json_retains_authorized_tools_but_private_scor
         arguments = {"section": "discussion", "offset": 0}
         output = {"next_step": "critic", "final_output": {"content_markdown": "LOCAL GOD FINAL"}}
         schema, role, agent = DiscussionFinal, "god", "god/local-finalization"
+    elif mode == "watchdog":
+        tool = "pwsh"
+        source = str(path).replace("'", "''")
+        repaired = store.data_dir / "native-repair.txt"
+        destination = str(repaired).replace("'", "''")
+        arguments = {"command": f"Get-Content -LiteralPath '{source}'; Set-Content -LiteralPath '{destination}' -Value 'native-repaired'",
+            "description": "Read the local fixture and write its repair receipt"}
+        output = {"content_markdown": "Read local evidence and repaired with native tool", "actions": []}
+        schema, role, agent = WatchdogDecision, "watchdog", "watchdog"
     else:
         tool, arguments = "read_research_evidence", {"artifact_id": artifact["id"]}
         output = {"score": 50} if mode == "private-score" else {"content_markdown": "LOCAL DISCUSSION TURN"}
@@ -78,7 +88,7 @@ async def test_suppressed_control_json_retains_authorized_tools_but_private_scor
     threading.Thread(target=server.serve_forever, daemon=True).start()
     control = ControlSupervisor(tmp_path / "control")
     control.register_project(rid, project["deadline_at"])
-    # These tests only read evidence, so no Runner process is needed.
+    # The fixture only uses local evidence and temporary files.
     adapter = DshRuntimeAdapter(store, control, LocalCredential(), runner=object())
     cid = "suppressed-" + mode
     store.create_conversation(rid, cid, title="Local SDK tool fixture")
@@ -90,6 +100,11 @@ async def test_suppressed_control_json_retains_authorized_tools_but_private_scor
         store.put("discussion_finalization_snapshot", "local-finalization", {
             "sections": sections, "snapshot_hash": snapshot_hash}, rid)
         runtime_context.update(finalization_id="local-finalization", snapshot_hash=snapshot_hash)
+    if mode == "watchdog":
+        store.update_project(rid, status="blocked", error={"code": "discussion_output_exhausted"})
+        store.put("watchdog_event", "local-watchdog", {"line_id": "line-01", "direction_epoch": 1,
+            "cycle_id": None, "status": "diagnosing", "lease_token": "local-lease"}, rid)
+        runtime_context.update(watchdog_event_id="local-watchdog", watchdog_lease_token="local-lease")
     try:
         result = await asyncio.wait_for(adapter.execute_turn(research_id=rid, agent_id=agent, role=role,
             task_id="sdk-tool-fixture", turn_id="turn", prompt="Run only the local tool transport fixture.",
@@ -104,8 +119,11 @@ async def test_suppressed_control_json_retains_authorized_tools_but_private_scor
                 if isinstance(block, dict) and block.get("type") == "tool_result"]
             assert results and any(block.get("is_error") for block in results), results
         else:
-            assert material in tool_result
+            assert material in tool_result, [block for message in requests[1]["messages"]
+                for block in message.get("content", []) if isinstance(block, dict) and block.get("type") == "tool_result"]
             assert tool in {item["name"] for item in requests[0].get("tools", [])}
+        if mode == "watchdog":
+            assert repaired.read_text(encoding="utf-8").strip() == "native-repaired"
         assert not store.messages(cid)["items"]  # Typed discussion messages are committed by the state machine.
     finally:
         await adapter.close()
