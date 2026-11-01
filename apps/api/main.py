@@ -485,48 +485,10 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
     @app.get("/api/research/{research_id}/conversations")
     def conversations(research_id: str, agent_id: str | None = None, group_id: str | None = None, kind: str | None = None, line_id: str | None = None,
                       at_seq: int | None = Query(default=None, ge=0)):
-        s = store()
-        s.project(research_id)
-        items = s.list("conversation", research_id)
-        if kind:
-            items = [x for x in items if x.get("kind") == kind]
-        if line_id:
-            items = [x for x in items if x.get("line_id") == line_id]
-        identity = agent_id or group_id
-        if identity:
-            with s.connect() as c:
-                ids = {row[0] for row in c.execute("""
-                    SELECT DISTINCT m.conversation_id FROM messages m WHERE m.research_id=:research AND (
-                      json_extract(m.data,'$.sender.id')=:identity
-                      OR substr(json_extract(m.data,'$.sender.id'),1,length(:identity)+1)=:identity||'/'
-                      OR (json_extract(m.data,'$.sender.type')='group' AND
-                          substr(:identity,1,length(json_extract(m.data,'$.sender.id'))+1)=json_extract(m.data,'$.sender.id')||'/')
-                      OR EXISTS (SELECT 1 FROM json_each(m.data,'$.recipients') r WHERE
-                          json_extract(r.value,'$.id')=:identity
-                          OR substr(json_extract(r.value,'$.id'),1,length(:identity)+1)=:identity||'/'
-                          OR (json_extract(r.value,'$.type')='group' AND
-                              substr(:identity,1,length(json_extract(r.value,'$.id'))+1)=json_extract(r.value,'$.id')||'/'))
-                    )""", {"research": research_id, "identity": identity})}
-            items = [x for x in items if x["conversation_id"] in ids or identity in x.get("group_ids", [])
-                     or any((p.get("id", "") if isinstance(p, dict) else p) == identity or
-                            (p.get("id", "") if isinstance(p, dict) else p).startswith(identity + "/")
-                            for p in x.get("participants", []))]
-        if at_seq is not None:
-            with s.connect() as c:
-                row = c.execute("SELECT data FROM events WHERE research_id=? AND seq<=? ORDER BY seq DESC LIMIT 1", (research_id, at_seq)).fetchone()
-            cutoff = json.loads(row[0])["occurred_at"] if row else s.project(research_id)["created_at"]
-            visible_arbitrations = {row["conversation_id"] for row in request_list(s, research_id, at_seq)}
-            items = [item for item in items if item.get("created_at", "") <= cutoff and
-                     (":god:" not in item["conversation_id"] or item["conversation_id"] in visible_arbitrations
-                      or item.get("kind") == "discussion_finalization")]
-        for item in items:
-            latest = s.messages(item["conversation_id"], limit=1, at_seq=at_seq)["items"]
-            item["last_message"] = latest[-1] if latest else None
-        from backend.persistence.conversation_views import disambiguate_summaries, summarize_conversation
-        executions = s.list("execution", research_id) if at_seq is None else []
-        items = [summarize_conversation(item, [item["last_message"]] if item["last_message"] else [],
-            executions, state=s.get("discussion_state", item["conversation_id"]) if at_seq is None else None) for item in items]
-        return _public({"items": disambiguate_summaries(items)})
+        from backend.persistence.conversation_views import conversation_list
+        rows = conversation_list(store(), research_id, identity=agent_id or group_id,
+            kind=kind, line_id=line_id, at_seq=at_seq)
+        return _public({"items": rows})
 
     @app.get("/api/conversations/{conversation_id:path}/messages")
     def conversation_messages(conversation_id: str, before: int | None = None, limit: int = 50, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):

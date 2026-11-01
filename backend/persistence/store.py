@@ -464,11 +464,17 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                     raise StoreError("cross_project_reference", "会话不属于当前研究", 403)
                 participants = {canonical(p): p for p in existing.get("participants", []) + fields.get("participants", [])}
                 if len(participants) != len(existing.get("participants", [])):
+                    self._emit(c, research_id, "conversation.participants_added", {"participants": fields.get("participants", [])},
+                        conversation_id=conversation_id)
                     return self._put(c, "conversation", conversation_id, {**existing, "participants": list(participants.values())}, research_id)
                 return existing
-            return self._put(c, "conversation", conversation_id, {"conversation_id": conversation_id,
+            conversation = {"conversation_id": conversation_id,
                 "title": fields.pop("title", conversation_id), "kind": fields.pop("kind", "discussion"),
-                "created_at": now(), "unread_position": 0, **fields}, research_id)
+                "created_at": now(), "unread_position": 0, **fields}
+            event = self._emit(c, research_id, "conversation.created", {"conversation": conversation},
+                conversation_id=conversation_id)
+            return self._put(c, "conversation", conversation_id,
+                {**conversation, "created_event_seq": event["seq"]}, research_id)
 
     def create_message(self, research_id, conversation_id, sender, content_markdown, **fields):
         with self.connect(True) as c:
