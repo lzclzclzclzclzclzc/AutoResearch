@@ -140,6 +140,19 @@ class ResourceService:
         spec = {key: value for key, value in spec.items() if key in ExperimentSpec.model_fields}
         if spec.get("version") != payload["spec_version"] or hashlib.sha256(_canonical(spec)).hexdigest() != payload["spec_hash"]:
             raise ResourceConflict("Frozen plan version or content hash does not match")
+        # New grants bind the research direction and cycle as well as the plan.
+        # Old saved requests without these fields retain their historical shape.
+        if "direction_epoch" in payload or "cycle_id" in payload:
+            line_id = payload.get("line_id")
+            row = c.execute("SELECT research_id,data FROM documents WHERE kind='line' AND id=?",
+                (f"{payload['research_id']}:{line_id}",)).fetchone()
+            if not row or row["research_id"] != payload["research_id"]:
+                raise ResourceConflict("Resource request has no matching research line")
+            line = json.loads(row["data"])
+            if (("direction_epoch" in payload and line.get("direction_epoch") != payload["direction_epoch"]) or
+                    ("cycle_id" in payload and line.get("cycle_id") != payload["cycle_id"]) or
+                    line.get("finish_requested") or line.get("direction_stop_epoch") == line.get("direction_epoch")):
+                raise ResourceConflict("Research direction or cycle changed before experiment admission")
 
     def _put_allocation(self, c, allocation: dict) -> None:
         c.execute("INSERT INTO runtime_allocations(id,request_id,state,data) VALUES(?,?,?,?) "

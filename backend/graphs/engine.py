@@ -1075,12 +1075,14 @@ class ResearchEngine:
         p = await self.guard(state["research_id"])
         self.store.update_line(state["research_id"], state["line_id"], phase="organizer")
         spec, impl = self.spec(state), self.store.get("implementation", state["implementation_id"])
+        line = self.store.get("line", f"{state['research_id']}:{state['line_id']}")
         attempt = state.get("experiment_attempt", 1)
         request_id = state["implementation_id"] + (":resources" if attempt == 1 else f":attempt-{attempt}:resources")
         request = {"resource_request_id": request_id, "research_id": state["research_id"], "line_id": state["line_id"],
             "implementation_agent_id": f"{state['line_id']}/implementation", "spec_id": spec.spec_id, "spec_version": spec.version,
             "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"],
             "memory_bytes": state.get("memory_budget_bytes") or impl["memory_mb"] * 1024 * 1024, "experiment_attempt": attempt,
+            "direction_epoch": state.get("direction_epoch", line["direction_epoch"]), "cycle_id": state.get("cycle_id", line.get("cycle_id")),
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
@@ -1258,6 +1260,7 @@ class ResearchEngine:
                     target.write_bytes(source.encode("utf-8"))
         payload = {**allocation, "experiment_run_id": run_id, "start_operation_id": run_id + ":start", "command": [sys.executable, "-u", impl["entrypoint"], *impl["arguments"]],
                    "cwd": str(workspace), "code_version": impl["code_version"]}
+        await self.line_open(state)
         try:
             run = await asyncio.to_thread(self.runner.start, payload)
         except Exception:

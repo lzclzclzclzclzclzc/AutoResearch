@@ -1,17 +1,19 @@
 """Memory expansion keeps real Runner receipts and never changes scientific code."""
 import asyncio
 import os
+import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from backend.adapters.dsh import ResearchStopped
+from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
 from backend.graphs.engine import ResearchEngine
 from backend.persistence.store import Store
 from backend.runtime.control import ControlSupervisor
-from backend.runtime.runner import RunnerSupervisor, host_memory_failure
+from backend.runtime.runner import ResourceConflict, RunnerSupervisor, host_memory_failure
 from backend.services.credentials import CredentialService
 from packages.contracts.research import ExperimentSpec, digest
 
@@ -242,3 +244,88 @@ def test_unhandled_host_exception_requires_same_limit_and_measured_peak(tmp_path
     assert host_memory_failure(run)["source"] == "unhandled_host_allocation_exception"
     assert host_memory_failure({**run, "state": "cancelled"}) is None
     assert host_memory_failure({**run, "memory_bytes": 256 * MIB}) is None
+
+
+@pytest.mark.parametrize("change", [{"direction_epoch": 2}, {"cycle_id": "next-cycle"},
+    {"finish_requested": True}, {"direction_stop_epoch": 1}])
+def test_runner_rechecks_direction_and_cycle_in_start_admission(tmp_path, monkeypatch, change):
+    store, control, state = setup_engine(tmp_path)
+    runner = RunnerSupervisor(tmp_path, control)
+    try:
+        spec = store.get("spec", "spec")
+        spec = ExperimentSpec.model_validate(spec)
+        request = {"research_id": state["research_id"], "implementation_agent_id": "line-01/implementation",
+            "line_id": "line-01", "spec_id": "spec", "spec_version": 1, "spec_hash": digest(spec.model_dump()),
+            "resource_request_id": "direction-resources", "direction_epoch": 1, "cycle_id": "cycle",
+            "memory_bytes": 64 * MIB, "cpu_cores": 1, "gpu_count": 0, "control_generation": 1}
+        grant = runner.request_allocation(request)
+        assert grant["state"] == "granted"
+        store.update_line(state["research_id"], "line-01", **change)
+        def forbidden(*args, **kwargs):
+            pytest.fail("changed research direction must not create a process")
+        monkeypatch.setattr(runner, "_process_factory", forbidden)
+        with pytest.raises(ResourceConflict, match="direction or cycle changed"):
+            runner.start({**grant, "experiment_run_id": "direction-run", "start_operation_id": "direction-start",
+                "command": [sys.executable, "-c", "pass"], "cwd": str(tmp_path), "code_version": "code"})
+        assert not runner.status()["runs"] and not runner.service.runs()
+        # Requests already issued before the new fields were introduced remain
+        # readable/validatable under their original plan-only contract.
+        legacy = {k: v for k, v in request.items() if k not in {"direction_epoch", "cycle_id"}}
+        with runner.service.connect() as c:
+            runner.service._frozen_spec(c, legacy)
+    finally:
+        runner.close()
+        control.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_rechecks_line_after_grant_before_dispatching_start(tmp_path):
+    store, control, state = setup_engine(tmp_path)
+    allocation = {"allocation_id": "a", "state": "granted", "bound_run_id": None}
+    store.put("allocation", "a", allocation, state["research_id"])
+    state["allocation_id"] = "a"
+    def grant(*args):
+        store.update_line(state["research_id"], "line-01", direction_epoch=2)
+        return allocation
+    def forbidden(*args):
+        pytest.fail("late direction change must be checked before dispatching Runner.start")
+    runner = SimpleNamespace(request_allocation=grant, start=forbidden)
+    engine = ResearchEngine(store, control, runner, CredentialService(tmp_path, store), None)
+    try:
+        with pytest.raises(RuntimeBlocked) as failure:
+            await engine.run_experiment(state)
+        assert failure.value.code == "task_superseded"
+        assert not store.list("run")
+    finally:
+        await engine.close()
+        control.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows completion port API")
+def test_memory_notifications_are_bounded_and_do_not_grow_the_retained_audit(monkeypatch):
+    from backend.runtime import processes
+    managed = processes.ManagedProcess.__new__(processes.ManagedProcess)
+    managed._handle_lock = threading.RLock()
+    managed.job, managed.completion_port, managed.closed = 1, 1, False
+    managed._memory_bytes, managed._memory_limit_events = 64 * MIB, []
+    calls = []
+    def query(job, information_class, buffer, size, returned):
+        buffer._obj.JobMemoryLimit = 64 * MIB
+        buffer._obj.PeakJobMemoryUsed = 60 * MIB
+        return True
+    def endless_notifications(port, message, key, pid, timeout):
+        calls.append(1)
+        message._obj.value = 10
+        pid._obj.value = 42
+        return True
+    monkeypatch.setattr(processes.kernel, "QueryInformationJobObject", query)
+    monkeypatch.setattr(processes.kernel, "GetQueuedCompletionStatus", endless_notifications)
+    try:
+        first = managed.memory_snapshot()
+        assert len(calls) == 1024 and len(first["memory_limit_events"]) == 32
+        second = managed.memory_snapshot()
+        assert len(calls) == 2048 and len(second["memory_limit_events"]) == 32
+        assert second["approved_memory_bytes"] == 64 * MIB
+    finally:
+        # These are fake handles; destructor must not pass them to CloseHandle.
+        managed.closed = True

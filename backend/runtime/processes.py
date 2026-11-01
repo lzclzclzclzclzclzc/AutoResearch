@@ -332,11 +332,15 @@ class ManagedProcess:
                 return {}
             limits = EXTENDED_LIMIT()
             _check(kernel.QueryInformationJobObject(self.job, 9, ctypes.byref(limits), ctypes.sizeof(limits), None), "Query Job memory")
-            while self.completion_port:
+            # A process can catch allocation failures in a tight loop. Bound
+            # work under the handle lock so termination can always acquire it.
+            for _ in range(1024):
+                if not self.completion_port:
+                    break
                 message, key, process_id = w.DWORD(), ULONG_PTR(), w.LPVOID()
                 if not kernel.GetQueuedCompletionStatus(self.completion_port, ctypes.byref(message), ctypes.byref(key), ctypes.byref(process_id), 0):
                     break
-                if message.value in {9, 10}:  # PROCESS_MEMORY_LIMIT / JOB_MEMORY_LIMIT
+                if message.value in {9, 10} and len(self._memory_limit_events) < 32:  # PROCESS_MEMORY_LIMIT / JOB_MEMORY_LIMIT
                     self._memory_limit_events.append({"source": "windows_job_memory_limit", "message": int(message.value),
                         "pid": int(process_id.value or 0), "observed_at": time.time()})
             return {"approved_memory_bytes": int(limits.JobMemoryLimit or self._memory_bytes or 0),
