@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { NavLink, Link, Route, Routes, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Activity, ArrowUpRight, BookOpen, ChevronRight, CircleHelp, Cpu, FlaskConical, FolderOpen, Menu, Network, Plus, Settings2, X } from 'lucide-react';
+import { Activity, ArrowUpRight, ChevronRight, Cpu, FlaskConical, FolderOpen, Menu, Network, Plus, Settings2, X } from 'lucide-react';
 import { api, items } from './api';
 import Home from './Home';
 const Settings = lazy(() => import('./Settings'));
@@ -41,7 +41,6 @@ export default function App() {
       </nav>
       <div className="sidebar-foot">
         <div className="local-status"><span className={`connection-dot ${health.isError ? 'off' : ''}`} /><div>本机服务<span>{health.isError ? '连接不可用' : health.data ? '已连接 · 仅本机访问' : '正在连接…'}</span></div><Activity size={15} /></div>
-        <div className="foot-note"><CircleHelp size={14} /><span>每个结论，都有可追溯的证据。</span></div>
       </div>
     </aside>
     <div className="main-frame">
@@ -55,7 +54,6 @@ export default function App() {
           <Route path="/settings/:section" element={<Settings />} />
           <Route path="*" element={<div className="page"><h1>页面未找到</h1><Link to="/">返回研究列表 <ArrowUpRight size={14}/></Link></div>} />
         </Routes></Suspense>
-        <div className="sheet-foot"><span><BookOpen size={12}/> AutoResearch</span><span>研究 · 实验 · 证据</span></div>
       </main>
     </div>
   </div>;
