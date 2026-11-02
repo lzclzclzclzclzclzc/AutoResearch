@@ -8,6 +8,7 @@ import { Empty, ErrorNotice, Status } from './App';
 import ResearchGraph from './components/ResearchGraph';
 import Chat, { Markdown } from './components/Chat';
 import { projectHistory } from './history';
+import { timelineQueryOptions } from './timeline';
 import WorkspacePanels from './components/WorkspacePanels';
 import { activeArbitration, arbitrationPhase } from './arbitrations';
 
@@ -21,7 +22,7 @@ export default function Workspace({ history = false }: { history?: boolean }) {
   const seq = useRef(0); const timeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshot = useQuery({ queryKey: ['snapshot',id], queryFn: () => api(`/api/research/${id}/snapshot`), refetchInterval: history ? false : 4000 });
   const control = useQuery({ queryKey: ['control',id], queryFn: () => api(`/api/research/${id}/control-status`), refetchInterval: 1000, retry: false });
-  const timeline = useQuery({ queryKey: ['timeline',id], queryFn: async () => { let result: Data[] = []; let after = 0; for (;;) { const page = await api(`/api/research/${id}/timeline?after=${after}&limit=2000`); const rows = items(page); result = result.concat(rows); if (rows.length < 2000) break; after = rows.at(-1)!.seq; } return result; }, enabled: history, staleTime: Infinity });
+  const timeline = useQuery(timelineQueryOptions(id, history));
   useEffect(() => { const timer = setInterval(() => setTick(Date.now()),1000); return () => clearInterval(timer); }, []);
   useEffect(() => { seq.current = 0; setConnected(false); }, [id,history]);
   useEffect(() => {
