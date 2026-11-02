@@ -17,6 +17,7 @@ from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBloc
 from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
 from backend.graphs.discussion import GroupDiscussionGraph
+from backend.graphs.issue_requirements import merge_execution_requirements
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
 from backend.runtime.evidence import validate_execution_checks, validate_report_facts
@@ -923,6 +924,13 @@ class ResearchEngine:
         p = await self.guard(state["research_id"])
         research_id, line_id = state["research_id"], state["line_id"]
         revision = state.get("revision", 1)
+        prefix = f"{state['task_id']}:revision-{revision}"
+        spec_id = prefix + ":spec"
+        if self.store.get("spec", spec_id):
+            # A corrected legacy summary must never rewrite an already frozen
+            # plan or its execution/verification identities during recovery.
+            self.store.update_line(research_id, line_id, phase="implementation", active_spec_id=spec_id)
+            return {"spec_id": spec_id, "revision": revision, "code_attempt": 1}
         self.store.update_line(research_id, line_id, phase="exploration")
         context = {"topic": p["topic"], "description": p.get("description", ""), "workspace_path": p.get("workspace_path"),
             "objective": self.store.get("cycle", state["cycle_id"])["objective"],
@@ -930,7 +938,6 @@ class ResearchEngine:
             "instruction": "设计完整实验，必须包含所有固定设置与允许调整边界", "previous_verifications": self.store.list("verification", research_id, cycle_id=state["cycle_id"])}
         context["implementation_revision_requests"] = self.store.list("spec_revision_request", research_id, line_id=line_id)
         context["line_instructions"] = self.store.list("line_instruction", research_id, line_id=line_id)
-        prefix = f"{state['task_id']}:revision-{revision}"
         exploration_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
             research_id, f"{line_id}/exploration", prefix + ":exploration-inbox", state["cycle_id"], self.control)}
         critic_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
@@ -946,14 +953,11 @@ class ResearchEngine:
             conversation_id=prefix + ":cross_group", line_id=line_id,
             recipients=[{"type": "group", "id": f"{line_id}/critic"}], edge_id=f"{line_id}/exploration->{line_id}/critic")
         spec_id = prefix + ":spec"
-        execution_requirements = {}
-        for source in (exploration, critic):
-            for issue in source.get("issues", []):
-                if issue.get("acceptance_stage") == "execution":
-                    execution_requirements[issue["issue_id"]] = Issue.model_validate({k: v for k, v in issue.items() if k != "raised_by"}).model_dump()
+        execution_requirements = merge_execution_requirements([(f"{line_id}/{role}", issue)
+            for role, source in (("exploration", exploration), ("critic", critic)) for issue in source.get("issues", [])])
         spec = await self.turn(research_id, self.members(p, "critic", line_id)[0], "critic", prefix, "freeze_spec", ExperimentSpec,
             {**critic_context, "instruction": "根据两组决议和回应冻结可执行 ExperimentSpec；设计必改项均解决，分歧映射到实验；完整原样保留 execution_requirements，交给运行后 Verify 核查", "exploration": exploration, "critic": critic, "exploration_response": response, "spec_id": spec_id, "spec_version": revision,
-                "execution_requirements": list(execution_requirements.values())},
+                "execution_requirements": execution_requirements},
             conversation_id=prefix + ":cross_group", line_id=line_id, message_kind="handoff",
             recipients=[{"type": "agent", "id": f"{line_id}/implementation"}], edge_id=f"{line_id}/critic->{line_id}/implementation")
         if spec["spec_id"] != spec_id or spec["version"] != revision or spec["deadline_at"] != p["deadline_at"]:

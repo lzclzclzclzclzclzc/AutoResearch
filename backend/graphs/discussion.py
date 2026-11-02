@@ -9,6 +9,7 @@ from langgraph.types import Command
 
 from backend.adapters.dsh import RuntimeBlocked
 from backend.graphs.tasks import ScopeResolved, TaskSuspended, current_task, recovery_suffix
+from backend.graphs.issue_requirements import merge_execution_requirements
 from packages.contracts.research import BossProposal, BossReview, Proposal, Review, Synthesis, Vote, design_blocker, digest, majority, validate_issue_transition, validate_vote
 
 
@@ -138,9 +139,14 @@ class GroupDiscussionGraph:
     def retain_execution_requirements(self, state, result):
         # A summary may omit an unresolved runtime requirement in prose, but it
         # cannot erase the member-owned acceptance contract passed to the plan.
-        required = {i["issue_id"]: {k: v for k, v in i.items() if k != "raised_by"}
-            for i in self.issues(state) if i.get("acceptance_stage") == "execution"}
-        result["issues"] = [i for i in result.get("issues", []) if i["issue_id"] not in required] + list(required.values())
+        # A synthesis can quote another member's local ID; it must not replace
+        # the source member's acceptance criteria under the host's identity.
+        authored = self.issues({**state, "records": {key: value for key, value in state.get("records", {}).items()
+            if not key.startswith("synthesis:")}})
+        sources = [(issue["raised_by"], issue) for issue in authored if issue.get("acceptance_stage") == "execution"]
+        required = merge_execution_requirements(sources)
+        replaced_ids = {issue["issue_id"] for _, issue in sources} | {issue["issue_id"] for issue in required}
+        result["issues"] = [issue for issue in result.get("issues", []) if issue["issue_id"] not in replaced_ids] + required
         return result
 
     async def member_turn(self, state):
@@ -228,7 +234,7 @@ class GroupDiscussionGraph:
         speaking = {}
         if self.blockers({**state, "records": {**state["records"], **records}}):
             return {**speaking, "records": records, "winner": None, "phase": "review", "round": state["round"] + 1}
-        self.retain_execution_requirements({**state, "records": {**state["records"], **records}}, result)
+        self.retain_execution_requirements(state, result)
         result["selected_payload"] = candidate
         result["decision_source"] = state.get("decision_source", "majority")
         if state.get("revised_exploration"):
@@ -393,7 +399,9 @@ class GroupDiscussionGraph:
             initial = None if snapshot.values and (snapshot.next or has_interrupt) else {"research_id": research_id, "discussion_id": discussion_id,
                 "role": role, "members": members, "context": context, "line_id": line_id, "records": {}, "phase": "proposal", "round": 1}
             if snapshot.values and not snapshot.next and not has_interrupt:
-                return snapshot.values["result"]
+                # Repair the projection of completed legacy checkpoints from
+                # their original member records without rewriting those records.
+                return self.retain_execution_requirements(snapshot.values, dict(snapshot.values["result"]))
             root = current_task.get()
             if root and root.get("recovery_outcome") and has_interrupt:
                 initial = Command(resume=root["recovery_outcome"])
