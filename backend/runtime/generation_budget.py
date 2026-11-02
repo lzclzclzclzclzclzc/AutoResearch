@@ -7,6 +7,7 @@ project deadline, stop gate and the lifetime of the work being observed.
 from __future__ import annotations
 
 from backend.adapters.dsh import RuntimeBlocked
+from backend.runtime.recovery import execution_process_exited
 from packages.contracts.research import digest
 
 
@@ -32,9 +33,17 @@ class GenerationBudget:
                     attempt.update(status="returned", output=execution["output"])
                     self.store._put(connection, "generation_budget", self.key, state, self.research_id)
                     return attempt, attempt["output"]
-                if execution and execution.get("status") in {"registered", "running", "unknown"}:
-                    raise RuntimeBlocked("execution_unknown", "已占用的生成尝试仍待执行回执，继续跟踪原执行")
                 attempt.update(status="unconfirmed", error="已占号但未找到完整回执；不重发该次生成")
+            # Rejection describes the reply, not the lifetime of its SDK owner.
+            # Check every occupied generation, including older rejected slots,
+            # before assigning a replacement identity. Cached answers above do
+            # not dispatch a replacement and remain reusable.
+            for occupied in attempts:
+                execution = self.store._get(connection, "execution", occupied["execution_key"])
+                execution = execution or self.store._get(connection, "execution", "demo-" + occupied["execution_key"])
+                if (execution and execution.get("status") in {"registered", "running", "unknown"}
+                        and not execution_process_exited(execution)):
+                    raise RuntimeBlocked("execution_unknown", "已占用的生成尝试仍待执行回执，继续跟踪原执行")
             number = len(attempts) + 1
             bound_turn = turn_id + ":generation-" + str(number)
             attempt = {"attempt_id": self.key + ":" + str(number), "number": number,

@@ -349,7 +349,13 @@ class WatchdogService:
                 raise
             except RuntimeBlocked as error:
                 if error.code == 'execution_unknown':
-                    raise
+                    # Keep the diagnostic lease and its generation binding.
+                    # Recheck scope/Control on every pass while the original
+                    # SDK owner is pending, then resume after exit is proven.
+                    from backend.runtime.recovery import execution_exit_proven
+                    await execution_exit_proven(self.store, self.control, {'research_id': rid, 'id': eid})
+                    await asyncio.sleep(0.2)
+                    continue
                 if attempt:
                     unstarted = error.code in {'rate_limited', 'model_transport_error', 'model_timeout'} and budget.release_unstarted_service_failure(attempt, error)
                     if not unstarted:
