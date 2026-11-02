@@ -589,12 +589,30 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             s.retry_failed_tasks(research_id)
             s.emit(research_id, "research.resumed", {"deadline_at": p.get("deadline_at")})
         elif body.kind == "rebind_credential":
-            provider_id = body.provider_config_id or p["provider_config_id"]
-            provider = s.get("provider", provider_id)
-            if not provider or not CredentialService(root, s).get_secret(provider_id):
-                raise StoreError("credential_missing", "目标模型凭据不可用", 422)
-            s.update_project(research_id, provider_config_id=provider_id, credential_version=provider["credential_version"])
-            s.emit(research_id, "credential.rebound", {"provider_config_id": provider_id, "credential_version": provider["credential_version"]})
+            # Rebinding rotates credentials for the frozen provider. Changing its
+            # identity, endpoint or model requires a new research project. Keep
+            # validation and the binding receipt in one transaction so a concurrent
+            # settings save cannot change the target between checking and binding.
+            with s.connect(True) as c:
+                current = s._project(c, research_id)
+                s.assert_progress(current, p["control_generation"])
+                provider_id = body.provider_config_id or current["provider_config_id"]
+                provider = s._get(c, "provider", provider_id)
+                if not provider:
+                    raise StoreError("credential_missing", "目标模型凭据不可用", 422)
+                frozen = current["config_snapshot"]["provider"]
+                if (provider_id != frozen.get("id", current["provider_config_id"])
+                        or provider.get("model", provider.get("model_id", "deepseek-flash")) != frozen.get("model", frozen.get("model_id", "deepseek-flash"))
+                        or messages_url(provider.get("base_url")) != messages_url(frozen.get("base_url"))):
+                    raise StoreError("provider_binding_mismatch",
+                        "只能为原提供方、模型和服务地址重绑凭据；请恢复原模型配置，或使用新配置创建研究", 409)
+                if not CredentialService(root, s).get_secret(provider_id, version=provider["credential_version"]):
+                    raise StoreError("credential_missing", "目标模型凭据不可用", 422)
+                binding = {"provider_config_id": provider_id, "credential_version": provider["credential_version"]}
+                s._update_project(c, research_id, **binding)
+                s._emit(c, research_id, "credential.rebound", binding)
+                return s._put(c, "command", rid, {"command_id": rid, "kind": body.kind,
+                    "status": "applied", "created_at": now(), **binding}, research_id)
         result = s.put("command", rid, {"command_id": rid, "kind": body.kind, "status": "applied", "created_at": now(), "version": 1}, research_id)
         return result
 
