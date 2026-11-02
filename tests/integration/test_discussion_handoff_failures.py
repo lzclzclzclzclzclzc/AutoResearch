@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from backend.adapters.dsh import RuntimeBlocked
+from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
 from backend.graphs.discussion_v2 import MemberDiscussion
 from backend.graphs.engine import ResearchEngine
 from backend.persistence.store import Store
@@ -164,7 +164,7 @@ async def test_third_unusable_product_registers_one_finalization_in_same_commit(
 
 
 @pytest.mark.asyncio
-async def test_generation_budget_covers_repeated_field_errors_and_restart(tmp_path):
+async def test_generation_corrections_survive_restart_and_continue_past_legacy_limit(tmp_path, monkeypatch):
     store = Store(tmp_path)
     project = make_project(store)
     control = ControlSupervisor(tmp_path / "control")
@@ -174,26 +174,35 @@ async def test_generation_budget_covers_repeated_field_errors_and_restart(tmp_pa
         engine = ResearchEngine(store, control, None, None, saver)
         async def malformed(**arguments):
             calls.append(arguments["turn_id"])
-            return {"approve": "true"}
+            return {"approve": "true"} if len(calls) <= 5 else {"approve": True, "next_step": "implementation"}
         engine.demo._produce_turn = malformed
+        record = GenerationBudget.record
+        def crash_after_third_rejection(self, attempt, status, **fields):
+            record(self, attempt, status, **fields)
+            if status == "rejected" and attempt["number"] == 3:
+                raise RuntimeError("restart after persisted correction")
+        monkeypatch.setattr(GenerationBudget, "record", crash_after_third_rejection)
         context = {"no_arbitration": True, "discussion_protocol": 2,
             "generation_budget": {"kind": "test", "key": "fixed-vote", "limit": 3}}
         try:
+            with pytest.raises(RuntimeError, match="persisted correction"):
+                await engine.turn(project["id"], "A", "critic", "same-task", "same-turn", EndBallot, context, publish_message=False)
             for _ in range(2):
-                with pytest.raises(RuntimeBlocked) as error:
-                    await engine.turn(project["id"], "A", "critic", "same-task", "same-turn", EndBallot, context, publish_message=False)
-                assert error.value.code == "generation_budget_exhausted"
+                output = await engine.turn(project["id"], "A", "critic", "same-task", "same-turn", EndBallot, context, publish_message=False)
+                assert output["approve"] is True
         finally:
             await engine.close()
     control.close()
-    assert len(calls) == 3 and len(set(calls)) == 3
+    assert len(calls) == 6 and len(set(calls)) == 6
     budget = store.list("generation_budget", project["id"])[0]
-    assert len(budget["attempts"]) == 3
-    assert all(item["output"] == {"approve": "true"} and item["error"] for item in budget["attempts"])
+    assert len(budget["attempts"]) == 6
+    assert all(item["output"] == {"approve": "true"} and item["error"] for item in budget["attempts"][:-1])
+    assert budget["attempts"][-1]["status"] == "accepted"
 
 
 @pytest.mark.asyncio
-async def test_watchdog_injection_recovers_exhausted_member_without_recasting_votes(tmp_path):
+@pytest.mark.parametrize("recovery", ["manual", "watchdog"])
+async def test_retry_recovers_legacy_exhausted_member_without_recasting_votes(tmp_path, monkeypatch, recovery):
     from backend.graphs.tasks import current_task
     from backend.runtime.watchdog import WatchdogService
     store = Store(tmp_path)
@@ -204,6 +213,12 @@ async def test_watchdog_injection_recovers_exhausted_member_without_recasting_vo
     task = store.add_task(rid, 'line', {'line_id': 'line-01', 'direction_epoch': 1}, 'root-task')
     calls = []
     corrected = False
+    record = GenerationBudget.record
+    def legacy_exhaustion(self, attempt, status, **fields):
+        record(self, attempt, status, **fields)
+        if status == 'rejected' and attempt['agent_id'] == 'C' and attempt['number'] == 3 and not corrected:
+            raise RuntimeBlocked('discussion_output_exhausted', 'Persisted by the previous three-attempt policy')
+    monkeypatch.setattr(GenerationBudget, 'record', legacy_exhaustion)
     async with AsyncSqliteSaver.from_conn_string(str(tmp_path / 'checkpoints.sqlite')) as saver:
         engine = ResearchEngine(store, control, None, None, saver)
         async def model(**arguments):
@@ -214,7 +229,7 @@ async def test_watchdog_injection_recovers_exhausted_member_without_recasting_vo
                 return {'content_markdown': 'Ready', 'end_vote': {'final_output': COMPLETE}}
             if member == 'C' and not corrected:
                 return {'approve': 'true'}
-            if member == 'C':
+            if member == 'C' and recovery == 'watchdog':
                 assert 'Choose implementation' in arguments['prompt']
             return {'approve': True, 'next_step': 'implementation'}
         engine.demo._produce_turn = model
@@ -228,12 +243,15 @@ async def test_watchdog_injection_recovers_exhausted_member_without_recasting_vo
         original = store.get('discussion_state', 'incident-discussion')['active_vote']
         assert list(original['ballots']) == ['A', 'B']
         store.patch('task', task['id'], status='failed', error={'code': 'discussion_output_exhausted'})
-        event = store.put('watchdog_event', 'event', {'line_id': 'line-01', 'direction_epoch': 1,
-            'cycle_id': None, 'status': 'diagnosing'}, rid)
-        service = WatchdogService(engine)
-        action = {'action': 'inject_prompt', 'target_id': task['id'], 'content_markdown': 'Choose implementation'}
-        service.apply(event['id'], action)
-        service.apply(event['id'], action)
+        if recovery == 'watchdog':
+            event = store.put('watchdog_event', 'event', {'line_id': 'line-01', 'direction_epoch': 1,
+                'cycle_id': None, 'status': 'diagnosing'}, rid)
+            service = WatchdogService(engine)
+            action = {'action': 'inject_prompt', 'target_id': task['id'], 'content_markdown': 'Choose implementation'}
+            service.apply(event['id'], action)
+            service.apply(event['id'], action)
+        else:
+            store.retry_failed_tasks(rid)
         corrected = True
         token = current_task.set(store.get('task', task['id']))
         try:
@@ -244,24 +262,26 @@ async def test_watchdog_injection_recovers_exhausted_member_without_recasting_vo
             assert state['failed_end_votes'] == 0
             assert state['votes'][0]['output_hash'] == original['output_hash']
             assert state['votes'][0]['ballots']['A'] == original['ballots']['A']
-            assert len(store.list('watchdog_action', rid)) == 1
+            assert len(store.list('watchdog_action', rid)) == int(recovery == 'watchdog')
         finally:
             current_task.reset(token)
             await engine.close()
             control.close()
 
 
-def test_unconfirmed_occupied_slots_consume_budget_and_demo_receipt_is_reused(tmp_path):
+def test_unconfirmed_slots_are_not_reissued_and_demo_receipt_is_reused(tmp_path):
     store = Store(tmp_path)
     project = make_project(store)
     budget = GenerationBudget(store, project["id"], {"kind": "test", "key": "lost-responses", "limit": 3})
-    for expected in range(1, 4):
+    for expected in range(1, 6):
         attempt, output = budget.acquire("A", "task", "turn")
         assert attempt["number"] == expected and output is None
     restarted = GenerationBudget(store, project["id"], budget.binding)
-    with pytest.raises(RuntimeBlocked) as error:
-        restarted.acquire("A", "task", "turn:technical-99")
-    assert error.value.code == "generation_budget_exhausted"
+    attempt, _ = restarted.acquire("A", "task", "turn:technical-99")
+    assert attempt["number"] == 6
+    saved = store.get("generation_budget", budget.key)["attempts"]
+    assert all(item["status"] == "unconfirmed" for item in saved[:-1])
+    assert len({item["execution_key"] for item in saved}) == 6
     output = {"approve": True}
     store.put("execution", "demo-" + attempt["execution_key"], {"status": "completed", "output": output}, project["id"])
     reused, answer = restarted.acquire("A", "task", "turn")
@@ -283,3 +303,36 @@ def test_explicit_service_failure_before_registration_keeps_infrastructure_backo
     with pytest.raises(RuntimeBlocked) as error:
         budget.acquire("A", "task", "turn")
     assert error.value.code == "execution_unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["pause", "stop", "deadline"])
+async def test_repeated_field_corrections_obey_control_before_the_next_generation(tmp_path, boundary):
+    import time
+    store = Store(tmp_path)
+    project = make_project(store)
+    rid = project["id"]
+    control = ControlSupervisor(tmp_path / "control")
+    control.register_project(rid, project["deadline_at"])
+    engine = ResearchEngine(store, control, None, None, None)
+    calls = []
+    async def invalid(**arguments):
+        calls.append(arguments["turn_id"])
+        if len(calls) == 5:
+            if boundary == "pause":
+                store.update_project(rid, status="paused")
+            elif boundary == "stop":
+                control.terminate(rid)
+            else:
+                with control._lock:
+                    control.projects[rid]["deadline_at"] = time.time() - 1
+        return {"approve": "true"}
+    engine.demo._produce_turn = invalid
+    try:
+        with pytest.raises(RuntimeBlocked if boundary == "pause" else ResearchStopped):
+            await engine.turn(rid, "A", "critic", "task", "ballot", EndBallot, {"no_arbitration": True,
+                "generation_budget": {"kind": "test", "key": "control-boundary"}}, publish_message=False)
+        assert len(calls) == 5 and len(set(calls)) == 5
+    finally:
+        await engine.close()
+        control.close()

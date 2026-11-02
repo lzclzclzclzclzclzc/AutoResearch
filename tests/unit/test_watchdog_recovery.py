@@ -1,4 +1,4 @@
-"""Watch Dog diagnostics retain bounded attempts and trusted Runner scope."""
+"""Watch Dog diagnostics retain durable attempts and trusted Runner scope."""
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -45,17 +45,15 @@ async def test_invalid_diagnosis_gets_two_corrections_in_same_durable_budget(sce
 
 
 @pytest.mark.asyncio
-async def test_diagnosis_exhaustion_is_explicit_and_restart_does_not_generate_fourth(scene):
+async def test_diagnosis_keeps_correcting_past_three_and_restart_reuses_acceptance(scene):
     service, store, project, event, calls, returned, _ = scene
-    returned.extend([{'actions': []}] * 3)
+    returned.extend([{'actions': []}] * 5)
     await service.diagnose(event)
-    exhausted = store.get('watchdog_event', event['id'])
-    assert exhausted['status'] == 'needs_attention'
-    assert exhausted['error']['code'] == 'generation_budget_exhausted'
-    assert len(exhausted['error']['attempts']) == 3
-    restarted = store.patch('watchdog_event', event['id'], status='diagnosing')
+    assert store.get('watchdog_event', event['id'])['status'] == 'awaiting_progress'
+    assert len(store.list('generation_budget', project['id'])[0]['attempts']) == 6
+    restarted = store.patch('watchdog_event', event['id'], status='diagnosing', diagnosis_round=0)
     await WatchdogService(service.engine).diagnose(restarted)
-    assert len(calls) == 3
+    assert len(calls) == 6
 
 
 @pytest.mark.asyncio

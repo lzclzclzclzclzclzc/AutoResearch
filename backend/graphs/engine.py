@@ -16,7 +16,6 @@ from backend.adapters.demo import DemoRuntimeAdapter
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
 from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
-from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.graphs.discussion import GroupDiscussionGraph
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
@@ -352,23 +351,29 @@ class ResearchEngine:
         wire_contract = model_contract(schema, context)
         prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象（系统编号、版本和哈希由程序填写）:\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
-        delay, last_error = 1.0, None
+        delay = 1.0
         token_limit = output_tokens(private_score)
         generation_budget = None
         generation_turn = turn_id
+        base_prompt = prompt
+        correction_number = 0
         if context.get("generation_budget"):
             from backend.runtime.generation_budget import GenerationBudget
             generation_budget = GenerationBudget(self.store, research_id, context["generation_budget"])
             corrections = generation_budget.corrections()
             if corrections:
-                prompt += "\n同一逻辑回合的先前尝试未获采纳，请根据具体错误更正完整 JSON：" + json.dumps(corrections, ensure_ascii=False)
+                prompt += "\n同一逻辑回合的先前尝试未获采纳，请根据具体错误更正完整 JSON：" + json.dumps(corrections[-1:], ensure_ascii=False)
         while True:
+            project = await self.guard(research_id)
+            if context.get("generation_budget", {}).get("kind") == "monitor_generation":
+                current_run = await asyncio.to_thread(self.runner.status, context["run"]["experiment_run_id"])
+                if current_run.get("state", "unknown") == "unknown":
+                    raise RuntimeBlocked("runner_unknown", "实验状态未知，保留监控窗口并等待对账")
+                if current_run.get("state") != "running":
+                    raise RuntimeBlocked("monitor_run_finished", "实验已退出，停止当前日志窗口的生成纠错")
             generation_attempt = None
             response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
             response_retry = self.store.get("model_response_retry", response_retry_id) or {}
-            if not generation_budget and response_retry.get("failures", 0) >= MAX_RESPONSE_ATTEMPTS:
-                raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
-                    provider_error_code=response_retry.get("provider_error_code"))
             try:
                 cached_generation = None
                 if generation_budget:
@@ -405,10 +410,12 @@ class ResearchEngine:
                 unstarted_service_failure = (generation_budget and generation_attempt and
                     error.code in {"rate_limited", "model_transport_error", "model_timeout"} and
                     generation_budget.release_unstarted_service_failure(generation_attempt, error))
-                if generation_budget and generation_attempt and not unstarted_service_failure and error.code not in {"execution_unknown", "generation_budget_exhausted"}:
+                if generation_budget and generation_attempt and not unstarted_service_failure and error.code != "execution_unknown":
                     generation_budget.record(generation_attempt, "rejected", error=str(error), error_code=error.code)
-                if generation_budget and error.code == "invalid_output":
-                    prompt += "\n上次输出校验失败，请更正并完整返回 JSON：" + str(error)
+                if error.code == "invalid_output":
+                    prompt = base_prompt + "\n上次输出校验失败，请更正并完整返回 JSON：" + str(error)
+                    correction_number += 1
+                    turn_id = generation_turn + ":repair" + (f"-{correction_number}" if correction_number > 1 else "")
                     continue
                 if error.code == "model_response_invalid":
                     await self.guard(research_id)
@@ -416,16 +423,13 @@ class ResearchEngine:
                     self.store.put("model_response_retry", response_retry_id, {"failures": failures,
                         "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id,
                         "provider_error_code": error.provider_error_code}, research_id)
-                    if failures >= MAX_RESPONSE_ATTEMPTS and not generation_budget:
-                        raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
-                            http_status=error.http_status, provider_error_code=error.provider_error_code) from error
                     # Adapter admission requires exit proof before a replacement.
                     # Keep the logical turn so completed tools and session history can be reused.
-                    delay = min(2 ** (failures - 1), 4)
+                    delay = 2 ** min(failures - 1, 2)
                     self.store.emit(research_id, "agent.retry_wait", {"delay_seconds": delay,
                         "code": error.code, "provider_error_code": error.provider_error_code,
-                        "attempt": failures, "max_attempts": MAX_RESPONSE_ATTEMPTS}, agent_id=agent_id)
-                    prompt += "\n上次响应的结束协议异常，未被接受。沿用已保存的工具结果，不重复已完成的操作，重新返回完整 JSON。"
+                        "attempt": failures}, agent_id=agent_id)
+                    prompt = base_prompt + "\n上次响应的结束协议异常，未被接受。沿用已保存的工具结果，不重复已完成的操作，重新返回完整 JSON。"
                     until = asyncio.get_running_loop().time() + delay
                     while asyncio.get_running_loop().time() < until:
                         await self.guard(research_id)
@@ -433,14 +437,12 @@ class ResearchEngine:
                     continue
                 if error.code == "model_output_truncated":
                     await self.guard(research_id)
-                    if token_limit >= MAX_OUTPUT_TOKENS and not generation_budget:
-                        from backend.graphs.arbitration import ArbitrationRequired
-                        raise ArbitrationRequired("model_output_truncated", f"模型输出在 {token_limit} token 上限下仍被截断", max_output_tokens=token_limit, original_error=str(error)) from error
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
                     self.store.emit(research_id, "agent.retry_wait", {"code": error.code, "max_output_tokens": token_limit,
-                        "message": "输出被截断，已提高额度重新请求完整结果"}, agent_id=agent_id)
-                    prompt += "\n上次输出达到 token 上限，现已增加额度。沿用已完成的工具结果，不重复执行已完成的操作；直接返回完整 JSON 对象。"
-                    turn_id += f":more-output:{token_limit}"
+                        "message": "输出被截断，正在重新请求完整结果"}, agent_id=agent_id)
+                    prompt = base_prompt + f"\n上次输出被截断。本次最多 {token_limit} token，请精简表述并完整返回 JSON。沿用已保存的工具结果，不重复已完成的操作。"
+                    correction_number += 1
+                    turn_id = generation_turn + f":more-output:{token_limit}:{correction_number}"
                     continue
                 if error.code not in {"rate_limited", "model_transport_error", "model_timeout"}:
                     raise
@@ -457,13 +459,9 @@ class ResearchEngine:
                 if generation_budget and generation_attempt:
                     generation_budget.record(generation_attempt, "rejected", error=signature,
                         output=result if "result" in locals() else None)
-                if signature == last_error and not generation_budget:
-                    from backend.graphs.arbitration import ArbitrationRequired
-                    raise ArbitrationRequired("invalid_output", "相同输出校验错误未取得进展：" + signature,
-                        validation_error=signature, source_output=result if "result" in locals() else None) from error
-                last_error = signature
-                prompt += "\n上次输出校验失败，请更正并完整返回 JSON：" + signature
-                turn_id = turn_id + ":repair"
+                prompt = base_prompt + "\n上次输出校验失败，请更正并完整返回 JSON：" + signature
+                correction_number += 1
+                turn_id = generation_turn + ":repair" + (f"-{correction_number}" if correction_number > 1 else "")
         return await self.accept_turn_output(research_id, agent_id, role, task_id, turn_id, schema, result, context,
             conversation_id=conversation_id, line_id=line_id, message_kind=message_kind, recipients=recipients,
             edge_id=edge_id, publish_message=publish_message, reply_to=reply_to, output_validator=output_validator)
@@ -1161,9 +1159,9 @@ class ResearchEngine:
         round_no = max(cursor["round_no"] + 1, observer["round_no"])
         window_id = f"{run_id}:monitor-window:{round_no}"
         window = self.store.get("run_monitor_window", window_id)
-        if window and window.get("status") in {"accepted", "exhausted", "late"}:
+        if window and window.get("status") in {"accepted", "late"}:
             logs = await self.collect_run_logs(run_id, cursor["next_offset"])
-            if window.get("status") in {"exhausted", "late"} and logs["next_offset"] <= window["next_offset"]:
+            if window.get("status") == "late" and logs["next_offset"] <= window["next_offset"]:
                 return None
             round_no += 1
             window_id = f"{run_id}:monitor-window:{round_no}"
@@ -1184,15 +1182,12 @@ class ResearchEngine:
             monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
                 f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
                 "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
-                "rule_ids": allowed, "no_arbitration": True, "generation_budget": {"kind": "monitor_generation", "key": window_id, "limit": 3}},
+                "rule_ids": allowed, "no_arbitration": True, "generation_budget": {"kind": "monitor_generation", "key": window_id}},
                 conversation_id=run_id + ":monitor", line_id=state["line_id"], output_validator=validate_monitor)
         except RuntimeBlocked as error:
-            if error.code not in {"generation_budget_exhausted", "monitor_generation_exhausted"}:
+            if error.code != "monitor_run_finished":
                 raise
-            self.store.patch("run_monitor_window", window_id, status="exhausted", error={"code": error.code,
-                "message": "监控回复纠正失败", "detail": str(error)})
-            self.store.emit(rid, "monitor.correction_exhausted", {"run_id": run_id, "window_id": window_id,
-                "message": "监控回复纠正失败", "log_hash": window["log_hash"]}, line_id=state["line_id"])
+            self.store.patch("run_monitor_window", window_id, status="late")
             return None
         except (ResearchStopped, asyncio.CancelledError):
             self.store.patch("run_monitor_window", window_id, status="late")

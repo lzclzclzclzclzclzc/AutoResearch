@@ -308,16 +308,18 @@ class WatchdogService:
         conversation = eid + ':watchdog'
         self.store.create_conversation(rid, conversation, title='Watch Dog 诊断与在线修复', kind='watchdog', participants=[{'type': 'agent', 'id': 'watchdog'}], line_id=event['line_id'])
         round_no = event.get('diagnosis_round', 0) + 1
-        binding = {'kind': 'watchdog_generation', 'key': [eid, round_no], 'limit': 3}
+        binding = {'kind': 'watchdog_generation', 'key': [eid, round_no]}
         budget = GenerationBudget(self.store, rid, binding)
         context = self.diagnostic_context(project, event)
         adapter = self.engine.demo if project['mode'] == 'demo' else self.engine.live
         prompt = WATCHDOG_PROMPT + '\n' + json.dumps(context, ensure_ascii=False, default=str) + '\n' + json.dumps(WatchdogDecision.model_json_schema(), ensure_ascii=False)
+        base_prompt = prompt
         if budget.corrections():
-            prompt += '\n先前诊断回复未获采纳，请根据字段错误纠正完整 JSON：' + json.dumps(budget.corrections(), ensure_ascii=False)
+            prompt += '\n先前诊断回复未获采纳，请根据字段错误纠正完整 JSON：' + json.dumps(budget.corrections()[-1:], ensure_ascii=False)
         from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
         token_limit = output_tokens()
         while True:
+            await asyncio.sleep(0)
             attempt, raw = None, None
             try:
                 if not self._diagnostic_current(event):
@@ -346,13 +348,6 @@ class WatchdogService:
                     budget.release_unstarted_service_failure(attempt, error)
                 raise
             except RuntimeBlocked as error:
-                if error.code == 'generation_budget_exhausted':
-                    updated = self._commit_diagnostic(event, status='needs_attention', error={
-                        'code': error.code, 'message': 'Watch Dog 诊断回复纠正失败，三次生成已耗尽',
-                        'attempts': budget.corrections()})
-                    if updated:
-                        self.store.emit(rid, 'watchdog.diagnostic_exhausted', {'event': updated}, line_id=event['line_id'])
-                    return
                 if error.code == 'execution_unknown':
                     raise
                 if attempt:
@@ -363,11 +358,11 @@ class WatchdogService:
                     raise
                 if error.code == 'model_output_truncated':
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
-                prompt += '\n上次诊断未获采纳，请纠正并返回完整 JSON：' + str(error)
+                prompt = base_prompt + '\n上次诊断未获采纳，请纠正并返回完整 JSON：' + str(error)
             except ValueError as error:
                 if attempt:
                     budget.record(attempt, 'rejected', output=raw, error=str(error))
-                prompt += '\n上次诊断字段校验失败，请纠正并返回完整 JSON：' + str(error)
+                prompt = base_prompt + '\n上次诊断字段校验失败，请纠正并返回完整 JSON：' + str(error)
         if not self._diagnostic_current(event):
             return
         self.store.create_message(rid, conversation, 'watchdog', decision['content_markdown'], source_event_id=eid + ':' + str(round_no), kind='watchdog')

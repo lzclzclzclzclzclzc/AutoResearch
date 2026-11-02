@@ -1,7 +1,8 @@
-"""Durable generation limits shared by a logical speech, ballot or observation.
+"""Durable generation attempts shared by a logical speech, ballot or observation.
 
 An occupied slot is never sent twice. Adapter execution receipts can recover an
-answer after a crash, but an unconfirmed occupied slot still consumes the limit.
+answer after a crash. Corrections have no count limit; callers enforce the
+project deadline, stop gate and the lifetime of the work being observed.
 """
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ class GenerationBudget:
         self.store, self.research_id = store, research_id
         self.binding = binding
         self.key = digest([research_id, binding.get("kind", "generation"), binding["key"]])
-        self.limit = min(3, max(1, int(binding.get("limit", 3))))
 
     def acquire(self, agent_id, task_id, turn_id):
         with self.store.connect(True) as connection:
@@ -35,19 +35,14 @@ class GenerationBudget:
                 if execution and execution.get("status") in {"registered", "running", "unknown"}:
                     raise RuntimeBlocked("execution_unknown", "已占用的生成尝试仍待执行回执，继续跟踪原执行")
                 attempt.update(status="unconfirmed", error="已占号但未找到完整回执；不重发该次生成")
-            if len(attempts) >= self.limit:
-                self.store._put(connection, "generation_budget", self.key, state, self.research_id)
-            else:
-                number = len(attempts) + 1
-                bound_turn = turn_id + ":generation-" + str(number)
-                attempt = {"attempt_id": self.key + ":" + str(number), "number": number,
-                    "status": "reserved", "agent_id": agent_id, "task_id": task_id, "turn_id": bound_turn,
-                    "execution_key": digest([self.research_id, agent_id, task_id, bound_turn])}
-                attempts.append(attempt)
-                self.store._put(connection, "generation_budget", self.key, state, self.research_id)
-                return attempt, None
-        # Raise after committing the last occupied slot's audit state.
-        raise RuntimeBlocked("generation_budget_exhausted", "同一逻辑回合的三次生成已耗尽，已保留原回复与字段错误")
+            number = len(attempts) + 1
+            bound_turn = turn_id + ":generation-" + str(number)
+            attempt = {"attempt_id": self.key + ":" + str(number), "number": number,
+                "status": "reserved", "agent_id": agent_id, "task_id": task_id, "turn_id": bound_turn,
+                "execution_key": digest([self.research_id, agent_id, task_id, bound_turn])}
+            attempts.append(attempt)
+            self.store._put(connection, "generation_budget", self.key, state, self.research_id)
+            return attempt, None
 
     def release_unstarted_service_failure(self, attempt, error):
         """A known service error before adapter registration is not a generation.

@@ -167,14 +167,19 @@ async def test_explicit_external_retry_gets_new_arbitration_without_rewriting_ol
 
 async def test_god_cannot_select_through_must_fix_blockers(fixture):
     store, project = fixture
-    engine = Engine(store)
+    async def invalid_until_deadline(request, context, attempt):
+        if attempt == 4:
+            store.patch("arbitration_request", request["id"],
+                judge_deadline_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+        return choose(request, context)
+    engine = Engine(store, invalid_until_deadline)
     service = ArbitrationService(engine)
     args = arguments(project)
     args["context"]["blockers"] = [{"issue_id": "must-fix-1", "category": "must_fix", "resolved": False}]
     with pytest.raises(RuntimeBlocked) as error:
         await service.resolve(**args)
     assert error.value.code == "arbitration_exhausted"
-    assert len(engine.calls) == 3
+    assert len(engine.calls) == 4
     assert not store.list("arbitration_decision", project["id"])
 
 

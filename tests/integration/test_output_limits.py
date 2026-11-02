@@ -20,7 +20,7 @@ async def test_truncated_turn_gets_more_room_without_becoming_a_json_repair(tmp_
     class Adapter:
         async def execute_turn(self, **kwargs):
             calls.append(kwargs)
-            if always_truncated or len(calls) == 1:
+            if (always_truncated and len(calls) <= 5) or len(calls) == 1:
                 raise RuntimeBlocked("model_output_truncated", "truncated")
             return {"score": 75} if private else {"content_markdown": "complete reply"}
 
@@ -38,12 +38,9 @@ async def test_truncated_turn_gets_more_room_without_becoming_a_json_repair(tmp_
             try:
                 result = await engine.turn(*args, publish_message=not private)
                 assert result == ({"score": 75} if private else {"content_markdown": "complete reply"})
-                assert len(escalations) == int(always_truncated)
-                if always_truncated:
-                    assert escalations[0]["reason_code"] == "model_output_truncated"
-                    assert escalations[0]["diagnostic"]["max_output_tokens"] == 131072
+                assert not escalations
                 limits = [call["runtime_context"]["max_output_tokens"] for call in calls]
-                assert limits == ([16384, 32768, 65536, 131072] if always_truncated else [16384, 32768] if private else [65536, 131072])
+                assert limits == ([16384, 32768, 65536, 131072, 131072, 131072] if always_truncated else [16384, 32768] if private else [65536, 131072])
                 assert len({call["turn_id"] for call in calls}) == len(calls)
                 assert all(":repair" not in call["turn_id"] for call in calls)
                 if private:

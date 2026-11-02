@@ -53,29 +53,23 @@ async def test_protocol_failure_retries_same_turn_then_accepts_complete_output(s
     assert not store.list("arbitration_request", p["id"])
 
 
-async def test_response_retry_budget_survives_replay_and_explicit_retry_gets_new_generation(scene):
+async def test_response_retry_audit_survives_restart_without_an_attempt_limit(scene):
     store, p, engine = scene
     calls = []
     async def produce(**args):
         calls.append(args["turn_id"])
-        if len(calls) <= 3:
+        if len(calls) == 4:
+            raise RuntimeError("worker restart")
+        if len(calls) <= 5:
             raise response_error()
         return {"content_markdown": "recovered"}
     engine.demo._produce_turn = produce
-    for _ in range(2):
-        with pytest.raises(RuntimeBlocked) as error:
-            await engine.turn(p["id"], "paper", "paper", "task", "reply", MessageReply, {})
-        assert error.value.code == "model_response_invalid"
-    assert len(calls) == 3
-    task = store.add_task(p["id"], "paper", {}, "root")
-    store.finish_task(task["id"], error={"code": "model_response_invalid"})
-    store.retry_failed_tasks(p["id"])
-    token = current_task.set(store.get("task", task["id"]))
-    try:
-        assert (await engine.turn(p["id"], "paper", "paper", "task", "reply", MessageReply, {}))["content_markdown"] == "recovered"
-    finally:
-        current_task.reset(token)
-    assert calls[-1] == "reply:recovery-1"
+    with pytest.raises(RuntimeError, match="worker restart"):
+        await engine.turn(p["id"], "paper", "paper", "task", "reply", MessageReply, {})
+    assert store.list("model_response_retry", p["id"])[0]["failures"] == 3
+    assert (await engine.turn(p["id"], "paper", "paper", "task", "reply", MessageReply, {}))["content_markdown"] == "recovered"
+    assert calls == ["reply"] * 6
+    assert store.list("model_response_retry", p["id"])[0]["failures"] == 4
 
 
 async def test_stop_after_malformed_response_prevents_replacement(scene):
@@ -92,12 +86,15 @@ async def test_stop_after_malformed_response_prevents_replacement(scene):
 
 
 @pytest.mark.parametrize("always_fail", [False, True])
-async def test_god_response_protocol_errors_use_existing_durable_three_attempt_budget(scene, always_fail):
+async def test_god_response_protocol_corrections_pass_three_and_still_obey_stop(scene, always_fail):
     store, p, engine = scene
     calls = []
     async def judge(request, context, attempt, **kwargs):
         calls.append(attempt)
-        if always_fail or attempt == 1:
+        if always_fail and attempt == 5:
+            engine.control.terminate(p["id"])
+            raise ResearchStopped("stopped during correction")
+        if attempt <= 4:
             raise response_error()
         return {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"],
             "action": "select_candidate", "selected_candidate_id": "member", "content_markdown": "choose", "rationale": "valid"}
@@ -106,13 +103,13 @@ async def test_god_response_protocol_errors_use_existing_durable_three_attempt_b
         reason_code="decision_blocked", origin_node="discussion.collect", allowed_actions=["select_candidate"],
         context={"role": "boss", "candidates": {"member": {}}, "blockers": []})
     if always_fail:
-        with pytest.raises(RuntimeBlocked) as error:
+        with pytest.raises(ResearchStopped):
             await engine.arbitration.resolve(**arguments)
-        assert error.value.code == "arbitration_exhausted" and calls == [1, 2, 3]
-        assert store.list("arbitration_request", p["id"])[0]["status"] == "exhausted"
+        assert calls == [1, 2, 3, 4, 5]
+        assert store.list("arbitration_request", p["id"])[0]["status"] == "cancelled"
     else:
         assert (await engine.arbitration.resolve(**arguments))["action"] == "select_candidate"
-        assert calls == [1, 2]
+        assert calls == [1, 2, 3, 4, 5]
 
 
 async def test_legacy_protocol_error_is_recovered_only_from_latest_boundary_and_never_after_stop(scene):

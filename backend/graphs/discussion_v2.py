@@ -69,9 +69,9 @@ class MemberDiscussion:
         saved = self.store.get("discussion_model_call", key) or {}
         if saved.get("output") is not None:
             return saved["output"]
-        # GenerationBudget owns the limit. Recovery may version its binding
-        # without replacing this discussion or any previously accepted ballots.
-        context = {**context, "generation_budget": {"kind": "discussion_generation", "key": key, "limit": 3}}
+        # Keep every correction on the same durable logical call, including
+        # retries of checkpoints created with the former generation limit.
+        context = {**context, "generation_budget": {"kind": "discussion_generation", "key": key}}
         if schema is not DiscussionFinal and hasattr(self.engine, "control"):
             line = self.store.get("line", state["research_id"] + ":" + state["line_id"]) if state.get("line_id") else None
             context["received_messages"] = await asyncio.to_thread(self.store.consume_agent_inbox,
@@ -84,14 +84,6 @@ class MemberDiscussion:
                 conversation_id=state["discussion_id"], line_id=state.get("line_id"),
                 publish_message=False, output_validator=validator)
         except RuntimeBlocked as error:
-            if error.code == "generation_budget_exhausted":
-                self.store.put("discussion_model_call", key, {"generation_contract_version": 2,
-                    "last_error": str(error), "member_id": member,
-                    "logical_turn": turn_id}, state["research_id"])
-                self.store.commit_discussion_state(state, state, [self._message(state,
-                    "generation-exhausted:" + key, "讨论回复纠正失败 · 成员 " + member + "：" + str(error),
-                    diagnostic=str(error), member_id=member, logical_turn=turn_id)])
-                raise RuntimeBlocked("discussion_output_exhausted", str(error)) from error
             if error.code in {"invalid_output", "model_output_truncated", "model_response_invalid"}:
                 # A resumed technical call must be able to correct the current
                 # member's malformed response without recasting accepted ballots.
