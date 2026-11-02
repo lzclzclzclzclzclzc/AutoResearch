@@ -1267,7 +1267,10 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             try:
                 allowed = bool(control.allows_progress(rid, receipt.get("control_generation")))
             except Exception:
-                allowed = False
+                # The receipt is durable, but an unavailable gate does not prove
+                # the project stopped. Retry before applying any terminal effects.
+                result["pending"].append(operation["id"])
+                continue
             with self.connect(True) as c:
                 current = c.execute("SELECT status FROM business_operations WHERE id=?", (operation["id"],)).fetchone()
                 if current["status"] != "pending_control_confirmation":
@@ -1526,7 +1529,9 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
         try:
             dispatch_allowed = bool(control.allows_progress(research_id, candidate["generation"]))
         except Exception:
-            dispatch_allowed = False
+            # Preserve this confirmed candidate for replay. Cancelling its tasks
+            # here would make a transient query failure permanent via the marker.
+            return {"status": "awaiting_confirmation_sync", "operation_id": operation["id"]}
         with self.connect(True) as c:
             marker = self._get(c, "boss_effects", decision_task_id)
             if marker:
