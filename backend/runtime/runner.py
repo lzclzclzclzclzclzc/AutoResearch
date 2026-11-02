@@ -494,6 +494,7 @@ class RunnerSupervisor:
         self.journal = DurableJournal(self.runtime_dir / "journal")
         self._creation_lock = threading.RLock()
         self._state_lock = threading.RLock()
+        self._control_check_lock = threading.Lock()
         self._operations: dict[str, dict] = {}
         self._starting_ids: set[str] = set()
         self._processes: dict[str, ManagedProcess] = {}
@@ -501,6 +502,7 @@ class RunnerSupervisor:
         self._stop_reasons: dict[str, str] = {}
         self._stop_operations: dict[str, dict] = {}
         self._stopped_projects: set[str] = set()
+        self._control_recoveries: dict[str, dict] = {}
         self._unbound_reconciling: set[str] = set()
         self._shutdown = threading.Event()
         self._process_factory = process_factory
@@ -516,13 +518,30 @@ class RunnerSupervisor:
                 self._stop_operations[record["operation_id"]] = record
         self._reconcile_restart()
         from .light_cpu import LightCpuService
-        self.light_cpu = LightCpuService(self.data_dir,self.control,self.service,self.instance_id,self.generation)
+        self.light_cpu = LightCpuService(self.data_dir,self.control,self.service,self.instance_id,self.generation,
+            admission_check=self._control_admits_project)
+        # In-process callers can use light_cpu immediately after construction.
+        # Initialize its shared gate before exposing that API, while allowing
+        # recovery and stop endpoints to start when Control is unavailable.
+        try:
+            self._connect_control()
+        except Exception:
+            pass
         self._monitor_thread = threading.Thread(target=self._monitor, name="runner-monitor", daemon=True)
         self._monitor_thread.start()
         self._deadline_thread = threading.Thread(target=self._deadlines, name="runner-deadlines", daemon=True)
         self._deadline_thread.start()
 
     def _connect_control(self) -> None:
+        # Serialize health observations, but never hold this lock in stop paths.
+        with self._control_check_lock:
+            try:
+                self._refresh_control()
+            except Exception:
+                self._suspend_control_work()
+                raise
+
+    def _refresh_control(self) -> None:
         state = self.control.status()
         epoch = state["control_epoch"]
         if self._control_epoch and self._control_epoch != epoch:
@@ -535,7 +554,64 @@ class RunnerSupervisor:
                 self.stop_project(rid, project.get("reason", "user_requested"))
         if hasattr(self.control, "register_supervisor"):
             self.control.register_supervisor(self.instance_id, f"{self._self_url}/stop-project")
+        self._reconcile_control_recoveries(state)
         self._control_ok = True
+
+    def _control_admits_project(self, research_id: str) -> bool:
+        return (self._control_ok and not self._shutdown.is_set()
+            and research_id not in self._stopped_projects and research_id not in self._control_recoveries)
+
+    def _suspend_control_work(self) -> None:
+        # A transport failure cancels admitted executions, not the project.
+        # Keep every run tombstone and hold new admission until exit is proven.
+        with self._creation_lock:
+            self._control_ok = False
+            with self._state_lock:
+                active = [dict(run) for run in self._operations.values()
+                    if run.get("state") not in TERMINAL or run.get("start_inflight") or run.get("reconciliation_pending")]
+            light_jobs = []
+            if hasattr(self, "light_cpu"):
+                with self.light_cpu.lock:
+                    light_jobs = [dict(job) for job in self.light_cpu.jobs.values()
+                        if job.get("state") not in TERMINAL or not job.get("process_tree_exited")
+                        or job.get("reconciliation_pending")]
+            for work, key in [(run, "experiment_run_id") for run in active] + [(job, "execution_id") for job in light_jobs]:
+                rid = work["research_id"]
+                if rid in self._stopped_projects:
+                    continue
+                recovery = self._control_recoveries.setdefault(rid, {
+                    "control_epoch": work.get("control_epoch", self._control_epoch),
+                    "control_generation": work["control_generation"], "runs": set(), "light_jobs": set()})
+                recovery["runs" if key == "experiment_run_id" else "light_jobs"].add(work[key])
+        for run in active:
+            if run["experiment_run_id"] not in self._cancelled:
+                self.request_stop(run["experiment_run_id"], "control_lost")
+        # Lightweight jobs observe the same admission fence inside their own
+        # supervision loop; their permanent stopped-project set is untouched.
+
+    def _reconcile_control_recoveries(self, state: dict) -> None:
+        for rid, recovery in list(self._control_recoveries.items()):
+            project = state.get("projects", {}).get(rid, {})
+            if (state["control_epoch"] != recovery["control_epoch"] or
+                    project.get("control_generation", recovery["control_generation"]) != recovery["control_generation"]):
+                self.stop_project(rid, "control_restarted")
+                continue
+            if not project.get("allowed") or project.get("stopped"):
+                continue
+            with self._creation_lock:
+                with self._state_lock:
+                    runs = [self._operations.get(identity, {}) for identity in recovery["runs"]]
+                    ready = all(run.get("state") in TERMINAL and not run.get("start_inflight")
+                        and not run.get("reconciliation_pending")
+                        and run.get("terminal_proof", {}).get("process_tree_exited")
+                        and run.get("terminal_proof", {}).get("start_operation_terminal") for run in runs)
+                with self.light_cpu.lock:
+                    jobs = [self.light_cpu.jobs.get(identity) for identity in recovery["light_jobs"]]
+                    # Only jobs whose reservation never succeeded are removed.
+                    ready = ready and all(job is None or (job.get("state") in TERMINAL
+                        and job.get("process_tree_exited") and not job.get("reconciliation_pending")) for job in jobs)
+                if ready and self._control_recoveries.get(rid) is recovery and rid not in self._stopped_projects:
+                    self._control_recoveries.pop(rid)
 
     def _reconcile_restart(self) -> None:
         # Exclusive OS lock proves all old Runner threads/late creates have ended.
@@ -575,6 +651,9 @@ class RunnerSupervisor:
             "journal_unknown": self.journal_unknown}
 
     def run_light_cpu(self,payload:dict)->dict:
+        self._connect_control()
+        if not self._control_admits_project(payload["research_id"]):
+            raise ControlUnavailable("Runner is waiting for previous executions to finish reconciliation")
         return self.light_cpu.execute(payload)
 
     def cancel_light_execution(self,parent_execution_id:str)->dict:
@@ -584,6 +663,8 @@ class RunnerSupervisor:
         if self.journal_unknown or self._shutdown.is_set():
             raise ResourceConflict("Runner recovery is incomplete; resources remain isolated")
         self._connect_control()
+        if payload["research_id"] in self._control_recoveries:
+            raise ControlUnavailable("Runner is waiting for previous executions to finish reconciliation")
         allocation = self.service.request_allocation(payload)
         rid = payload["research_id"]
         if rid in self._stopped_projects or not self.control.allows_progress(rid, payload.get("control_generation", 1), self._control_epoch):
@@ -605,6 +686,8 @@ class RunnerSupervisor:
                 if operation["start_operation_id"] != payload["start_operation_id"]:
                     raise ResourceConflict("Run identity cannot be reused by another start operation")
                 return self.status(run_id)
+            if rid in self._control_recoveries:
+                raise ControlUnavailable("Runner is waiting for previous executions to finish reconciliation")
             if run_id in self._cancelled or rid in self._stopped_projects or self.journal_unknown:
                 raise ResourceConflict("A terminal cancellation tombstone forbids this start")
             if run_id in self._starting_ids:
@@ -676,7 +759,11 @@ class RunnerSupervisor:
                 self._cancelled.add(run_id)
                 process = self._processes.get(run_id) or prepared_process
             exited = process.terminate() if process else True
-            run.update(state="cancelled" if rid in self._stopped_projects or not self.control.allows_progress(rid) else "execution_failed",
+            try:
+                allowed = self.control.allows_progress(rid)
+            except Exception:
+                allowed = False
+            run.update(state="cancelled" if rid in self._stopped_projects or not allowed else "execution_failed",
                 error=str(exc), stop_reason="start_interrupted")
             self._finish(run, exited)
             if not exited:
@@ -698,6 +785,7 @@ class RunnerSupervisor:
         # No DB, disk or network calls in this critical section.
         if (not self._control_ok or run["control_epoch"] != self._control_epoch or self._shutdown.is_set()
                 or run["experiment_run_id"] in self._cancelled or run["research_id"] in self._stopped_projects
+                or run["research_id"] in self._control_recoveries
                 or run["deadline_at"] <= time.time()):
             raise ControlUnavailable("Local execution gate is closed")
 
@@ -709,7 +797,7 @@ class RunnerSupervisor:
         run_id = run["experiment_run_id"]
         requested_reason = self._stop_reasons.get(run_id)
         if requested_reason or run["research_id"] in self._stopped_projects:
-            run["state"] = "cancelled" if run["research_id"] in self._stopped_projects else "early_stopped"
+            run["state"] = "cancelled" if run["research_id"] in self._stopped_projects or requested_reason == "control_lost" else "early_stopped"
             run["stop_reason"] = requested_reason or "user_requested"
         # Tombstone becomes effective in memory before any blocking persistence.
         self._cancelled.add(run_id)
@@ -746,8 +834,10 @@ class RunnerSupervisor:
             try:
                 final = self.service.release(proof, run["state"], run.get("stop_reason"))
                 with self._state_lock:
-                    self._operations[run_id].update(final, reconciliation_pending=False, process_tree_exited=True)
+                    self._operations[run_id].update(final, reconciliation_pending=True, process_tree_exited=True)
                 self.control.complete_execution(run_id)
+                with self._state_lock:
+                    self._operations[run_id]["reconciliation_pending"] = False
                 process = self._processes.pop(run_id, None)
                 if process:
                     process.close()
@@ -808,7 +898,9 @@ class RunnerSupervisor:
         return {**run, "state": "stopping", "process_tree_exited": False}
 
     def stop_project(self, research_id: str, reason: str = "user_requested") -> dict:
-        self._stopped_projects.add(research_id)
+        with self._creation_lock:
+            self._stopped_projects.add(research_id)
+            self._control_recoveries.pop(research_id, None)
         if hasattr(self,"light_cpu"):
             self.light_cpu.stop_project(research_id,reason)
         with self._state_lock:
@@ -938,11 +1030,7 @@ class RunnerSupervisor:
                 try:
                     self._connect_control()
                 except Exception:
-                    self._control_ok = False
-                    with self._state_lock:
-                        projects = {r["research_id"] for r in self._operations.values() if r.get("state") not in TERMINAL}
-                    for rid in projects:
-                        self.stop_project(rid, "control_lost")
+                    pass  # _connect_control already fenced and interrupted active work.
             with self._state_lock:
                 operations = [(rid, copy.deepcopy(run)) for rid, run in self._operations.items()]
             for rid, run in operations:
@@ -1084,7 +1172,7 @@ def create_app(data_dir: str | Path = "data", supervisor: RunnerSupervisor | Non
 
     @app.post("/light-cpu")
     def light_cpu(payload:dict):
-        return service.light_cpu.execute(payload)
+        return service.run_light_cpu(payload)
 
     @app.post("/cancel-light-execution")
     async def cancel_light_execution(payload:dict):

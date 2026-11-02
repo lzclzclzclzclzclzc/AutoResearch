@@ -40,12 +40,13 @@ def validate_numeric_code(code: str) -> tuple[ast.Module, dict, dict]:
 
 
 class LightCpuService:
-    def __init__(self,data_dir:Path,control:Any,resources:Any,instance_id:str,generation:str):
+    def __init__(self,data_dir:Path,control:Any,resources:Any,instance_id:str,generation:str,admission_check=None):
         self.data_dir=Path(data_dir).resolve()
         self.directory=self.data_dir/"light_cpu"
         self.directory.mkdir(parents=True,exist_ok=True)
         self.control,self.resources=control,resources
         self.instance_id,self.generation=instance_id,generation
+        self.admission_check=admission_check or (lambda research_id: True)
         self.jobs:dict[str,dict]={}
         self.processes:dict[str,ManagedProcess]={}
         self.stopped:set[str]=set()
@@ -89,7 +90,7 @@ class LightCpuService:
         parent=payload.get("parent_execution_id")
         if (payload.get("parent_pid") is not None or payload.get("parent_create_time") is not None) and not parent:
             raise ValueError("父进程监督身份必须绑定父执行 ID")
-        if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self._parent_alive(payload) or not self.control.allows_progress(rid,generation):
+        if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or not self._parent_alive(payload) or not self.control.allows_progress(rid,generation):
             raise ControlUnavailable("研究停止、到期或控制服务不可用")
         store=Store(self.data_dir)
         identity=store.get("agent",f"{rid}:{agent}")
@@ -152,7 +153,7 @@ class LightCpuService:
             if not self._parent_alive(job):raise ControlUnavailable("父 Agent 执行已退出，禁止创建计算")
             if not self.control.allows_progress(rid,generation,job["control_epoch"]):raise ControlUnavailable("控制门禁已关闭")
             with self.creation_lock:
-                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
+                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
                 process.create_suspended()
                 self.processes[execution_id]=process
                 job["pid"]=process.pid
@@ -162,15 +163,15 @@ class LightCpuService:
             if not self._parent_alive(job):raise ControlUnavailable("父 Agent 执行已退出，禁止恢复计算")
             if not self.control.allows_progress(rid,generation,job["control_epoch"]):raise ControlUnavailable("恢复执行前控制门禁已关闭")
             with self.creation_lock:
-                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
+                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
                 process.resume();job["state"]="running"
             self.resources.update_light(job)
             while process.poll() is None:
-                if self.closed.wait(.1) or rid in self.stopped or parent in self.cancelled_parents or not self._parent_alive(job) or time.time()>=job["deadline_at"]:
+                if self.closed.wait(.1) or rid in self.stopped or parent in self.cancelled_parents or not self.admission_check(rid) or not self._parent_alive(job) or time.time()>=job["deadline_at"]:
                     raise ControlUnavailable("研究停止或总时间到期")
                 if not self.control.allows_progress(rid,generation,job["control_epoch"]):
                     raise ControlUnavailable("控制服务失联或执行许可失效")
-            if rid in self.stopped or parent in self.cancelled_parents or not self._parent_alive(job) or not self.control.allows_progress(rid,generation,job["control_epoch"]):
+            if rid in self.stopped or parent in self.cancelled_parents or not self.admission_check(rid) or not self._parent_alive(job) or not self.control.allows_progress(rid,generation,job["control_epoch"]):
                 raise ControlUnavailable("结果返回前研究已停止")
             job.update(state="completed" if process.poll()==0 else "execution_failed",exit_code=process.poll())
             if job["state"]=="completed":
@@ -189,12 +190,13 @@ class LightCpuService:
         finally:
             exited=process.terminate() if process else True
             if admitted:
-                job.update(ended_at=iso_now(),process_tree_exited=exited)
+                job.update(ended_at=iso_now(),process_tree_exited=exited,reconciliation_pending=True)
                 if exited:
                     try:
                         self._artifacts(store, job)
                         self.resources.update_light(job,terminal_proof=True)
                         self.control.complete_execution(execution_id)
+                        job["reconciliation_pending"]=False
                     except Exception:
                         job["reconciliation_pending"]=True
                 else:job.update(state="stopping",reconciliation_pending=True)
