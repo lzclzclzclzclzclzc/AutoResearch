@@ -262,8 +262,6 @@ class DshRuntimeAdapter:
         project = self.store.project(research_id)
         generation = project["control_generation"]
         session = self.ensure_session(research_id, agent_id, direction_epoch)
-        interrupted_history = any(e.get("session_id") == session["session_id"] and e.get("status") in {"interrupted", "unknown"}
-                                  for e in self.store.list("execution", research_id))
         logical_key = digest([research_id, agent_id, task_id, turn_id])
         concurrency = project["config_snapshot"]["team"].get("model_concurrency", 4)
         project_semaphore = self.project_semaphores.setdefault(research_id, asyncio.Semaphore(concurrency))
@@ -290,6 +288,11 @@ class DshRuntimeAdapter:
                 if pid and psutil.pid_exists(pid):
                     raise RuntimeBlocked("execution_unknown", "旧 DSH 执行仍存活，拒绝重复调用")
                 self.store.patch("execution", logical_key, status="interrupted")
+            # The preceding owner may have saved history while this turn waited
+            # for the session lock. Choose start/resume from the admitted state.
+            session = self.ensure_session(research_id, agent_id, direction_epoch)
+            interrupted_history = any(e.get("session_id") == session["session_id"] and e.get("status") in {"interrupted", "unknown"}
+                                      for e in self.store.list("execution", research_id))
             secret = self.credentials.get_secret(project["provider_config_id"], version=project.get("credential_version"))
             if not secret:
                 raise RuntimeBlocked("credential_missing", "请先在设置中保存 DeepSeek API Key")
