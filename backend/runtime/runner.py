@@ -521,7 +521,7 @@ class RunnerSupervisor:
         self._reconcile_restart()
         from .light_cpu import LightCpuService
         self.light_cpu = LightCpuService(self.data_dir,self.control,self.service,self.instance_id,self.generation,
-            admission_check=self._control_admits_project)
+            admission_check=self._control_admits_project,owns_runner_lock=True)
         # In-process callers can use light_cpu immediately after construction.
         # Initialize its shared gate before exposing that API, while allowing
         # recovery and stop endpoints to start when Control is unavailable.
