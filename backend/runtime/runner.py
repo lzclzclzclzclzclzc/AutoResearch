@@ -296,13 +296,15 @@ class ResourceService:
                     continue
                 try:
                     other_project = self._project(c, other["research_id"], other["control_generation"])
+                    self._frozen_spec(c, other)
                     other_config = other_project.get("config_snapshot", {}).get("team", {})
                     other_max = max(1, int(other_config.get("experiment_concurrency", 1)))
                     if sum(not item.get("light_cpu") and item["research_id"] == other["research_id"] for item in held) >= other_max:
                         continue
                 except ResourceConflict:
-                    # A paused/blocked/obsolete request keeps its queue position
-                    # for recovery but cannot hold up currently runnable work.
+                    # Revalidate the same frozen plan/direction as admission.
+                    # Ineligible requests retain their record and queue age for
+                    # recovery, but cannot hold up currently runnable work.
                     continue
                 other_score = float(other.get("priority", 0)) + (now - other["requested_at"]) / 30
                 other_requested = other.get("requested_gpu_uuids", other.get("gpu_uuids", []))
