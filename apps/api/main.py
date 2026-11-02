@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from apps.api.arbitration_views import request_detail, request_list
+from apps.api.export_views import export_artifacts, export_records
 from backend.adapters.provider_endpoints import DEFAULT_MESSAGES_BASE_URL, messages_base_url, messages_url
 from backend.adapters.token_limits import CONNECTION_OUTPUT_TOKENS
 from backend.persistence import Store, StoreError, canonical, new_id, now
@@ -651,31 +652,26 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         rid = request_id(request, body)
         previous = s.get("export", rid)
         if previous:
-            if previous.get("research_id") != research_id:
-                raise StoreError("idempotency_conflict", "请求 ID 已用于其他研究导出")
+            if previous.get("research_id") != research_id or previous.get("kind", "all") != body.kind:
+                raise StoreError("idempotency_conflict", "请求 ID 已用于其他研究或导出类型")
             return previous
         snapshot = s.snapshot(research_id)
+        records = _public(export_records(s, research_id, body.kind, snapshot))
+        attachments = export_artifacts(s, research_id, body.kind, records)
         directory = root / "artifacts" / research_id
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"export-{new_id()}.zip"
         temporary = target.with_suffix(".tmp")
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("snapshot.json", canonical(_public(snapshot)))
-            for kind in ("submission", "spec", "verification", "boss_decision", "report", "memory_node", "memory_version"):
-                archive.writestr(f"{kind}.json", canonical(_public(s.list(kind, research_id))))
-            with s.connect() as c:
-                msgs = [json.loads(r[0]) for r in c.execute("SELECT data FROM messages WHERE research_id=? ORDER BY cursor", (research_id,))]
-                events = [json.loads(r[0]) for r in c.execute("SELECT data FROM events WHERE research_id=? ORDER BY seq", (research_id,))]
-            archive.writestr("conversations.json", canonical(_public(msgs)))
-            archive.writestr("events.json", canonical(_public(events)))
-            for info in s.list("artifact", research_id):
-                if info.get("purpose") == "export":
-                    continue
+            for name, value in records.items():
+                archive.writestr(name, canonical(value))
+            for info in attachments:
                 _, source = s.artifact(info["artifact_id"])
                 archive.write(source, f"artifacts/{info['artifact_id']}/{source.name}")
         os.replace(temporary, target)
         artifact = s.register_artifact(research_id, target, "application/zip", purpose="export")
-        result = {"artifact_id": artifact["artifact_id"], "download_url": f"/api/artifacts/{artifact['artifact_id']}?download=true", "version": 1}
+        result = {"artifact_id": artifact["artifact_id"], "download_url": f"/api/artifacts/{artifact['artifact_id']}?download=true",
+            "kind": body.kind, "version": 1}
         s.put("export", rid, result, research_id)
         return result
 
