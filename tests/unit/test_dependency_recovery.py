@@ -120,3 +120,59 @@ async def test_verify_and_ordinary_boss_publication_trigger_new_coordination_and
     await service.dispatch(p["id"])
     assert store.get("dependency_wait", job["id"])["status"] == "fulfilled"
     assert store.get("task", root["id"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_v2_boss_plan_and_sourced_memory_resume_the_original_parent_once(waiting, tmp_path):
+    from backend.graphs.engine import ResearchEngine
+    store, control, service, p, root, job = waiting
+    rid = p["id"]
+    engine = ResearchEngine(store, control, None, None, None)
+    try:
+        await service.dispatch(rid)
+        boss_id = store.get("dependency_wait", job["id"])["coordination_ids"][0]
+        source = tmp_path / "baseline.txt"
+        source.write_text("A real baseline observation.", encoding="utf-8")
+        artifact = store.register_artifact(rid, source, line_id="line-01")
+        decision = {"protocol_version": 2, "discussion_id": "dependency-boss", "next_step": "report",
+            "final_output": {"content_markdown": "Publish the baseline and report.",
+                "memory_updates": [{"content_markdown": "Baseline observation", "source_ids": [artifact["id"]]}]}}
+        await engine.apply_discussion_boss(store.get("task", boss_id), decision, {"lines": store.lines(rid)})
+        store.finish_task(boss_id, result=decision)
+        assert store.get("boss_operation_plan", boss_id)["status"] == "applied"
+        assert not store.get("boss_effects", boss_id)
+        assert store.get("boss_effects", boss_id + ":operation:0")["status"] == "applied"
+        for _ in range(3):
+            await service.dispatch(rid)
+        resolved = store.get("dependency_wait", job["id"])
+        assert resolved["status"] == "fulfilled"
+        assert resolved["coordination_ids"] == [boss_id]
+        assert resolved["result"]["boss_decision_id"] == boss_id
+        assert resolved["result"]["shared_memory"][0]["source_ids"] == [artifact["id"]]
+        assert store.get("task", root["id"])["status"] == "pending"
+        assert len([event for event in store.events(rid) if event["type"] == "dependency.ready"]) == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["completed_plan", "receipt", "source", "completed_task"])
+async def test_v2_dependency_still_requires_a_complete_plan_and_traceable_publication(waiting, tmp_path, missing):
+    store, _, service, p, root, job = waiting
+    rid = p["id"]
+    await service.dispatch(rid)
+    boss_id = store.get("dependency_wait", job["id"])["coordination_ids"][0]
+    if missing != "completed_task":
+        store.finish_task(boss_id, result={})
+    store.put("boss_operation_plan", boss_id, {"status": "pending" if missing == "completed_plan" else "applied"}, rid)
+    # Even a legacy root effect must not override an unfinished V2 plan.
+    store.put("boss_effects", boss_id, {"status": "applied"}, rid)
+    source = tmp_path / "baseline.txt"
+    source.write_text("baseline", encoding="utf-8")
+    artifact = store.register_artifact(rid, source, line_id="line-01")
+    store.put("memory_node", "baseline", {"boss_decision_id": boss_id,
+        "source_ids": ["missing" if missing == "source" else artifact["id"]],
+        "receipt": None if missing == "receipt" else {"persisted": True}}, rid)
+    await service.dispatch(rid)
+    assert store.get("dependency_wait", job["id"])["status"] == "waiting_children"
+    assert store.get("task", root["id"])["status"] == "waiting_recovery"

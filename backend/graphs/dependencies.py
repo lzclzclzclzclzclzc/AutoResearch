@@ -118,7 +118,9 @@ class DependencyService:
             for boss_id in job["coordination_ids"]:
                 boss = self.store.get("task", boss_id)
                 effective_id = self.store.effective_boss_task_id(boss_id)
-                effects = self.store.get("boss_effects", effective_id)
+                # V2 commits the whole plan at the root ID; its individual
+                # effects live under :operation:N and cannot alone release a wait.
+                effects = self.store.get("boss_operation_plan", effective_id) or self.store.get("boss_effects", effective_id)
                 shared = self._published(job, effective_id)
                 if boss and boss["status"] == "completed" and effects and effects["status"] == "applied" and shared:
                     # The original group still reviews whether these results meet
