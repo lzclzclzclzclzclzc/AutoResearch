@@ -140,6 +140,32 @@ class ResearchEngine:
             raise ResearchStopped("独立控制门禁已关闭或失联")
         return p
 
+    def _bind_turn_scope(self, research_id, line_id, context):
+        context = dict(context)
+        if line_id:
+            task_scope = (current_task.get() or {}).get("payload", {})
+            if task_scope.get("line_id") == line_id:
+                for field in ("direction_epoch", "cycle_id"):
+                    if field in task_scope:
+                        context.setdefault(field, task_scope[field])
+            line = self.store.get("line", f"{research_id}:{line_id}")
+            if line:
+                context.setdefault("direction_epoch", line["direction_epoch"])
+                context.setdefault("cycle_id", line.get("cycle_id"))
+        return context
+
+    def _assert_turn_scope(self, research_id, line_id, role, context):
+        if not line_id:
+            return
+        line = self.store.get("line", f"{research_id}:{line_id}")
+        direction = context.get("direction_epoch")
+        if (not line or (direction is not None and (line["direction_epoch"] != direction or
+                line.get("direction_stop_epoch") == direction)) or
+                ("cycle_id" in context and line.get("cycle_id") != context["cycle_id"])):
+            raise RuntimeBlocked("task_superseded", "原研究方向或周期已失效，当前回合仅保留历史")
+        if role in {"exploration", "critic", "implementation"} and line.get("finish_requested"):
+            raise RuntimeBlocked("line_finished", "该研究方向已结束，停止生成和接纳新的角色回复")
+
     async def line_open(self, state):
         await self.guard(state["research_id"])
         line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
@@ -199,8 +225,12 @@ class ResearchEngine:
                 reason_code=saved_failure["reason_code"], diagnostic=saved_failure["diagnostic"],
                 recovery_chain_id=chain_id, **values)
         try:
+            # Bind before waiting for the member lock; old work must not adopt
+            # a new cycle that started while this call was queued.
+            call_values = {**original_values, "context": self._bind_turn_scope(
+                research_id, original_values["line_id"], original_values["context"])}
             async with self.agent_turn_locks.setdefault((research_id, agent_id), asyncio.Lock()):
-                return await self._turn(**original_values)
+                return await self._turn(**call_values)
         except RuntimeBlocked as error:
             if original_values["context"].get("no_arbitration"):
                 # Technical recovery must never replace an individual member's vote.
@@ -310,7 +340,7 @@ class ResearchEngine:
                    conversation_id=None, line_id=None, message_kind="discussion", recipients=None, edge_id=None,
                    publish_message=True, reply_to=None, output_validator=None):
         project = await self.guard(research_id)
-        context = dict(context)
+        context = self._bind_turn_scope(research_id, line_id, context)
         root_task = current_task.get() or {}
         task_record = self.store.get("task", root_task.get("id", "")) or {}
         if task_record.get("watchdog_prompts"):
@@ -319,16 +349,7 @@ class ResearchEngine:
         plan = context.get("spec") or context.get("submission", {}).get("spec", {})
         if plan.get("discussion_protocol") == 2:
             context.setdefault("discussion_protocol", 2)
-        if line_id and "direction_epoch" not in context:
-            line = next((line for line in self.store.lines(research_id) if line["line_id"] == line_id), None)
-            if line:
-                context["direction_epoch"] = line["direction_epoch"]
-        if line_id and role in {"exploration", "critic", "implementation"} and not turn_id.startswith("monitor-"):
-            line = next(line for line in self.store.lines(research_id) if line["line_id"] == line_id)
-            if line["direction_epoch"] != context.get("direction_epoch", line["direction_epoch"]) or line.get("direction_stop_epoch") == context.get("direction_epoch"):
-                raise RuntimeBlocked("task_superseded", "旧研究方向已结束，当前回合仅保留历史")
-            if line.get("finish_requested"):
-                raise RuntimeBlocked("line_finished", "Boss 已结束该研究方向，停止发起新角色任务")
+        self._assert_turn_scope(research_id, line_id, role, context)
         conversation_id = conversation_id or f"{research_id}:{task_id}"
         inbox_consumer = digest([research_id, agent_id, task_id, turn_id, "received-messages"])
         if publish_message:
@@ -366,12 +387,14 @@ class ResearchEngine:
                 prompt += "\n同一逻辑回合的先前尝试未获采纳，请根据具体错误更正完整 JSON：" + json.dumps(corrections[-1:], ensure_ascii=False)
         while True:
             project = await self.guard(research_id)
+            self._assert_turn_scope(research_id, line_id, role, context)
             if context.get("generation_budget", {}).get("kind") == "monitor_generation":
                 current_run = await asyncio.to_thread(self.runner.status, context["run"]["experiment_run_id"])
                 if current_run.get("state", "unknown") == "unknown":
                     raise RuntimeBlocked("runner_unknown", "实验状态未知，保留监控窗口并等待对账")
                 if current_run.get("state") != "running":
                     raise RuntimeBlocked("monitor_run_finished", "实验已退出，停止当前日志窗口的生成纠错")
+                self._assert_turn_scope(research_id, line_id, role, context)
             generation_attempt = None
             response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
             response_retry = self.store.get("model_response_retry", response_retry_id) or {}
@@ -393,6 +416,8 @@ class ResearchEngine:
                 if generation_budget:
                     generation_budget.record(generation_attempt, "returned", output=result)
                 result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
+                await self.guard(research_id)
+                self._assert_turn_scope(research_id, line_id, role, context)
                 for instruction in context.get("watchdog_repair_instructions", []):
                     operation = self.store.get("watchdog_action", instruction["operation_id"])
                     if operation and not operation.get("consumed_by"):
@@ -474,10 +499,7 @@ class ResearchEngine:
         validator = self.validate_recovery_output if decision_source == "god" else self.validate_output
         result = validator(research_id, repaired_for_agent_id or agent_id, schema, result, context, output_validator)
         project = await self.guard(research_id)
-        if line_id and context.get("direction_epoch") is not None:
-            line = self.store.get("line", f"{research_id}:{line_id}")
-            if line and (line["direction_epoch"] != context["direction_epoch"] or line.get("direction_stop_epoch") == context["direction_epoch"]):
-                raise RuntimeBlocked("task_superseded", "旧方向的晚到回复不能推进后继任务")
+        self._assert_turn_scope(research_id, line_id, role, context)
         if not publish_message:
             return result
         conversation_id = conversation_id or f"{research_id}:{task_id}"
@@ -1186,10 +1208,11 @@ class ResearchEngine:
             monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
                 f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
                 "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
+                **{field: state[field] for field in ("direction_epoch", "cycle_id") if field in state},
                 "rule_ids": allowed, "no_arbitration": True, "generation_budget": {"kind": "monitor_generation", "key": window_id}},
                 conversation_id=run_id + ":monitor", line_id=state["line_id"], output_validator=validate_monitor)
         except RuntimeBlocked as error:
-            if error.code != "monitor_run_finished":
+            if error.code not in {"monitor_run_finished", "task_superseded", "line_finished"}:
                 raise
             self.store.patch("run_monitor_window", window_id, status="late")
             return None
@@ -1203,7 +1226,8 @@ class ResearchEngine:
         line = self.store.get("line", f"{rid}:{state['line_id']}")
         if (current.get("state") != "running" or project["status"] != "running" or
                 (line and (line.get("finish_requested") or line.get("direction_stop_epoch") == line["direction_epoch"] or
-                    state.get("direction_epoch", line["direction_epoch"]) != line["direction_epoch"]))):
+                    state.get("direction_epoch", line["direction_epoch"]) != line["direction_epoch"] or
+                    ("cycle_id" in state and state["cycle_id"] != line.get("cycle_id"))))):
             self.store.patch("run_monitor_window", window_id, status="late", late_decision=monitor)
             return None
         await self.guard(rid, allow_paused=True)
