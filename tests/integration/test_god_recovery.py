@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -18,6 +20,16 @@ def split_plan(schema=MessageReply):
          "allowed_write_paths": ["/sections/" + name], "depends_on": []} for name in ("first", "second")],
         "merge_plan": {"strategy": "markdown_sections", "order": ["first", "second"], "base_output": {}},
         "invariants": {}, "acceptance_checks": ["both sections and original MessageReply"]}
+
+
+async def recover_truncated_parent(engine, research_id, task_id, instruction):
+    # Start at the recovery entry for an already recorded failure. Correction
+    # attempts stay unlimited and are exercised separately by test_output_limits.
+    async with asyncio.timeout(10):
+        return await engine.arbitration.repair_turn(research_id, "boss/member-01", "boss",
+            task_id, "reply", MessageReply, {"instruction": instruction},
+            reason_code="model_output_truncated", diagnostic={"code": "model_output_truncated",
+                "message": "Recorded incomplete parent response requires decomposition"})
 
 
 def test_god_prompt_preserves_candidates_and_exposes_complete_pagination_manifest():
@@ -84,8 +96,7 @@ async def test_truncated_parent_interrupts_and_children_resume_without_worker_sl
             calls = []
             async def produce(**args):
                 calls.append((args["role"], args["schema"].__name__, args["turn_id"]))
-                if args["schema"] is MessageReply:
-                    raise RuntimeBlocked("model_output_truncated", "truncated")
+                assert args["schema"].__name__ != "MessageReply", "the parent already entered arbitration"
                 if args["role"] == "god":
                     req = args["context"]["arbitration_request"]
                     return {"arbitration_id": req["id"], "snapshot_hash": req["snapshot_hash"],
@@ -95,7 +106,7 @@ async def test_truncated_parent_interrupts_and_children_resume_without_worker_sl
                 return {"sections": {path: path.upper()}}
             engine.demo._produce_turn = produce
             async def operation(task):
-                return await engine.turn(p["id"], "boss/member-01", "boss", "logical", "reply", MessageReply, {"instruction": "long reply"})
+                return await recover_truncated_parent(engine, p["id"], "logical", "long reply")
             parent_graph = PaperGraph(operation, saver)
             task = store.add_task(p["id"], "paper", {}, "parent")
             token = current_task.set(task)
@@ -145,8 +156,7 @@ async def test_consecutive_recovery_waits_keep_interrupt_order_across_restarts(t
     async def produce(**args):
         name = args["schema"].__name__
         calls.append(name)
-        if name == "MessageReply":
-            raise RuntimeBlocked("model_output_truncated", "truncated")
+        assert name != "MessageReply", "the parent already entered arbitration"
         if name == "GodDecision":
             request = args["context"]["arbitration_request"]
             output = {"arbitration_id": request["id"], "snapshot_hash": request["snapshot_hash"],
@@ -178,10 +188,8 @@ async def test_consecutive_recovery_waits_keep_interrupt_order_across_restarts(t
                             first = await engine.recover_action(request, decision, context=context,
                                 agent_id="boss/member-01", role="boss", task_id="first", turn_id="recover")
                         else:
-                            first = await engine.turn(project["id"], "boss/member-01", "boss", "first", "reply",
-                                MessageReply, {"instruction": "first reply"})
-                        second = await engine.turn(project["id"], "boss/member-01", "boss", "second", "reply",
-                            MessageReply, {"instruction": "second reply"})
+                            first = await recover_truncated_parent(engine, project["id"], "first", "first reply")
+                        second = await recover_truncated_parent(engine, project["id"], "second", "second reply")
                         return {"first": first, "second": second}
                     graph = PaperGraph(operation, saver)
                     task = store.get("task", parent["id"])
@@ -219,7 +227,6 @@ async def test_consecutive_recovery_waits_keep_interrupt_order_across_restarts(t
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replace_failed_plan", [False, True])
 async def test_real_worker_capacity_one_runs_children_while_parent_waits(tmp_path, monkeypatch, replace_failed_plan):
-    import asyncio
     import backend.graphs.engine as engine_module
     import backend.runtime.control as control_module
     import backend.runtime.runner as runner_module
@@ -237,10 +244,9 @@ async def test_real_worker_capacity_one_runs_children_while_parent_waits(tmp_pat
             super().__init__(*args)
             self.demo._produce_turn = self.produce
         async def paper(self, task):
-            return await self.turn(p["id"], "boss/member-01", "boss", "logical", "reply", MessageReply, {"instruction": "long reply"})
+            return await recover_truncated_parent(self, p["id"], "logical", "long reply")
         async def produce(self, **args):
-            if args["schema"] is MessageReply:
-                raise RuntimeBlocked("model_output_truncated", "truncated")
+            assert args["schema"].__name__ != "MessageReply", "the parent already entered arbitration"
             if args["role"] == "god":
                 req = args["context"]["arbitration_request"]
                 generations["god"] += 1
@@ -253,7 +259,7 @@ async def test_real_worker_capacity_one_runs_children_while_parent_waits(tmp_pat
             if part == "first":
                 generations["first"] += 1
             if replace_failed_plan and part == "second" and "recovered" not in args["context"]["instruction"]:
-                return {"sections": {"second": 12}}
+                raise RuntimeBlocked("recovery_child_output_invalid", "Fixture child failed acceptance; replace its plan")
             await asyncio.sleep(0.05)
             return {"sections": {part: part.upper()}}
     monkeypatch.setattr(engine_module, "ResearchEngine", Engine)
