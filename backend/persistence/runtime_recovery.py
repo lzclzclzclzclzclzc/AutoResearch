@@ -32,6 +32,7 @@ class RuntimeRecoveryStoreMixin:
     def complete_model_turn(self, execution_key, output, *, payload, fields=None, session_id=None):
         """Cache the result, session history and completion event as one fact."""
         from backend.persistence.store import now
+        from packages.contracts.research import digest
         with self.connect(True) as c:
             execution = self._get(c, "execution", execution_key)
             if execution["status"] == "completed":
@@ -41,7 +42,13 @@ class RuntimeRecoveryStoreMixin:
                 "status": "completed", "output": output, "completed_at": now()}, rid)
             if session_id:
                 session = self._get(c, "dsh_session", session_id)
-                self._put(c, "dsh_session", session_id, {**session, "has_history": True}, rid)
+                # The locked profile's Organizer session is machine-wide. Keep
+                # its original owner; the execution and event still belong to rid.
+                shared_organizer = (execution.get("agent_id") == session.get("agent_id") == "organizer"
+                    and session_id == digest(["machine", "organizer", 1, "1"])[:32]
+                    and execution.get("session_id") == session.get("session_id") == "ar-" + session_id)
+                owner = session.get("research_id") if shared_organizer else rid
+                self._put(c, "dsh_session", session_id, {**session, "has_history": True}, owner)
             self._emit(c, rid, "agent.completed", payload, agent_id=execution["agent_id"],
                 execution_id=execution["execution_attempt_id"], task_id=execution["task_id"])
             return result
