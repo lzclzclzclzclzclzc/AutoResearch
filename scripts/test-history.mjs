@@ -43,6 +43,87 @@ test('package replay keeps verification pending until its actual event',()=>{
   assert.equal(projectHistory(snapshot,events,7).reports.length,1);
 });
 
+test('line replay accumulates phase patches without borrowing a future direction, cycle or spec',()=>{
+  const live={...snapshot,lines:[{id:'line-record',research_id:'research',line_id:'line-01',title:'Line one',k:3,
+    phase:'completed',direction_epoch:3,cycle_id:'cycle-3',active_spec_id:'spec-3',completed_verify_rounds:9,
+    objective:'future objective',error:{code:'future error'},finish_requested:true}]};
+  const progress=[
+    {seq:1,type:'line.phase_changed',line_id:'line-01',occurred_at:t(1),payload:{phase:'exploration',direction_epoch:2,cycle_id:'cycle-2',completed_verify_rounds:0}},
+    {seq:2,type:'line.phase_changed',line_id:'line-01',occurred_at:t(2),payload:{phase:'critic'}},
+    {seq:3,type:'line.phase_changed',line_id:'line-01',occurred_at:t(3),payload:{phase:'implementation',active_spec_id:'spec-2'}},
+    {seq:4,type:'line.phase_changed',line_id:'line-01',occurred_at:t(4),payload:{phase:'running'}},
+    {seq:5,type:'verification.completed',line_id:'line-01',cycle_id:'cycle-2',occurred_at:t(5),payload:{round_no:1,passed:false}},
+    {seq:6,type:'line.phase_changed',line_id:'line-01',occurred_at:t(6),payload:{phase:'waiting_boss'}},
+  ];
+  const before=structuredClone(live);
+  const initial=projectHistory(live,progress,0).lines[0];
+  assert.equal(initial.title,'Line one');
+  assert.equal(initial.k,3);
+  assert.equal(initial.direction_epoch,1);
+  assert.equal(initial.cycle_id,null);
+  assert.equal(initial.active_spec_id,undefined);
+  assert.equal(initial.objective,undefined);
+  assert.equal(initial.error,undefined);
+  assert.equal(initial.finish_requested,undefined);
+  assert.equal(initial.completed_verify_rounds,0);
+  const critic=projectHistory(live,progress,2).lines[0];
+  assert.equal(critic.direction_epoch,2);
+  assert.equal(critic.cycle_id,'cycle-2');
+  assert.equal(critic.phase,'critic');
+  assert.equal(critic.active_spec_id,undefined);
+  const running=projectHistory(live,[...progress].reverse(),4).lines[0];
+  assert.equal(running.direction_epoch,2);
+  assert.equal(running.cycle_id,'cycle-2');
+  assert.equal(running.active_spec_id,'spec-2');
+  assert.equal(running.phase,'running');
+  assert.equal(running.completed_verify_rounds,0);
+  assert.equal(projectHistory(live,progress,6).lines[0].completed_verify_rounds,1);
+  assert.deepEqual(live,before);
+});
+
+test('line replay resets a new cycle and ignores later reports from its old scope',()=>{
+  const progress=[
+    {seq:1,type:'line.phase_changed',line_id:'line-01',occurred_at:t(1),payload:{phase:'verify',direction_epoch:1,cycle_id:'old',active_spec_id:'old-spec'}},
+    {seq:2,type:'verification.completed',line_id:'line-01',cycle_id:'old',occurred_at:t(2),payload:{round_no:3}},
+    {seq:3,type:'line.phase_changed',line_id:'line-01',cycle_id:'new',occurred_at:t(3),payload:{phase:'exploration',direction_epoch:2,completed_verify_rounds:0}},
+    {seq:4,type:'line.phase_changed',line_id:'line-01',occurred_at:t(4),payload:{phase:'critic'}},
+    {seq:5,type:'verification.completed',line_id:'line-01',cycle_id:'old',occurred_at:t(5),payload:{round_no:4}},
+    {seq:6,type:'verification.completed',line_id:'line-01',cycle_id:'new',occurred_at:t(6),payload:{round_no:8,direction_epoch:1}},
+    {seq:7,type:'verification.completed',line_id:'line-01',cycle_id:'new',occurred_at:t(7),payload:{round_no:9,historical:true}},
+    {seq:8,type:'line.phase_changed',line_id:'line-01',occurred_at:t(8),payload:{phase:'implementation',active_spec_id:'new-spec'}},
+    {seq:9,type:'verification.completed',line_id:'line-01',cycle_id:'new',occurred_at:t(9),payload:{round_no:1}},
+  ];
+  assert.equal(projectHistory(snapshot,progress,2).lines[0].completed_verify_rounds,3);
+  for(const cursor of [3,4,5,6,7]) {
+    const line=projectHistory(snapshot,progress,cursor).lines[0];
+    assert.equal(line.direction_epoch,2);
+    assert.equal(line.cycle_id,'new');
+    assert.equal(line.completed_verify_rounds,0);
+    assert.equal(line.active_spec_id,undefined);
+  }
+  const verified=projectHistory(snapshot,progress,9).lines[0];
+  assert.equal(verified.completed_verify_rounds,1);
+  assert.equal(verified.active_spec_id,'new-spec');
+});
+
+test('legacy line events retain unscoped verification rounds and explicit zero or null patches',()=>{
+  const progress=[
+    {seq:1,type:'line.phase_changed',line_id:'line-01',occurred_at:t(1),payload:{phase:'implementation',active_spec_id:'legacy-spec'}},
+    {seq:2,type:'verification.completed',line_id:'line-01',occurred_at:t(2),payload:{round:2}},
+    {seq:3,type:'line.phase_changed',line_id:'line-01',occurred_at:t(3),payload:{phase:'critic'}},
+    {seq:4,type:'line.phase_changed',line_id:'line-01',occurred_at:t(4),payload:{phase:'exploration',completed_verify_rounds:0,active_spec_id:null}},
+    {seq:5,type:'line.phase_changed',line_id:'line-01',occurred_at:t(5),payload:{phase:'critic'}},
+  ];
+  const legacy=projectHistory(snapshot,progress,3).lines[0];
+  assert.equal(legacy.direction_epoch,1);
+  assert.equal(legacy.cycle_id,null);
+  assert.equal(legacy.active_spec_id,'legacy-spec');
+  assert.equal(legacy.completed_verify_rounds,2);
+  const reset=projectHistory(snapshot,progress,5).lines[0];
+  assert.equal(reset.completed_verify_rounds,0);
+  assert.equal(reset.active_spec_id,null);
+});
+
 test('arbitration replay retains real timing and never leaks a future decision or effect',()=>{
   const arbitrationEvents = [
     {seq:8,type:'arbitration.requested',occurred_at:t(10),payload:{arbitration_id:'arb-1'}},

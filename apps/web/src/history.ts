@@ -5,13 +5,49 @@ import { projectWatchdog } from './watchdog.ts';
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) : Number.NaN;
 const ident = (x: Data) => x.run_id || x.experiment_run_id || x.id;
 
+function projectLines(lines: Data[], events: Data[]): Data[] {
+  const projected = new Map<string,Data>(lines.map((line): [string,Data] => [line.line_id, {
+    // Only the line identity and fixed display settings come from the live row.
+    ...Object.fromEntries(['id','research_id','line_id','title','k'].filter(key => key in line).map(key => [key,line[key]])),
+    phase:'idle',direction_epoch:1,cycle_id:null,completed_verify_rounds:0,
+  }]));
+  for (const event of events) {
+    const payload = event.payload || {};
+    const line = projected.get(event.line_id || payload.line_id);
+    if (!line) continue;
+    if (event.type === 'line.phase_changed') {
+      const changes = {...payload};
+      for (const field of ['cycle_id','direction_epoch']) {
+        if (!(field in changes) && event[field] !== undefined) changes[field] = event[field];
+      }
+      const directionChanged = changes.direction_epoch !== undefined && changes.direction_epoch !== line.direction_epoch;
+      const cycleChanged = 'cycle_id' in changes && changes.cycle_id !== line.cycle_id;
+      if (directionChanged || cycleChanged) {
+        line.completed_verify_rounds = 0;
+        delete line.active_spec_id;
+        if (directionChanged && !('cycle_id' in changes)) line.cycle_id = null;
+      }
+      Object.assign(line,changes);
+    } else if (event.type === 'verification.completed') {
+      const cycleId = payload.cycle_id ?? event.cycle_id;
+      const directionEpoch = payload.direction_epoch ?? event.direction_epoch;
+      // Old records may omit scope metadata; explicit old-scope receipts never
+      // advance the currently visible cycle, including late recovery receipts.
+      if (payload.historical || (cycleId != null && line.cycle_id != null && cycleId !== line.cycle_id) ||
+          (directionEpoch != null && directionEpoch !== line.direction_epoch)) continue;
+      const round = payload.round_no ?? payload.round;
+      if (round !== undefined) line.completed_verify_rounds = round;
+    }
+  }
+  return [...projected.values()];
+}
+
 /** Project historical views only from facts already committed at the cursor. */
 export function projectHistory(snapshot: Data, allEvents: Data[], seq: number): Data {
-  const events = allEvents.filter(e => e.seq <= seq);
+  const events = allEvents.filter(e => e.seq <= seq).sort((a,b) => a.seq-b.seq);
   const arbitrations = projectArbitrations(snapshot.arbitrations || [], allEvents, seq);
   const watchdog = projectWatchdog(allEvents, seq);
   const asOf = at(events.at(-1)?.occurred_at || snapshot.project?.created_at);
-  const phase = (id: string) => events.filter(e => e.line_id === id && e.type === 'line.phase_changed').at(-1)?.payload || {};
   const executions = (snapshot.executions || []).filter((x: Data) => at(x.started_at || x.created_at) <= asOf).map((x: Data) => {
     const refs = events.filter(e => e.execution_id === (x.execution_attempt_id || x.execution_id || x.id));
     const last = refs.filter(e => /^agent\.(completed|failed|cancelled)$/.test(e.type)).at(-1);
@@ -47,9 +83,6 @@ export function projectHistory(snapshot: Data, allEvents: Data[], seq: number): 
       error:status === 'blocked' ? lifecycleEvent?.payload?.error : undefined,
       blocked_reason:status === 'blocked' ? lifecycleEvent?.payload?.reason : undefined},snapshot_seq:seq,recent_events:events,
     topology:{...snapshot.topology,nodes,edges},agents,executions,runs,submissions,arbitrations,...watchdog,
-    lines:(snapshot.lines || []).map((l: Data) => {
-      const state = phase(l.line_id); const verify = events.filter(e => e.line_id === l.line_id && e.type === 'verification.completed').at(-1)?.payload;
-      return {...l,...state,phase:state.phase || 'idle',direction_epoch:state.direction_epoch || 1,completed_verify_rounds:verify?.round_no || verify?.round || 0};
-    }),
+    lines:projectLines(snapshot.lines || [],events),
     reports:(snapshot.reports || []).filter((r: Data) => r.created_event_seq ? r.created_event_seq <= seq : at(r.created_at) <= asOf)};
 }
