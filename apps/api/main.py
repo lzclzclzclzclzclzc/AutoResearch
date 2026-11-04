@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -112,6 +113,22 @@ def _public(value):
     return value
 
 
+def _worker_health(record):
+    result = {**(record or {}), "available": False}
+    if not record or record.get("status") != "running":
+        return {**result, "code": "worker_unavailable"}
+    try:
+        heartbeat = datetime.fromisoformat(record["heartbeat_at"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return {**result, "code": "worker_heartbeat_invalid"}
+    result["heartbeat_age_seconds"] = round(age, 3)
+    result["available"] = -5 <= age <= 30
+    if not result["available"]:
+        result["code"] = "worker_heartbeat_stale" if age > 30 else "worker_heartbeat_invalid"
+    return result
+
+
 def create_app(data_dir: str | Path | None = None, control_client=None, *, testing=False):
     root = Path(data_dir or os.environ.get("AUTORESEARCH_DATA_DIR", "data")).resolve()
     app = FastAPI(title="AutoResearch Local API", version="0.1.0")
@@ -212,8 +229,11 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             worker, database = None, "unavailable"
         from backend.adapters.dsh import runtime_availability
         runtime = await asyncio.to_thread(runtime_availability)
-        return {"status": "ok" if database == "available" and control_health["available"] else "degraded",
-            "database": database, "control": control_health, "worker": worker,
+        worker_health = _worker_health(worker)
+        healthy = (database == "available" and control_health["available"]
+            and not control_health.get("journal_unknown") and worker_health["available"])
+        return {"status": "ok" if healthy else "degraded",
+            "database": database, "control": control_health, "worker": worker_health,
             "runtime": (worker or {}).get("dsh", runtime), "version": "0.1.0"}
 
     @app.get("/api/settings/team")

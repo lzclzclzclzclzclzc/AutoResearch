@@ -213,6 +213,33 @@ def test_corrupt_journal_and_unavailable_client_fail_closed(tmp_path):
         control.close()
 
 
+def test_archiving_non_journal_backup_restores_admission_without_reviving_stops(tmp_path):
+    journal_dir = tmp_path / "control"
+    journal_dir.mkdir()
+    _journal_file(journal_dir, _stop_record())
+    backup = journal_dir / "line01-plan-repair-20261031.json"
+    original = b'{"recorded_at":"2026-10-31","original_state":{}}'
+    backup.write_bytes(original)
+    first = ControlSupervisor(journal_dir)
+    try:
+        assert first.journal_unknown
+        with pytest.raises(ControlUnavailable):
+            first.register_project("new", time.time() + 60)
+    finally:
+        first.close()
+    archive = tmp_path / "diagnostics"
+    archive.mkdir()
+    backup.rename(archive / backup.name)
+    second = ControlSupervisor(journal_dir)
+    try:
+        assert not second.journal_unknown
+        assert not second.allows_progress("old")
+        assert (archive / backup.name).read_bytes() == original
+        assert second.register_project("new", time.time() + 60)["allowed"]
+    finally:
+        second.close()
+
+
 def test_stop_survives_journal_failure_in_memory(tmp_path):
     control = ControlSupervisor(tmp_path)
     try:

@@ -131,6 +131,8 @@ npm run build
 
 服务日志为 `data/control.log`、`api.log`、`runner.log` 和 `worker.log`。停止日志损坏、旧进程状态不明、数据库故障时，启动门禁保持关闭。可以导出已有记录；不要删除停止墓碑以尝试恢复研究。
 
+Runner 启动时可能需要较长时间恢复历史执行；初次就绪检查超时后，启动器会继续探测，待 Runner 就绪再补启 Worker。`/api/health` 会检查 Worker 心跳（30 秒内）与控制日志完整性，异常时返回 `status: degraded`。`data/control/` 根目录只存放程序生成的控制日志；诊断 JSON 和人工修复备份应保存在 `data/diagnostics/` 等其他目录，否则会被当成损坏日志关闭启动门禁。
+
 备份时先通过启动器停止所有服务，然后一起复制整个数据目录，保留业务库、检查点、停止记录和产物。DPAPI 凭据绑定 Windows 用户，迁移账户或机器后应重新配置密钥。
 
 ## 执行与并发恢复

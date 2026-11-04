@@ -43,6 +43,47 @@ def client(tmp_path):
     return c, app
 
 
+@pytest.mark.parametrize("worker_state,heartbeat,expected", [
+    (None, None, "degraded"),
+    ("running", "stale", "degraded"),
+    ("running", "malformed", "degraded"),
+    ("running", None, "degraded"),
+    ("running", "future", "degraded"),
+    ("stopped", "fresh", "degraded"),
+    ("running", "fresh", "ok"),
+])
+def test_health_requires_fresh_running_worker(tmp_path, worker_state, heartbeat, expected):
+    from datetime import datetime, timedelta, timezone
+    from backend.persistence.store import Store
+
+    c, app = client(tmp_path)
+    if worker_state is not None:
+        worker = {"status": worker_state, "pid": 123}
+        if heartbeat is not None:
+            age = {"stale": 90, "fresh": 0, "future": -90}.get(heartbeat, 0)
+            worker["heartbeat_at"] = ((datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+                if heartbeat != "malformed" else "not-a-timestamp")
+        app.state.store = Store(tmp_path)
+        app.state.store.put("system", "worker", worker)
+    response = c.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == expected
+    assert response.json()["worker"]["available"] is (expected == "ok")
+
+
+def test_health_is_degraded_when_control_journal_is_incomplete(tmp_path):
+    from backend.persistence.store import Store, now
+
+    c, app = client(tmp_path)
+    app.state.store = Store(tmp_path)
+    app.state.store.put("system", "worker", {"status": "running", "heartbeat_at": now()})
+    app.state.control.status = lambda: {"control_epoch": "fixture", "projects": {}, "journal_unknown": True}
+    health = c.get("/api/health").json()
+    assert health["status"] == "degraded"
+    assert health["control"]["available"] is True
+    assert health["worker"]["available"] is True
+
+
 @pytest.fixture
 def messages_service():
     routes, received = {}, []

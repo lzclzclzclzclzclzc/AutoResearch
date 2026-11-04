@@ -90,3 +90,70 @@ def test_launcher_restarts_only_exited_worker_with_backoff():
     assert not watcher.check(dead, restart, 4)
     assert watcher.check(dead, restart, 5)
     assert len(starts) == 2
+
+
+def test_launcher_waits_for_runner_before_starting_missing_worker():
+    watcher = WorkerWatchdog()
+    starts = []
+    ready = False
+    probe = lambda: ready
+    restart = lambda: starts.append(True)
+    assert not watcher.check(None, restart, 0, ready=probe)
+    assert not watcher.check(None, restart, 1, ready=probe)
+    assert not starts
+    ready = True
+    assert not watcher.check(None, restart, 2, ready=probe)
+    assert watcher.check(None, restart, 3, ready=probe)
+    assert starts == [True]
+    alive = SimpleNamespace(poll=lambda: None)
+    assert not watcher.check(alive, restart, 4, ready=probe)
+    assert starts == [True]
+
+
+def test_launcher_starts_worker_after_runner_exceeds_initial_timeout(tmp_path, monkeypatch):
+    import contextlib
+    import scripts.launch as launch
+    import backend.runtime.processes as processes
+    import psutil
+
+    clock = [0.0]
+    spawned, starts = {}, []
+    runner_probes = []
+
+    def spawn(argv, **kwargs):
+        name = "api" if "uvicorn" in argv else argv[2].rsplit(".", 1)[-1]
+        starts.append((name, clock[0]))
+        child = SimpleNamespace(pid=len(starts))
+        child.poll = lambda: 0 if name == "api" and "worker" in spawned else None
+        spawned[name] = child
+        return child
+
+    def request(url, token, body=None, timeout=1.5):
+        if url.endswith(":8767/health"):
+            runner_probes.append(clock[0])
+            if clock[0] < 80:
+                raise OSError("Runner is replaying historical jobs")
+            return {"status": "ok"}
+        return {"projects": {}}
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] > 150:
+            pytest.fail("launcher never started Worker after Runner became ready")
+
+    monkeypatch.setattr(launch.sys, "argv", ["launch.py", "--data-dir", str(tmp_path), "--no-browser"])
+    monkeypatch.setattr(launch, "lock", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(launch.socket, "socket", lambda: contextlib.nullcontext(SimpleNamespace(bind=lambda _: None)))
+    monkeypatch.setattr(launch.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(launch.subprocess, "Popen", spawn)
+    monkeypatch.setattr(launch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch.time, "sleep", sleep)
+    monkeypatch.setattr(launch, "request", request)
+    monkeypatch.setattr(processes, "terminate_identity", lambda *args: True)
+    monkeypatch.setattr(psutil, "Process", lambda _: SimpleNamespace(create_time=lambda: 0))
+
+    launch.main()
+
+    assert [name for name, _ in starts] == ["control", "api", "runner", "worker"]
+    assert next(when for name, when in starts if name == "worker") >= 80
+    assert any(25 < when < 80 for when in runner_probes)
