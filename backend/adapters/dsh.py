@@ -19,6 +19,7 @@ from packages.contracts.research import digest
 from backend.adapters.provider_endpoints import messages_base_url
 from backend.adapters.token_limits import output_tokens, truncated_output_error
 from backend.persistence.resilience import is_storage_busy
+from backend.runtime.recovery import execution_process_exited
 
 
 class RuntimeBlocked(RuntimeError):
@@ -31,6 +32,42 @@ class RuntimeBlocked(RuntimeError):
 
 class ResearchStopped(RuntimeError):
     pass
+
+
+def parse_final_object(response, schema, *, finish_reason, record_repair, validate_repaired=None):
+    """Repair only one missing object terminator in a normally completed reply."""
+    try:
+        return schema.model_validate_json(response).model_dump()
+    except ValueError as original:
+        raw = response.rstrip()
+        if finish_reason != "completed" or not raw.lstrip().startswith("{"):
+            raise
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as syntax:
+            if syntax.pos != len(raw):
+                raise original
+        else:
+            # Valid JSON with a contract error belongs to the usual correction path.
+            raise original
+        audit = {"original_response": response, "method": "append_single_right_brace",
+                 "adopted": False}
+        try:
+            candidate = json.loads(raw + "}")
+            if not isinstance(candidate, dict):
+                raise original
+            result = schema.model_validate(candidate).model_dump()
+            if validator := getattr(schema, "validate_repaired_output", None):
+                validator(result)
+            if validate_repaired is not None:
+                validate_repaired(result)
+        except ValueError as error:
+            audit["validation_error"] = str(error)
+            record_repair(audit)
+            raise error from original
+        audit["adopted"] = True
+        record_repair(audit)
+        return result
 
 
 @lru_cache(maxsize=8)
@@ -71,10 +108,21 @@ def runtime_availability():
     return {"available": True, "sdk_version": sdk, "runtime_version": runtime, "runtime_source": "bundled_native", "profile": "sdk"}
 
 
-def kill_tree(pid: int) -> bool:
+def kill_tree(pid: int, *, receipt: dict | None = None) -> bool:
+    if receipt is not None:
+        receipt.update(process_tree=[], process_tree_complete=False)
     try:
         parent = psutil.Process(pid)
         tree = parent.children(recursive=True) + [parent]
+        if receipt is not None:
+            for process in tree:
+                try:
+                    receipt["process_tree"].append({"pid": process.pid, "pid_create_time": process.create_time()})
+                except psutil.NoSuchProcess:
+                    pass
+            # Preserve all observed identities before killing the root; partial
+            # cleanup can orphan children that are no longer discoverable by it.
+            receipt["process_tree_complete"] = True
         for process in reversed(tree):
             try:
                 process.kill()
@@ -83,7 +131,9 @@ def kill_tree(pid: int) -> bool:
         _, alive = psutil.wait_procs(tree, timeout=3)
         return not alive
     except psutil.NoSuchProcess:
-        return True
+        if receipt is None:
+            return True
+        return bool(receipt.get("process_tree_complete")) and execution_process_exited(receipt)
 
 
 class RuntimeMessageReader:
@@ -180,7 +230,11 @@ class DshRuntimeAdapter:
                         gate.release()
             project = await asyncio.to_thread(self.store.project, research_id)
             self._assert_arbitration_open(runtime_context)
-            if project["status"] in {"pausing", "paused", "blocked"}:
+            watchdog_event = self.store.get("watchdog_event", runtime_context.get("watchdog_event_id", "")) or {}
+            watchdog_recovery = (watchdog_event.get("research_id") == research_id
+                and watchdog_event.get("status") == "diagnosing"
+                and watchdog_event.get("lease_token") == runtime_context.get("watchdog_lease_token"))
+            if project["status"] in {"pausing", "paused", "blocked"} and not (project["status"] == "blocked" and watchdog_recovery):
                 raise RuntimeBlocked("research_paused", "研究暂停期间不启动新的模型回合")
             if runtime_context.get("arbitration_id") and announced:
                 self.store.emit(research_id, "arbitration.capacity_acquired", {
@@ -191,6 +245,19 @@ class DshRuntimeAdapter:
                 gate.release()
 
     def _assert_arbitration_open(self, runtime_context):
+        wid = (runtime_context or {}).get("watchdog_event_id")
+        if wid:
+            event = self.store.get("watchdog_event", wid) or {}
+            if not event:
+                raise ResearchStopped("Watch Dog 诊断记录已经失效")
+            project = self.store.project(event.get("research_id", ""))
+            line = self.store.get("line", project["id"] + ":" + event.get("line_id", "")) or {}
+            if (event.get("status") != "diagnosing"
+                    or event.get("lease_token") != runtime_context.get("watchdog_lease_token")
+                    or project["status"] not in {"running", "blocked"} or project.get("stop_reason")
+                    or line.get("finish_requested") or line.get("direction_epoch") != event.get("direction_epoch")
+                    or line.get("cycle_id") != event.get("cycle_id")):
+                raise ResearchStopped("Watch Dog 诊断范围已经停止或失效")
         aid = (runtime_context or {}).get("arbitration_id")
         if aid:
             request = self.store.get("arbitration_request", aid)
@@ -198,7 +265,8 @@ class DshRuntimeAdapter:
                 raise ResearchStopped("该 God 仲裁范围已经取消或失效")
 
     async def execute_turn(self, *, research_id, agent_id, role, task_id, turn_id,
-                           prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None):
+                           prompt, schema, direction_epoch=1, model=None, context=None, runtime_context=None,
+                           repaired_validator=None):
         runtime_context = runtime_context or {}
         private_score = bool(runtime_context.get("private_score", runtime_context.get("suppress_chat")
             and runtime_context.get("discussion_protocol") != 2))
@@ -208,8 +276,6 @@ class DshRuntimeAdapter:
         project = self.store.project(research_id)
         generation = project["control_generation"]
         session = self.ensure_session(research_id, agent_id, direction_epoch)
-        interrupted_history = any(e.get("session_id") == session["session_id"] and e.get("status") in {"interrupted", "unknown"}
-                                  for e in self.store.list("execution", research_id))
         logical_key = digest([research_id, agent_id, task_id, turn_id])
         concurrency = project["config_snapshot"]["team"].get("model_concurrency", 4)
         project_semaphore = self.project_semaphores.setdefault(research_id, asyncio.Semaphore(concurrency))
@@ -229,13 +295,28 @@ class DshRuntimeAdapter:
             previous = self.store.get("execution", logical_key)
             if previous and previous["status"] == "completed":
                 return previous["output"]
-            if previous and previous["status"] in {"registered", "running", "unknown"}:
-                pid = previous.get("pid")
-                if not pid:
-                    raise RuntimeBlocked("execution_unknown", "旧 DSH 启动身份未得到退出证明，拒绝重新调用")
-                if pid and psutil.pid_exists(pid):
-                    raise RuntimeBlocked("execution_unknown", "旧 DSH 执行仍存活，拒绝重复调用")
-                self.store.patch("execution", logical_key, status="interrupted")
+            # Corrections and new tasks use different logical keys but still
+            # write the same SDK history. The organizer even shares its session
+            # across projects, so fence by durable session, not just this turn.
+            session_executions = self.store.list("execution", session_id=session["session_id"])
+            if previous and all(item["id"] != previous["id"] for item in session_executions):
+                session_executions.append(previous)
+            for execution in session_executions:
+                execution_id = execution.get("execution_attempt_id", execution["id"])
+                if execution.get("status") not in {"registered", "running", "unknown"}:
+                    if execution.get("exit_confirmed") or execution.get("exit_reconciled"):
+                        self.processes.pop(execution_id, None)
+                    continue
+                if not execution_process_exited(execution):
+                    raise RuntimeBlocked("execution_unknown", "同一 DSH 会话的旧执行尚未确认退出，等待回执后继续")
+                await asyncio.to_thread(self.control.complete_execution, execution_id)
+                self.store.patch("execution", execution["id"], status="interrupted", exit_reconciled=True, exit_confirmed=True)
+                self.processes.pop(execution_id, None)
+            # The preceding owner may have saved history while this turn waited
+            # for the session lock. Choose start/resume from the admitted state.
+            session = self.ensure_session(research_id, agent_id, direction_epoch)
+            interrupted_history = any(e.get("session_id") == session["session_id"] and e.get("status") in {"interrupted", "unknown"}
+                                      for e in self.store.list("execution", session_id=session["session_id"]))
             secret = self.credentials.get_secret(project["provider_config_id"], version=project.get("credential_version"))
             if not secret:
                 raise RuntimeBlocked("credential_missing", "请先在设置中保存 DeepSeek API Key")
@@ -353,7 +434,12 @@ class DshRuntimeAdapter:
                 if final.get("finish_reason") == "max-tokens":
                     failure = truncated_output_error()
                     raise RuntimeBlocked(failure["code"], failure["message"])
-                result = schema.model_validate_json(final["final_response"]).model_dump()
+                result = parse_final_object(final["final_response"], schema,
+                    finish_reason=final.get("finish_reason"),
+                    validate_repaired=repaired_validator,
+                    record_repair=lambda audit: self.store.emit(research_id, "agent.json_repair", {
+                        **audit, "execution_attempt_id": execution_id},
+                        agent_id=agent_id, execution_id=execution_id, task_id=task_id))
                 message_id = self.gateway.last_message(capability) if capability else None
                 self.store.complete_model_turn(logical_key, result, session_id=session["id"],
                     fields={"finish_reason": final.get("finish_reason"), "message_id": message_id,
@@ -362,7 +448,12 @@ class DshRuntimeAdapter:
                 turn_completed = True
                 return result
             except BaseException as error:
-                exit_confirmed = await asyncio.to_thread(kill_tree, proc.pid)
+                cleanup_receipt = {}
+                if not exit_confirmed:
+                    try:
+                        exit_confirmed = await asyncio.to_thread(kill_tree, proc.pid, receipt=cleanup_receipt)
+                    except (psutil.Error, OSError):
+                        exit_confirmed = False
                 cancelled = isinstance(error, (ResearchStopped, asyncio.CancelledError))
                 safe_error = {"code": getattr(error, "code", type(error).__name__),
                     "message": str(error) if isinstance(error, RuntimeBlocked) else "研究已停止，执行已取消。" if cancelled else "DSH 运行失败，请检查本地运行时。",
@@ -370,7 +461,8 @@ class DshRuntimeAdapter:
                 try:
                     self.store.patch("execution", logical_key, status="unknown" if not exit_confirmed else "interrupted" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "failed",
                                      error_code=safe_error["code"], error_message=safe_error["message"], error=safe_error,
-                                     http_status=safe_error["http_status"], provider_error_code=safe_error["provider_error_code"], completed_at=datetime.now(timezone.utc).isoformat())
+                                     http_status=safe_error["http_status"], provider_error_code=safe_error["provider_error_code"],
+                                     exit_confirmed=exit_confirmed, completed_at=datetime.now(timezone.utc).isoformat(), **cleanup_receipt)
                     self.store.emit(research_id, "agent.cancelled" if isinstance(error, (ResearchStopped, asyncio.CancelledError)) else "agent.failed",
                         {"mode": "live", "execution_attempt_id": execution_id, **safe_error,
                          "exit_confirmed": exit_confirmed}, agent_id=agent_id, execution_id=execution_id, task_id=task_id)
@@ -381,9 +473,12 @@ class DshRuntimeAdapter:
                     # business SQLite is busy; recovery reconciles the old row.
                     print(json.dumps({"event": "agent.failure_persistence_deferred", "code": "storage_busy",
                         "execution_id": execution_id, "exit_confirmed": exit_confirmed}), flush=True)
+                if not exit_confirmed and not cancelled and isinstance(error, Exception):
+                    raise RuntimeBlocked("execution_unknown", "DSH 执行退出尚未确认，保留原错误并等待退出回执后自动重试") from error
                 raise
             finally:
-                self.processes.pop(execution_id, None)
+                if exit_confirmed:
+                    self.processes.pop(execution_id, None)
                 if capability and self.gateway:
                     try:
                         self.gateway.revoke(capability, interrupted=not turn_completed)
@@ -410,7 +505,45 @@ class DshRuntimeAdapter:
 
     async def cancel_execution(self, execution_id):
         proc = self.processes.get(execution_id)
-        return {"execution_id": execution_id, "exit_confirmed": await asyncio.to_thread(kill_tree, proc.pid) if proc else False}
+        execution = self.get_execution(execution_id)
+        if execution is None:
+            return {"execution_id": execution_id, "exit_confirmed": False}
+        if execution.get("status") in {"completed", "failed", "interrupted"} and execution.get("exit_confirmed") is not False:
+            self.processes.pop(execution_id, None)
+            return {"execution_id": execution_id, "exit_confirmed": True}
+        receipt = {}
+        confirmed = execution_process_exited(execution)
+        try:
+            if not confirmed and execution.get("process_tree_complete"):
+                from backend.runtime.processes import terminate_identity
+                identities = list(execution.get("process_tree") or [])
+                if execution.get("pid"):
+                    identities.append(execution)
+                results = [await asyncio.to_thread(terminate_identity, item["pid"], item.get("pid_create_time"))
+                    for item in identities]
+                confirmed = bool(results) and all(results)
+            elif not confirmed and proc and proc.returncode is None:
+                confirmed = await asyncio.to_thread(kill_tree, proc.pid, receipt=receipt)
+        except (psutil.Error, OSError):
+            confirmed = False
+        try:
+            with self.store.connect(True) as connection:
+                current = self.store._get(connection, "execution", execution["id"])
+                if current and current.get("execution_attempt_id") == execution_id:
+                    # The SDK can commit its output while cancellation waits on
+                    # the OS. Preserve that completion and never overwrite a
+                    # newer attempt that reused this logical execution key.
+                    if current.get("status") in {"completed", "failed", "interrupted"} and current.get("exit_confirmed") is not False:
+                        confirmed = True
+                    else:
+                        self.store._put(connection, "execution", current["id"], {**current,
+                            "status": "interrupted" if confirmed else "unknown", "exit_confirmed": confirmed,
+                            **receipt}, current["research_id"])
+        finally:
+            if confirmed:
+                await asyncio.to_thread(self.control.complete_execution, execution_id)
+                self.processes.pop(execution_id, None)
+        return {"execution_id": execution_id, "exit_confirmed": confirmed}
 
     def export_session(self, session_id):
         return {"session_id": session_id, "executions": [e for e in self.store.list("execution") if e.get("session_id") == session_id]}
@@ -419,7 +552,11 @@ class DshRuntimeAdapter:
         return self.ensure_session(research_id, agent_id, direction_epoch)
 
     async def close(self):
-        for proc in list(self.processes.values()):
-            await asyncio.to_thread(kill_tree, proc.pid)
+        for execution_id in list(self.processes):
+            try:
+                await self.cancel_execution(execution_id)
+            except Exception:
+                # A failed receipt write must not skip the remaining cleanup.
+                pass
         if self.gateway:
             await asyncio.to_thread(self.gateway.close)

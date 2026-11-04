@@ -186,7 +186,7 @@ class ArbitrationService:
         rid, aid = request["research_id"], request["id"]
         feedback = request.get("diagnostic")
         token_limit = request.get("max_output_tokens", 65536)
-        while request.get("generation_attempts", 0) <= 3:
+        while True:
             recovered = request.get("recovered_response")
             invalid = self._scope_current(request)
             if invalid:
@@ -275,18 +275,16 @@ class ArbitrationService:
                         attempt=max(0, attempt - 1), retry_not_before=now(),
                         diagnostic="模型容量等待期间研究暂停，God 回合尚未发起")
                     raise
-                if error.code not in {"model_output_truncated", "rate_limited", "model_transport_error", "model_timeout", "model_response_invalid"}:
+                if error.code not in {"invalid_output", "model_output_truncated", "rate_limited", "model_transport_error", "model_timeout", "model_response_invalid"}:
                     raise
                 if error.code == "model_output_truncated":
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
                 feedback = f"{error.code}: {str(error)[:1000]}"
             except (ValueError, ConnectionError, TimeoutError) as error:
                 feedback = str(error)[:2000]
-            if attempt >= 3:
-                break
             request = self.store.transition_arbitration(aid, "retry_wait", owner=self.owner,
                 lease_epoch=request["lease_epoch"], diagnostic=feedback, recovered_response=None,
-                retry_not_before=(datetime.now(timezone.utc) + timedelta(seconds=min(2 ** attempt, 8))).isoformat())
+                retry_not_before=(datetime.now(timezone.utc) + timedelta(seconds=2 ** min(attempt, 3))).isoformat())
         self._end(aid, "exhausted", diagnostic=feedback or "God 判决阶段超过 600 秒或项目截止时间")
         raise RuntimeBlocked("arbitration_exhausted", f"自动仲裁未通过原验收；原始错误 {request['reason_code']}。{feedback or '判决时限已耗尽'}；现场及尝试已保存，可在仲裁详情查看缺失条件。")
 
@@ -338,14 +336,15 @@ class ArbitrationService:
                 raise ValueError("God repair must match the original target schema")
             if schema.__name__ == "Vote":
                 raise ValueError("God cannot generate a member Vote")
-            if schema.__name__ == "Verification":
+            if schema.__name__ in {"Verification", "LegacyVerification"}:
                 source = context.get("diagnostic", {}).get("source_output")
                 if isinstance(source, str):
                     try:
                         source = json.loads(source)
                     except ValueError:
                         source = None
-                factual_fields = ("passed", "scientific_observation", "evidence", "limitations", "required_changes")
+                factual_fields = (("content_markdown", "passed", "scientific_observation") if schema.__name__ == "Verification"
+                    else ("passed", "scientific_observation", "evidence", "limitations", "required_changes"))
                 if not isinstance(source, dict) or any(field not in source for field in factual_fields):
                     raise ValueError("Verification repair requires the original complete verification facts; request Verify revision")
                 if any(decision["output"].get(field) != source.get(field) for field in

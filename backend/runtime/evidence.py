@@ -1,4 +1,17 @@
 """Acceptance of evidence derived from a specific frozen submission."""
+def validate_report_facts(store, research_id, submission, result, line_id):
+    """Check system-owned run facts, never parse scientific prose or citations."""
+    if not result.get('passed'):
+        return
+    if result.get('scientific_observation') == 'execution_failed':
+        raise ValueError('An execution failure cannot be marked as a passed scientific result')
+    runs = [store.get('run', run_id) for run_id in submission.get('run_ids', [])]
+    if not any(run and run.get('research_id') == research_id and run.get('line_id') == line_id
+               and run.get('state', run.get('status')) in {'completed', 'succeeded', 'early_stopped'}
+               for run in runs):
+        raise ValueError('Passed verification requires a real acceptable run in this submission')
+
+
 def submission_sources(store, research_id, submission, line_id):
     allowed = set(submission.get('run_ids', [])) | {
         item.get('artifact_id', item.get('id')) for item in submission.get('artifacts', [])}

@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from apps.api.arbitration_views import request_detail, request_list
+from apps.api.export_views import export_artifacts, export_records
 from backend.adapters.provider_endpoints import DEFAULT_MESSAGES_BASE_URL, messages_base_url, messages_url
 from backend.adapters.token_limits import CONNECTION_OUTPUT_TOKENS
 from backend.persistence import Store, StoreError, canonical, new_id, now
@@ -41,6 +43,7 @@ class Team(Input):
     max_runtime_seconds: int = Field(default=3600, ge=1, le=31536000)
     model_concurrency: int = Field(default=4, ge=1)
     experiment_concurrency: int = Field(default=1, ge=1)
+    watchdog_interval_minutes: int = Field(default=10, ge=1, strict=True)
 
 
 class Research(Input):
@@ -108,6 +111,22 @@ def _public(value):
     if isinstance(value, str):
         return redact(value)
     return value
+
+
+def _worker_health(record):
+    result = {**(record or {}), "available": False}
+    if not record or record.get("status") != "running":
+        return {**result, "code": "worker_unavailable"}
+    try:
+        heartbeat = datetime.fromisoformat(record["heartbeat_at"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return {**result, "code": "worker_heartbeat_invalid"}
+    result["heartbeat_age_seconds"] = round(age, 3)
+    result["available"] = -5 <= age <= 30
+    if not result["available"]:
+        result["code"] = "worker_heartbeat_stale" if age > 30 else "worker_heartbeat_invalid"
+    return result
 
 
 def create_app(data_dir: str | Path | None = None, control_client=None, *, testing=False):
@@ -210,8 +229,11 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             worker, database = None, "unavailable"
         from backend.adapters.dsh import runtime_availability
         runtime = await asyncio.to_thread(runtime_availability)
-        return {"status": "ok" if database == "available" and control_health["available"] else "degraded",
-            "database": database, "control": control_health, "worker": worker,
+        worker_health = _worker_health(worker)
+        healthy = (database == "available" and control_health["available"]
+            and not control_health.get("journal_unknown") and worker_health["available"])
+        return {"status": "ok" if healthy else "degraded",
+            "database": database, "control": control_health, "worker": worker_health,
             "runtime": (worker or {}).get("dsh", runtime), "version": "0.1.0"}
 
     @app.get("/api/settings/team")
@@ -409,6 +431,10 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         nodes = topology.setdefault("nodes", [])
         if not any(node["id"] == "god" for node in nodes):
             nodes.append({"id": "god", "type": "role", "data": {"role": "god", "label": "God", "status": "idle"}})
+        if not any(node["id"] == "watchdog" for node in nodes):
+            nodes.append({"id": "watchdog", "type": "agent", "data": {"role": "watchdog", "label": "Watch Dog", "status": "idle"}})
+        result["watchdog_events"] = s.list("watchdog_event", research_id)
+        result["watchdog_actions"] = s.list("watchdog_action", research_id)
         return _public(result)
 
     @app.get("/api/research/{research_id}/arbitrations")
@@ -485,44 +511,10 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
     @app.get("/api/research/{research_id}/conversations")
     def conversations(research_id: str, agent_id: str | None = None, group_id: str | None = None, kind: str | None = None, line_id: str | None = None,
                       at_seq: int | None = Query(default=None, ge=0)):
-        s = store()
-        s.project(research_id)
-        items = s.list("conversation", research_id)
-        if kind:
-            items = [x for x in items if x.get("kind") == kind]
-        if line_id:
-            items = [x for x in items if x.get("line_id") == line_id]
-        identity = agent_id or group_id
-        if identity:
-            with s.connect() as c:
-                ids = {row[0] for row in c.execute("""
-                    SELECT DISTINCT m.conversation_id FROM messages m WHERE m.research_id=:research AND (
-                      json_extract(m.data,'$.sender.id')=:identity
-                      OR substr(json_extract(m.data,'$.sender.id'),1,length(:identity)+1)=:identity||'/'
-                      OR (json_extract(m.data,'$.sender.type')='group' AND
-                          substr(:identity,1,length(json_extract(m.data,'$.sender.id'))+1)=json_extract(m.data,'$.sender.id')||'/')
-                      OR EXISTS (SELECT 1 FROM json_each(m.data,'$.recipients') r WHERE
-                          json_extract(r.value,'$.id')=:identity
-                          OR substr(json_extract(r.value,'$.id'),1,length(:identity)+1)=:identity||'/'
-                          OR (json_extract(r.value,'$.type')='group' AND
-                              substr(:identity,1,length(json_extract(r.value,'$.id'))+1)=json_extract(r.value,'$.id')||'/'))
-                    )""", {"research": research_id, "identity": identity})}
-            items = [x for x in items if x["conversation_id"] in ids or identity in x.get("group_ids", [])
-                     or any((p.get("id", "") if isinstance(p, dict) else p) == identity or
-                            (p.get("id", "") if isinstance(p, dict) else p).startswith(identity + "/")
-                            for p in x.get("participants", []))]
-        if at_seq is not None:
-            with s.connect() as c:
-                row = c.execute("SELECT data FROM events WHERE research_id=? AND seq<=? ORDER BY seq DESC LIMIT 1", (research_id, at_seq)).fetchone()
-            cutoff = json.loads(row[0])["occurred_at"] if row else s.project(research_id)["created_at"]
-            visible_arbitrations = {row["conversation_id"] for row in request_list(s, research_id, at_seq)}
-            items = [item for item in items if item.get("created_at", "") <= cutoff and
-                     (":god:" not in item["conversation_id"] or item["conversation_id"] in visible_arbitrations
-                      or item.get("kind") == "discussion_finalization")]
-        for item in items:
-            latest = s.messages(item["conversation_id"], limit=1, at_seq=at_seq)["items"]
-            item["last_message"] = latest[-1] if latest else None
-        return _public({"items": items})
+        from backend.persistence.conversation_views import conversation_list
+        rows = conversation_list(store(), research_id, identity=agent_id or group_id,
+            kind=kind, line_id=line_id, at_seq=at_seq)
+        return _public({"items": rows})
 
     @app.get("/api/conversations/{conversation_id:path}/messages")
     def conversation_messages(conversation_id: str, before: int | None = None, limit: int = 50, q: str | None = Query(default=None, max_length=1000), at_seq: int | None = Query(default=None, ge=0)):
@@ -618,12 +610,30 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
             s.retry_failed_tasks(research_id)
             s.emit(research_id, "research.resumed", {"deadline_at": p.get("deadline_at")})
         elif body.kind == "rebind_credential":
-            provider_id = body.provider_config_id or p["provider_config_id"]
-            provider = s.get("provider", provider_id)
-            if not provider or not CredentialService(root, s).get_secret(provider_id):
-                raise StoreError("credential_missing", "目标模型凭据不可用", 422)
-            s.update_project(research_id, provider_config_id=provider_id, credential_version=provider["credential_version"])
-            s.emit(research_id, "credential.rebound", {"provider_config_id": provider_id, "credential_version": provider["credential_version"]})
+            # Rebinding rotates credentials for the frozen provider. Changing its
+            # identity, endpoint or model requires a new research project. Keep
+            # validation and the binding receipt in one transaction so a concurrent
+            # settings save cannot change the target between checking and binding.
+            with s.connect(True) as c:
+                current = s._project(c, research_id)
+                s.assert_progress(current, p["control_generation"])
+                provider_id = body.provider_config_id or current["provider_config_id"]
+                provider = s._get(c, "provider", provider_id)
+                if not provider:
+                    raise StoreError("credential_missing", "目标模型凭据不可用", 422)
+                frozen = current["config_snapshot"]["provider"]
+                if (provider_id != frozen.get("id", current["provider_config_id"])
+                        or provider.get("model", provider.get("model_id", "deepseek-flash")) != frozen.get("model", frozen.get("model_id", "deepseek-flash"))
+                        or messages_url(provider.get("base_url")) != messages_url(frozen.get("base_url"))):
+                    raise StoreError("provider_binding_mismatch",
+                        "只能为原提供方、模型和服务地址重绑凭据；请恢复原模型配置，或使用新配置创建研究", 409)
+                if not CredentialService(root, s).get_secret(provider_id, version=provider["credential_version"]):
+                    raise StoreError("credential_missing", "目标模型凭据不可用", 422)
+                binding = {"provider_config_id": provider_id, "credential_version": provider["credential_version"]}
+                s._update_project(c, research_id, **binding)
+                s._emit(c, research_id, "credential.rebound", binding)
+                return s._put(c, "command", rid, {"command_id": rid, "kind": body.kind,
+                    "status": "applied", "created_at": now(), **binding}, research_id)
         result = s.put("command", rid, {"command_id": rid, "kind": body.kind, "status": "applied", "created_at": now(), "version": 1}, research_id)
         return result
 
@@ -662,31 +672,26 @@ def create_app(data_dir: str | Path | None = None, control_client=None, *, testi
         rid = request_id(request, body)
         previous = s.get("export", rid)
         if previous:
-            if previous.get("research_id") != research_id:
-                raise StoreError("idempotency_conflict", "请求 ID 已用于其他研究导出")
+            if previous.get("research_id") != research_id or previous.get("kind", "all") != body.kind:
+                raise StoreError("idempotency_conflict", "请求 ID 已用于其他研究或导出类型")
             return previous
         snapshot = s.snapshot(research_id)
+        records = _public(export_records(s, research_id, body.kind, snapshot))
+        attachments = export_artifacts(s, research_id, body.kind, records)
         directory = root / "artifacts" / research_id
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"export-{new_id()}.zip"
         temporary = target.with_suffix(".tmp")
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("snapshot.json", canonical(_public(snapshot)))
-            for kind in ("submission", "spec", "verification", "boss_decision", "report", "memory_node", "memory_version"):
-                archive.writestr(f"{kind}.json", canonical(_public(s.list(kind, research_id))))
-            with s.connect() as c:
-                msgs = [json.loads(r[0]) for r in c.execute("SELECT data FROM messages WHERE research_id=? ORDER BY cursor", (research_id,))]
-                events = [json.loads(r[0]) for r in c.execute("SELECT data FROM events WHERE research_id=? ORDER BY seq", (research_id,))]
-            archive.writestr("conversations.json", canonical(_public(msgs)))
-            archive.writestr("events.json", canonical(_public(events)))
-            for info in s.list("artifact", research_id):
-                if info.get("purpose") == "export":
-                    continue
+            for name, value in records.items():
+                archive.writestr(name, canonical(value))
+            for info in attachments:
                 _, source = s.artifact(info["artifact_id"])
                 archive.write(source, f"artifacts/{info['artifact_id']}/{source.name}")
         os.replace(temporary, target)
         artifact = s.register_artifact(research_id, target, "application/zip", purpose="export")
-        result = {"artifact_id": artifact["artifact_id"], "download_url": f"/api/artifacts/{artifact['artifact_id']}?download=true", "version": 1}
+        result = {"artifact_id": artifact["artifact_id"], "download_url": f"/api/artifacts/{artifact['artifact_id']}?download=true",
+            "kind": body.kind, "version": 1}
         s.put("export", rid, result, research_id)
         return result
 

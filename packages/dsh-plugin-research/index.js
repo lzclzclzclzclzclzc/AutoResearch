@@ -81,6 +81,10 @@ export function apply(ctx) {
     ['read_shared_memory', 'Read a Boss-managed shared memory node and its direct children. Empty node_id reads the root index.', object({ node_id: string })],
     ['send_research_message', 'Deliver a message to registered permitted recipients with durable per-member inboxes and a recoverable communication reply. It does not assign scientific tasks or create group votes.', object({ recipient_ids: strings, content_markdown: string }, ['recipient_ids', 'content_markdown'])],
   ]
+  if (role === 'watchdog') definitions.push(
+    ['read_watchdog_state', 'Read a section of this project state across groups, including tasks, executions, runs, discussions and prior repairs; paginate using next_offset.', object({ section: string, offset: { type: 'integer', minimum: 0 } }, ['section'])],
+    ['apply_watchdog_action', 'Apply an auditable online repair after diagnosis. inject_prompt and resume_task target an existing task; restore_line_task targets a line whose parent task is missing; redeliver_handoff targets an outbox; reconcile_run targets a run. Stops, deadline, frozen artifacts and real process facts always prevail.', object({ action: { type: 'string', enum: ['inject_prompt', 'resume_task', 'restore_line_task', 'redeliver_handoff', 'reconcile_run'] }, target_id: string, content_markdown: string }, ['action', 'target_id'])],
+  )
   if (process.env.AUTORESEARCH_HAS_INPUTS === '1' && ['exploration', 'critic', 'implementation', 'verify', 'boss'].includes(role)) definitions.push(
     ['list_research_inputs', 'List only the human-selected read-only input directory. path is relative; directory pages advance by next_offset. Every file inside the selected directory is readable, including hidden files and binary data. Paths outside it are unavailable.', object({ path: string, offset: { type: 'integer', minimum: 0 } })],
     ['read_research_input', 'Read any file relative to the human-selected input directory; binary pages use base64 and include a file path. Returns an immutable evidence artifact and source hash, with a response bounded to 64 KiB. Advance by next_offset; no filesystem writes or credentials.', object({ relative_path: string, offset: { type: 'integer', minimum: 0 } }, ['relative_path'])],
@@ -90,7 +94,8 @@ export function apply(ctx) {
   )
   const allowed = new Set([...(role === 'god' ? [] : ['web_search', 'web_fetch', 'todo_write']), ...definitions.map(([name]) => name)])
   // Monotonic guard also denies new tools accidentally added to future profiles.
-  ctx.tools.guard(execution => allowed.has(execution.name) ? undefined : 'This tool is outside the registered research role policy')
+  if (role !== 'watchdog')
+    ctx.tools.guard(execution => allowed.has(execution.name) ? undefined : 'This tool is outside the registered research role policy')
   for (const [name, description, parameters] of definitions) {
     ctx.tools.register({
       name, description, parameters,

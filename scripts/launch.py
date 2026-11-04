@@ -20,17 +20,15 @@ sys.path.insert(0, str(ROOT))
 
 
 class WorkerWatchdog:
-    """Restart only an exited Worker; its exclusive lock and recovery fence admission."""
+    """Start a missing/exited Worker; its exclusive lock and recovery fence admission."""
     def __init__(self):
         self.retry_at = None
         self.delay = 1
         self.started_at = time.monotonic()
 
-    def check(self, process, restart, current_time=None):
+    def check(self, process, restart, current_time=None, *, ready=None):
         current_time = time.monotonic() if current_time is None else current_time
-        if process is None:
-            return False
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             if current_time - self.started_at >= 60:
                 self.delay = 1
             return False
@@ -38,6 +36,10 @@ class WorkerWatchdog:
             self.retry_at = current_time + self.delay
             self.delay = min(30, self.delay * 2)
         if current_time < self.retry_at:
+            return False
+        if ready is not None and not ready():
+            self.retry_at = current_time + self.delay
+            self.delay = min(30, self.delay * 2)
             return False
         restart()
         self.retry_at = None
@@ -118,6 +120,12 @@ def main():
         return spawn("worker", ["-m", "backend.runtime.worker", "--data-dir", str(directory),
             "--control-url", control_url, "--runner-url", runner_url])
 
+    def runner_ready():
+        try:
+            return request(f"{runner_url}/health", token, timeout=.5).get("status") == "ok"
+        except Exception:
+            return False
+
     def ready(name, url):
         until = time.monotonic() + 25
         while time.monotonic() < until:
@@ -154,8 +162,11 @@ def main():
                 if children["api"].poll() is not None:
                     print("API 退出；独立控制仍可清理研究。正在关闭本次服务。", flush=True)
                     break
-                if worker_watchdog.check(children.get("worker"), spawn_worker):
-                    print("Worker 已退出，正在恢复执行状态并重新调度；详情见 worker.log。", flush=True)
+                # Runner may finish historical recovery after the initial ready()
+                # timeout. Keep probing without replacing that live Runner, then
+                # start the missing Worker under its ordinary exclusive lock.
+                if worker_watchdog.check(children.get("worker"), spawn_worker, ready=runner_ready):
+                    print("Worker 已启动，正在恢复执行状态并重新调度；详情见 worker.log。", flush=True)
                 time.sleep(.5)
         finally:
             # This only uses control's in-memory registry, never business SQLite.

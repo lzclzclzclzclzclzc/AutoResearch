@@ -6,7 +6,7 @@ import math
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel, model_serializer, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel, StrictBool, field_validator, model_serializer, model_validator
 
 
 def digest(value: Any) -> str:
@@ -332,7 +332,7 @@ class ExecutionCheck(Contract):
     evidence: list[Evidence] = Field(min_length=1)
 
 
-class Verification(Contract):
+class LegacyVerification(Contract):
     content_markdown: str
     passed: bool
     scientific_observation: Literal["improvement", "no_improvement", "negative", "inconclusive", "execution_failed"]
@@ -347,6 +347,19 @@ class Verification(Contract):
         value = handler(self)
         if not self.execution_checks:
             value.pop("execution_checks", None)
+        return value
+
+
+class Verification(Contract):
+    content_markdown: str = Field(min_length=1)
+    passed: StrictBool
+    scientific_observation: Literal["improvement", "no_improvement", "negative", "inconclusive", "execution_failed"]
+
+    @field_validator("content_markdown")
+    @classmethod
+    def nonempty_report(cls, value):
+        if not value.strip():
+            raise ValueError("Verify content_markdown must contain a report")
         return value
 
 

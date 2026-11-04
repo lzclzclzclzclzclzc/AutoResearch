@@ -9,6 +9,8 @@ import asyncio
 from copy import deepcopy
 
 from backend.adapters.dsh import ResearchStopped, RuntimeBlocked
+from backend.persistence.conversation_views import conversation_metadata
+from packages.contracts.handoffs import discussion_handoff_requirements
 from packages.contracts.research import (
     DiscussionFinal, DiscussionTurn, EndBallot, OrdinaryBallot, allowed_next_steps, digest,
 )
@@ -31,6 +33,8 @@ class MemberDiscussion:
         return {**state["context"], "discussion_protocol": 2, "no_arbitration": True,
             "role": state["role"], "members": state["members"],
             "allowed_next_steps": list(allowed_next_steps(state["role"])),
+            "handoff_requirements": discussion_handoff_requirements(state["role"]),
+            "last_end_vote_failure": state.get("last_end_vote_failure"),
             "failed_end_votes": state["failed_end_votes"],
             "freeze_remaining": state["freeze_remaining"],
             "conversation_snapshot": self._history(state["discussion_id"]), **fields}
@@ -65,8 +69,9 @@ class MemberDiscussion:
         saved = self.store.get("discussion_model_call", key) or {}
         if saved.get("output") is not None:
             return saved["output"]
-        attempt = saved.get("technical_attempt", 0)
-        logical_turn = turn_id + (":technical-" + str(attempt) if attempt else "")
+        # Keep every correction on the same durable logical call, including
+        # retries of checkpoints created with the former generation limit.
+        context = {**context, "generation_budget": {"kind": "discussion_generation", "key": key}}
         if schema is not DiscussionFinal and hasattr(self.engine, "control"):
             line = self.store.get("line", state["research_id"] + ":" + state["line_id"]) if state.get("line_id") else None
             context["received_messages"] = await asyncio.to_thread(self.store.consume_agent_inbox,
@@ -75,7 +80,7 @@ class MemberDiscussion:
         try:
             output = await self.engine.turn(state["research_id"], member,
                 "god" if schema is DiscussionFinal else state["role"],
-                state["discussion_id"], logical_turn, schema, context,
+                state["discussion_id"], turn_id, schema, context,
                 conversation_id=state["discussion_id"], line_id=state.get("line_id"),
                 publish_message=False, output_validator=validator)
         except RuntimeBlocked as error:
@@ -83,10 +88,11 @@ class MemberDiscussion:
                 # A resumed technical call must be able to correct the current
                 # member's malformed response without recasting accepted ballots.
                 self.store.put("discussion_model_call", key,
-                    {"technical_attempt": attempt + 1, "last_error": str(error)}, state["research_id"])
+                    {"generation_contract_version": 2,
+                        "last_error": str(error), "member_id": member, "logical_turn": turn_id}, state["research_id"])
                 raise RuntimeBlocked("discussion_technical_failure", str(error)) from error
             raise
-        self.store.put("discussion_model_call", key, {"technical_attempt": attempt,
+        self.store.put("discussion_model_call", key, {"generation_contract_version": 2,
             "output": output}, state["research_id"])
         return output
 
@@ -95,7 +101,8 @@ class MemberDiscussion:
             raise ValueError("讨论必须登记非空且不重复的成员")
         self.store.create_conversation(research_id, discussion_id, kind="group_discussion",
             title=role + " 组内讨论", protocol_version=2,
-            participants=[{"type": "agent", "id": m} for m in members], line_id=line_id)
+            participants=[{"type": "agent", "id": m} for m in members], line_id=line_id,
+            summary_metadata=conversation_metadata(members[0], role, discussion_id, "discussion", context))
         state = self.store.initialize_discussion(discussion_id, {
             "protocol_version": 2, "research_id": research_id, "discussion_id": discussion_id,
             "role": role, "members": list(members), "order": order, "context": context,
@@ -164,10 +171,17 @@ class MemberDiscussion:
                 messages.append(self._message(state, "invalid-product:" + str(state["turn_index"]),
                     "已保留发言，结束投票尚未发起；请在下次发言补齐产物的交接参数：" + str(error)))
             else:
+                previews = {}
+                for direction in allowed_next_steps(state["role"]):
+                    try:
+                        self._validate_output(state, final_output, direction)
+                    except (ValueError, TypeError) as error:
+                        previews[direction] = str(error)
                 vote = {"id": state["discussion_id"] + ":vote:" + str(state["poll_index"] + 1),
                     "type": "end", "question": "是否同意以这份产物结束当前讨论并推进？",
                     "options": [], "initiator": member, "final_output": deepcopy(final_output),
                     "output_hash": digest(final_output), "ballots": {}, "status": "voting",
+                    "handoff_previews": previews,
                     "allowed_next_steps": list(allowed_next_steps(state["role"]))}
                 new.update(mode="end_vote", active_vote=vote, poll_index=state["poll_index"] + 1)
                 messages.append(self._message(state, "vote-start:" + vote["id"],
@@ -198,9 +212,6 @@ class MemberDiscussion:
                     raise ValueError("每张结束票都须选择本次允许的推进方向，包括否票")
                 if len(directions) == 1 and output.get("next_step") not in (None, directions[0]):
                     raise ValueError("推进方向不属于当前讨论")
-                if output["approve"]:
-                    self._validate_output(state, vote["final_output"],
-                        directions[0] if len(directions) == 1 else output["next_step"])
             elif output.get("option") not in {o[k] for o in vote["options"] for k in ("id", "label")}:
                 raise ValueError("请选择当前普通投票中真实存在的选项")
         context = self._context(state, vote=deepcopy(vote), instruction=(
@@ -229,6 +240,14 @@ class MemberDiscussion:
         vote = new["active_vote"]
         ballots = list(vote["ballots"].values())
         passed = vote["type"] == "end" and all(b["approve"] for b in ballots) and len({b["next_step"] for b in ballots}) == 1
+        handoff_error = None
+        if passed:
+            try:
+                self._validate_output(state, vote["final_output"], ballots[0]["next_step"])
+            except (ValueError, TypeError) as error:
+                passed, handoff_error = False, str(error)
+                vote.update(failure_kind="handoff_invalid", handoff_error=handoff_error,
+                    selected_next_step=ballots[0]["next_step"])
         vote["status"] = "passed" if passed else "failed" if vote["type"] == "end" else "completed"
         new["votes"].append(deepcopy(vote))
         new["active_vote"] = None
@@ -240,7 +259,6 @@ class MemberDiscussion:
             content = "普通投票结束，继续讨论。\n" + "\n".join(o["label"] + "：" + str(tally[o["id"]]) + " 票" for o in vote["options"])
         elif passed:
             next_step = ballots[0]["next_step"]
-            self._validate_output(state, vote["final_output"], next_step)
             new["mode"] = "ended"
             new["result"] = {"protocol_version": 2, "discussion_id": state["discussion_id"],
                 "next_step": next_step, "final_output": deepcopy(vote["final_output"]),
@@ -249,9 +267,14 @@ class MemberDiscussion:
             content = "结束投票全票通过，推进方向：" + next_step
         else:
             new["failed_end_votes"] += 1
+            new["last_end_vote_failure"] = {"vote_id": vote["id"], "output_hash": vote["output_hash"],
+                "ballots": deepcopy(ballots), "error": handoff_error,
+                "failure_kind": "handoff_invalid" if handoff_error else "disagreement"}
             new["freeze_remaining"] = list(state["order"]) if new["failed_end_votes"] < 3 else []
             new["mode"] = "god" if new["failed_end_votes"] == 3 else "discussion"
             content = "结束投票未通过，累计失败 " + str(new["failed_end_votes"]) + " 次。"
+            if handoff_error:
+                content = "产物无法交接：" + handoff_error + "，已退回 " + state["role"].title() + "。原票保留为同意。累计失败 " + str(new["failed_end_votes"]) + " 次。"
             content += "第三次失败，立即由 God 定稿。" if new["mode"] == "god" else "结束投票冻结，待每位成员再完成一次普通发言。"
         view = self._vote_view(new, vote, phase="result", next_step=(new.get("result") or {}).get("next_step"))
         message = self._message(state, "result:" + vote["id"], content, vote=view)

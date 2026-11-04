@@ -26,6 +26,7 @@ from .scientific_json import loads as scientific_loads,numeric_status
 ROLES={"exploration","critic","implementation","verify"}
 # Include the import footprint of NumPy/pandas in the supervised process tree.
 LIGHT_CPU_MEMORY_BYTES = 512 * 1024 * 1024
+TERMINAL = {"completed", "execution_failed", "cancelled", "interrupted"}
 
 
 def validate_numeric_code(code: str) -> tuple[ast.Module, dict, dict]:
@@ -40,31 +41,31 @@ def validate_numeric_code(code: str) -> tuple[ast.Module, dict, dict]:
 
 
 class LightCpuService:
-    def __init__(self,data_dir:Path,control:Any,resources:Any,instance_id:str,generation:str):
+    def __init__(self,data_dir:Path,control:Any,resources:Any,instance_id:str,generation:str,admission_check=None,owns_runner_lock=False):
         self.data_dir=Path(data_dir).resolve()
         self.directory=self.data_dir/"light_cpu"
         self.directory.mkdir(parents=True,exist_ok=True)
         self.control,self.resources=control,resources
         self.instance_id,self.generation=instance_id,generation
+        self.admission_check=admission_check or (lambda research_id: True)
+        self.owns_runner_lock=owns_runner_lock
         self.jobs:dict[str,dict]={}
         self.processes:dict[str,ManagedProcess]={}
+        self._active:set[str]=set()
+        self._restored:set[str]=set()
         self.stopped:set[str]=set()
         self.cancelled_parents:set[str]=set()
         self.closed=threading.Event()
         self.lock=threading.RLock()
         self.creation_lock=threading.RLock()
         for job in resources.light_jobs():
-            if job["state"] in ("completed","execution_failed","cancelled","interrupted"):
-                self.jobs[job["execution_id"]]=job
-                continue
-            # Parent Runner has acquired the exclusive old-instance lock; old Job owner is gone.
-            exited=not job.get("pid") or not identity_alive(job["pid"],job.get("process_create_time"))
-            if not exited:
-                exited=terminate_identity(job["pid"],job.get("process_create_time"))
-            if exited:
-                job.update(state="interrupted",ended_at=iso_now(),process_tree_exited=True)
-                resources.update_light(job,terminal_proof=True)
             self.jobs[job["execution_id"]]=job
+            self._restored.add(job["execution_id"])
+            # Even terminal rows may precede a lost Control completion ACK.
+            job["reconciliation_pending"]=True
+            if job["state"] not in TERMINAL:
+                job.update(state="reconciling",terminal_state="interrupted")
+            self._reconcile_job(job)
         self.maintenance=threading.Thread(target=self._reconcile_pending,name="light-cpu-reconcile",daemon=True)
         self.maintenance.start()
 
@@ -89,7 +90,7 @@ class LightCpuService:
         parent=payload.get("parent_execution_id")
         if (payload.get("parent_pid") is not None or payload.get("parent_create_time") is not None) and not parent:
             raise ValueError("父进程监督身份必须绑定父执行 ID")
-        if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self._parent_alive(payload) or not self.control.allows_progress(rid,generation):
+        if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or not self._parent_alive(payload) or not self.control.allows_progress(rid,generation):
             raise ControlUnavailable("研究停止、到期或控制服务不可用")
         store=Store(self.data_dir)
         identity=store.get("agent",f"{rid}:{agent}")
@@ -112,8 +113,10 @@ class LightCpuService:
                 "control_generation":generation,"control_epoch":control_state["control_epoch"],"deadline_at":timestamp(project["deadline_at"]),
                 "parent_execution_id":parent,
                 "parent_pid":payload.get("parent_pid"),"parent_create_time":payload.get("parent_create_time"),
-                "runner_instance_id":self.instance_id,"runner_generation":self.generation,"started_at":iso_now(),"pid":None}
+                "runner_instance_id":self.instance_id,"runner_generation":self.generation,"started_at":iso_now(),"pid":None,
+                "process_creation_started":False}
             self.jobs[execution_id]=job
+            self._active.add(execution_id)
         admitted=False
         process=None
         try:
@@ -151,8 +154,11 @@ class LightCpuService:
             process=ManagedProcess([sys.executable,str(script),str(directory/"inputs.json"),job["result_path"]],directory,job["log_path"],environment,1,job["memory_bytes"],defer_creation=True)
             if not self._parent_alive(job):raise ControlUnavailable("父 Agent 执行已退出，禁止创建计算")
             if not self.control.allows_progress(rid,generation,job["control_epoch"]):raise ControlUnavailable("控制门禁已关闭")
+            # Commit creation intent before entering the OS create operation.
+            job["process_creation_started"]=True
+            self.resources.update_light(job)
             with self.creation_lock:
-                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
+                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
                 process.create_suspended()
                 self.processes[execution_id]=process
                 job["pid"]=process.pid
@@ -162,15 +168,15 @@ class LightCpuService:
             if not self._parent_alive(job):raise ControlUnavailable("父 Agent 执行已退出，禁止恢复计算")
             if not self.control.allows_progress(rid,generation,job["control_epoch"]):raise ControlUnavailable("恢复执行前控制门禁已关闭")
             with self.creation_lock:
-                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
+                if rid in self.stopped or parent in self.cancelled_parents or self.closed.is_set() or not self.admission_check(rid) or time.time()>=job["deadline_at"]:raise ControlUnavailable("本地启动门禁已关闭")
                 process.resume();job["state"]="running"
             self.resources.update_light(job)
             while process.poll() is None:
-                if self.closed.wait(.1) or rid in self.stopped or parent in self.cancelled_parents or not self._parent_alive(job) or time.time()>=job["deadline_at"]:
+                if self.closed.wait(.1) or rid in self.stopped or parent in self.cancelled_parents or not self.admission_check(rid) or not self._parent_alive(job) or time.time()>=job["deadline_at"]:
                     raise ControlUnavailable("研究停止或总时间到期")
                 if not self.control.allows_progress(rid,generation,job["control_epoch"]):
                     raise ControlUnavailable("控制服务失联或执行许可失效")
-            if rid in self.stopped or parent in self.cancelled_parents or not self._parent_alive(job) or not self.control.allows_progress(rid,generation,job["control_epoch"]):
+            if rid in self.stopped or parent in self.cancelled_parents or not self.admission_check(rid) or not self._parent_alive(job) or not self.control.allows_progress(rid,generation,job["control_epoch"]):
                 raise ControlUnavailable("结果返回前研究已停止")
             job.update(state="completed" if process.poll()==0 else "execution_failed",exit_code=process.poll())
             if job["state"]=="completed":
@@ -187,20 +193,22 @@ class LightCpuService:
                     self.jobs.pop(execution_id, None)
                 raise
         finally:
-            exited=process.terminate() if process else True
+            try:
+                exited=process.terminate() if process and process.pid else True
+            except Exception:
+                exited=False
             if admitted:
-                job.update(ended_at=iso_now(),process_tree_exited=exited)
+                job.update(ended_at=iso_now(),process_tree_exited=exited,reconciliation_pending=True)
                 if exited:
-                    try:
-                        self._artifacts(store, job)
-                        self.resources.update_light(job,terminal_proof=True)
-                        self.control.complete_execution(execution_id)
-                    except Exception:
-                        job["reconciliation_pending"]=True
-                else:job.update(state="stopping",reconciliation_pending=True)
+                    self._reconcile_job(job)
+                else:
+                    job.update(terminal_state=job["state"],state="stopping")
+                    try:self.resources.update_light(job)
+                    except Exception:pass
             if process:
                 process.close()
             self.processes.pop(execution_id,None)
+            with self.lock:self._active.discard(execution_id)
         return job
 
     def _artifacts(self, store, job, line_id=None):
@@ -238,18 +246,59 @@ class LightCpuService:
             if not self._parent_alive(job) and job.get("parent_execution_id") not in self.cancelled_parents:
                 self.cancel_parent(job["parent_execution_id"])
 
+    def _exit_proven(self, job):
+        if job.get("process_tree_exited"):
+            return True
+        if job.get("pid"):
+            # Missing creation identity or an OS inspection failure is unknown,
+            # not proof that a process (and its descendants) has exited.
+            return terminate_identity(job["pid"],job.get("process_create_time"))
+        if job["execution_id"] not in self._restored or not self.owns_runner_lock:
+            return False
+        # The exclusive Runner lock excludes late creates by the old owner.
+        # ManagedProcess installs STARTUPINFOEX JOB_LIST before CreateProcess;
+        # successful creation already belongs to the private Job.
+        # On Windows its private KILL_ON_JOB_CLOSE handle also covers a crash
+        # between CreateProcess and persisting the PID. POSIX needs the durable
+        # pre-create state, since its process groups lack that owner lifetime.
+        return job.get("process_creation_started") is False or os.name == "nt"
+
+    def _reconcile_job(self, job):
+        job["reconciliation_pending"]=True
+        try:
+            if not self._exit_proven(job):
+                if job["state"] not in TERMINAL:
+                    self.resources.update_light(job)
+                return
+            if not job.get("process_tree_exited"):
+                job.update(process_tree_exited=True,ended_at=job.get("ended_at") or iso_now(),
+                    recovery_proof_reason="verified_process_exit" if job.get("pid") else
+                        ("previous_runner_exited_before_creation" if job.get("process_creation_started") is False
+                            else "previous_runner_exited_and_job_closed"))
+            if job["state"] not in TERMINAL:
+                job["state"]=job.get("terminal_state","interrupted")
+            from backend.persistence.store import Store
+            # Some legacy terminal rows have no output workspace. Their saved
+            # exit proof still permits completing the Control registration.
+            if job["state"] != "completed" or job.get("workspace_dir"):
+                self._artifacts(Store(self.data_dir),job)
+            self.resources.update_light(job,terminal_proof=True)
+            self.control.complete_execution(job["execution_id"])
+            confirmed={**job,"reconciliation_pending":False}
+            self.resources.update_light(confirmed,terminal_proof=True)
+            job.update(confirmed)
+        except Exception:
+            # The persisted terminal row/exit proof is sufficient to retry
+            # completion after both transient outages and another Runner crash.
+            job["reconciliation_pending"]=True
+
     def _reconcile_pending(self):
         while not self.closed.wait(.5):
             with self.lock:
-                pending=[job for job in self.jobs.values() if job.get("reconciliation_pending") and job.get("process_tree_exited")]
+                pending=[job for job in self.jobs.values() if job.get("reconciliation_pending")
+                    and job["execution_id"] not in self._active]
             for job in pending:
-                try:
-                    from backend.persistence.store import Store
-                    self._artifacts(Store(self.data_dir), job)
-                    self.resources.update_light(job,terminal_proof=True)
-                    self.control.complete_execution(job["execution_id"])
-                    job["reconciliation_pending"]=False
-                except Exception:pass
+                self._reconcile_job(job)
 
     def cancel_parent(self,parent_execution_id:str)->dict:
         self.cancelled_parents.add(parent_execution_id)
@@ -268,6 +317,11 @@ class LightCpuService:
 
     def close(self):
         self.closed.set()
-        for process in list(self.processes.values()):
+        # Drain the create/resume critical section before the Runner releases
+        # its owner lock; an old execution cannot create after this snapshot.
+        with self.creation_lock:
+            processes=list(self.processes.values())
+        for process in processes:
             process.terminate()
             process.close()
+        self.maintenance.join(timeout=1)

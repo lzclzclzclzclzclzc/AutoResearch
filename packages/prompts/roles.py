@@ -31,7 +31,9 @@ ROLES = {
 }
 
 
-def role_prompt(role: Role, discussion_protocol: int = 1) -> str:
+def role_prompt(role: Role, discussion_protocol: int = 1, verification_contract_version: int = 1) -> str:
+    if role == Role.VERIFY and verification_contract_version == 2:
+        return CURRENT_COMMON + "\n" + CURRENT_ROLES[role] + " 只输出 content_markdown、passed、scientific_observation。正文说明查阅的运行/产物、结论、局限和需要的修订；不要求固定标题。不输出结构化 evidence、independent_replication、execution_checks、required_changes 或 limitations。"
     if discussion_protocol == 2:
         if role == Role.GOD:
             return god_final_prompt()
@@ -79,8 +81,12 @@ DISCUSSION = """本次使用 discussion_protocol=2。普通讨论按程序提供
 
 
 def discussion_prompt(role: str | Role, mode: str = "discussion") -> str:
+    import json
+    from packages.contracts.handoffs import discussion_handoff_requirements
     role = Role(role)
     instructions = role_prompt(role, discussion_protocol=2) + "\n" + DISCUSSION
+    instructions += "\n按接收方共用的必填项：" + json.dumps(discussion_handoff_requirements(role.value), ensure_ascii=False)
+    instructions += "\n开票仅检查正文和公共结构，各方向缺项是预览提示；成员可自由选择方向。收票只校验真实成员自己的票；全票同向后才检查绑定产物能否交接。产物缺项计一次结束失败，保留真实同意票并由原组修订；不能让某位投票人重投来补另一份冻结产物。"
     if mode in {"ordinary_vote", "poll", "ordinary_ballot"}:
         instructions += "\n当前只投普通票：从本次给出的 options 选择原文 option，并给出 reason。只代表自己，不更改问题或选项。"
     elif mode in {"end_vote", "end_ballot"}:

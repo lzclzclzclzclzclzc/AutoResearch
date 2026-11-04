@@ -117,6 +117,9 @@ if os.name == "nt":
     class CPU_RATE(ctypes.Structure):
         _fields_ = [("ControlFlags", w.DWORD), ("CpuRate", w.DWORD)]
 
+    class COMPLETION_PORT_ASSOCIATION(ctypes.Structure):
+        _fields_ = [("CompletionKey", w.LPVOID), ("CompletionPort", w.HANDLE)]
+
     class BASIC_ACCOUNTING(ctypes.Structure):
         _fields_ = [(name, ctypes.c_int64) for name in ("TotalUserTime", "TotalKernelTime", "PeriodUserTime", "PeriodKernelTime")] + [
             (name, w.DWORD) for name in ("PageFaults", "TotalProcesses", "ActiveProcesses", "TerminatedProcesses")]
@@ -147,6 +150,10 @@ if os.name == "nt":
     kernel.GetExitCodeProcess.restype = w.BOOL
     kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
     kernel.WaitForSingleObject.restype = w.DWORD
+    kernel.CreateIoCompletionPort.argtypes = [w.HANDLE, w.HANDLE, ULONG_PTR, w.DWORD]
+    kernel.CreateIoCompletionPort.restype = w.HANDLE
+    kernel.GetQueuedCompletionStatus.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD), ctypes.POINTER(ULONG_PTR), ctypes.POINTER(w.LPVOID), w.DWORD]
+    kernel.GetQueuedCompletionStatus.restype = w.BOOL
 
     def _check(result: Any, operation: str) -> Any:
         if not result:
@@ -166,6 +173,9 @@ class ManagedProcess:
         if not command or not all(isinstance(v, str) and "\x00" not in v for v in command):
             raise ValueError("Command must be a nonempty argument list")
         self.job = self.handle = self.thread = None
+        self.completion_port = None
+        self._memory_limit_events = []
+        self._memory_bytes = memory_bytes
         self.proc = None
         self.closed = False
         self.suspended = True
@@ -223,6 +233,9 @@ class ManagedProcess:
                 limits.BasicLimitInformation.LimitFlags |= 0x200  # JOB_MEMORY
                 limits.JobMemoryLimit = int(memory_bytes)
             _check(kernel.SetInformationJobObject(self.job, 9, ctypes.byref(limits), ctypes.sizeof(limits)), "Job limits")
+            self.completion_port = _check(kernel.CreateIoCompletionPort(ctypes.c_void_p(-1), None, 0, 1), "Job completion port")
+            association = COMPLETION_PORT_ASSOCIATION(ctypes.c_void_p(1), self.completion_port)
+            _check(kernel.SetInformationJobObject(self.job, 7, ctypes.byref(association), ctypes.sizeof(association)), "Job completion association")
             if cpu_cores:
                 rate = CPU_RATE(1 | 4, max(1, min(10000, int(cpu_cores / (os.cpu_count() or 1) * 10000))))
                 _check(kernel.SetInformationJobObject(self.job, 15, ctypes.byref(rate), ctypes.sizeof(rate)), "CPU rate")
@@ -255,6 +268,9 @@ class ManagedProcess:
             if self.job:
                 kernel.CloseHandle(self.job)
                 self.job = None
+            if self.completion_port:
+                kernel.CloseHandle(self.completion_port)
+                self.completion_port = None
             raise
 
     def _cleanup_prepared_handles(self):
@@ -303,6 +319,32 @@ class ManagedProcess:
             if self.closed:
                 return False
             return self._tree_alive()
+
+    def memory_snapshot(self) -> dict:
+        """Read the Job's commit peak and OS limit notifications before its handle closes.
+
+        Job memory notifications may be dropped by Windows, so the caller also
+        records unhandled host allocation exceptions as a conservative fallback.
+        https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port
+        """
+        with self._handle_lock:
+            if os.name != "nt" or not self.job or self.closed:
+                return {}
+            limits = EXTENDED_LIMIT()
+            _check(kernel.QueryInformationJobObject(self.job, 9, ctypes.byref(limits), ctypes.sizeof(limits), None), "Query Job memory")
+            # A process can catch allocation failures in a tight loop. Bound
+            # work under the handle lock so termination can always acquire it.
+            for _ in range(1024):
+                if not self.completion_port:
+                    break
+                message, key, process_id = w.DWORD(), ULONG_PTR(), w.LPVOID()
+                if not kernel.GetQueuedCompletionStatus(self.completion_port, ctypes.byref(message), ctypes.byref(key), ctypes.byref(process_id), 0):
+                    break
+                if message.value in {9, 10} and len(self._memory_limit_events) < 32:  # PROCESS_MEMORY_LIMIT / JOB_MEMORY_LIMIT
+                    self._memory_limit_events.append({"source": "windows_job_memory_limit", "message": int(message.value),
+                        "pid": int(process_id.value or 0), "observed_at": time.time()})
+            return {"approved_memory_bytes": int(limits.JobMemoryLimit or self._memory_bytes or 0),
+                "peak_job_memory_bytes": int(limits.PeakJobMemoryUsed), "memory_limit_events": list(self._memory_limit_events)}
 
     def _tree_alive(self) -> bool:
         if os.name == "nt":
@@ -357,10 +399,11 @@ class ManagedProcess:
             self.closed = True
             if os.name == "nt":
                 self._cleanup_prepared_handles()
-                for handle in (getattr(self, "job", None), getattr(self, "thread", None), getattr(self, "handle", None)):
+                for handle in (getattr(self, "job", None), getattr(self, "thread", None), getattr(self, "handle", None), getattr(self, "completion_port", None)):
                     if handle:
                         kernel.CloseHandle(handle)
                 self.job = self.thread = self.handle = None
+                self.completion_port = None
             else:
                 if getattr(self, "_log", None):
                     self._log.close()

@@ -39,9 +39,9 @@ def bind_metadata(schema, value, context):
     return value
 
 
-def model_contract(schema, context):
+def model_contract(schema, context, repaired_validator=None):
     bound = bindings(schema, context)
-    if not bound: return schema
+    if not bound and repaired_validator is None: return schema
     document = copy.deepcopy(schema.model_json_schema())
     def omit(node, fields):
         for key in fields: node.get('properties', {}).pop(key, None)
@@ -55,6 +55,10 @@ def model_contract(schema, context):
             optional = {'hypothesis', 'baseline', 'data', 'design', 'monitoring', 'completion_criteria'}
             document['required'] = [key for key in document.get('required', []) if key not in optional]
     class BoundContract:
+        @classmethod
+        def validate_repaired_output(cls, value):
+            if repaired_validator is not None:
+                repaired_validator(value)
         @classmethod
         def model_json_schema(cls): return copy.deepcopy(document)
         @classmethod

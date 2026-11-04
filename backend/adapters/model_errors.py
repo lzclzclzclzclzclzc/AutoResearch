@@ -10,7 +10,6 @@ from collections.abc import Sequence
 
 
 RESPONSE_FAILURE_CODES = frozenset({"MALFORMED_RESPONSE", "EMPTY_RESPONSE", "INVALID_RESPONSE", "STREAM_CLOSED"})
-MAX_RESPONSE_ATTEMPTS = 3
 
 
 _PROVIDER_CODES = frozenset({

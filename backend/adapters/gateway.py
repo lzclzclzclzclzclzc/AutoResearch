@@ -142,6 +142,25 @@ class ToolGateway:
         name, args = payload.get("name"), payload.get("arguments", {})
         if name == "record_stream_event":
             return self.record_stream(context, args)
+        if role == "watchdog" and name in {"read_watchdog_state", "apply_watchdog_action"}:
+            from backend.runtime.watchdog import WatchdogService
+            from types import SimpleNamespace
+            service = WatchdogService(SimpleNamespace(store=self.store, control=self.control, runner=self.runner))
+            event = self.store.get("watchdog_event", context.get("watchdog_event_id", ""))
+            if not event or event.get("research_id") != research_id or event.get("status") != "diagnosing":
+                raise PermissionError("Watch Dog event is no longer open")
+            if event.get("lease_token") != context.get("watchdog_lease_token"):
+                raise PermissionError("Watch Dog diagnostic lease is stale")
+            if name == "apply_watchdog_action":
+                return service.apply(event["id"], args, context.get("watchdog_lease_token"))
+            section, offset = args.get("section"), args.get("offset", 0)
+            if not isinstance(section, str) or not section or type(offset) is not int or offset < 0:
+                raise ValueError("Invalid project state section or offset")
+            text = json.dumps(self.store.list(section, research_id), ensure_ascii=False, sort_keys=True)
+            page = text[offset:offset + 16384]
+            return {"section": section, "offset": offset, "next_offset": offset + len(page), "total_length": len(text), "text": page}
+        if name in {"read_watchdog_state", "apply_watchdog_action"}:
+            raise PermissionError("Only Watch Dog may inspect and repair project state")
         if context.get("suppress_chat") and context.get("discussion_protocol") != 2:
             raise PermissionError("Private scheduling scores cannot use research tools")
         if role == "god":

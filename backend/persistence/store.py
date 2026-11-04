@@ -54,7 +54,7 @@ class _DispatchDeferred(Exception):
 
 TERMINAL = {"terminating", "terminated", "completed", "quarantined"}
 DEFAULT_TEAM = {"n": 2, "m1": 2, "m2": 2, "k": 3, "boss_members": 3,
-                "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1}
+                "max_runtime_seconds": 3600, "model_concurrency": 4, "experiment_concurrency": 1, "watchdog_interval_minutes": 10}
 
 
 class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMixin):
@@ -464,11 +464,17 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                     raise StoreError("cross_project_reference", "会话不属于当前研究", 403)
                 participants = {canonical(p): p for p in existing.get("participants", []) + fields.get("participants", [])}
                 if len(participants) != len(existing.get("participants", [])):
+                    self._emit(c, research_id, "conversation.participants_added", {"participants": fields.get("participants", [])},
+                        conversation_id=conversation_id)
                     return self._put(c, "conversation", conversation_id, {**existing, "participants": list(participants.values())}, research_id)
                 return existing
-            return self._put(c, "conversation", conversation_id, {"conversation_id": conversation_id,
+            conversation = {"conversation_id": conversation_id,
                 "title": fields.pop("title", conversation_id), "kind": fields.pop("kind", "discussion"),
-                "created_at": now(), "unread_position": 0, **fields}, research_id)
+                "created_at": now(), "unread_position": 0, **fields}
+            event = self._emit(c, research_id, "conversation.created", {"conversation": conversation},
+                conversation_id=conversation_id)
+            return self._put(c, "conversation", conversation_id,
+                {**conversation, "created_event_seq": event["seq"]}, research_id)
 
     def create_message(self, research_id, conversation_id, sender, content_markdown, **fields):
         with self.connect(True) as c:
@@ -897,7 +903,7 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             if outbox and outbox.get("status") == "pending":
                 self._put(c, "outbox", outbox_id, {**outbox, "last_dispatch_error": reason}, outbox["research_id"])
 
-    def dispatch_outbox(self, control, limit=100, research_id=None):
+    def dispatch_outbox(self, control, limit=100, research_id=None, *, only_outbox_id=None, scope_guard=None):
         """At-least-once Verify delivery with idempotent durable recipient inboxes.
 
         The message is committed first. Its acknowledgement, all inbox receipts,
@@ -911,6 +917,9 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             if research_id is not None:
                 sql += " AND research_id=?"
                 args.append(research_id)
+            if only_outbox_id is not None:
+                sql += " AND id=?"
+                args.append(only_outbox_id)
             # Interleave projects and rotate attempts so an unavailable project's
             # old messages cannot monopolize every bounded Worker pass.
             candidates = [json.loads(row[0]) for row in c.execute("SELECT data FROM (" + sql +
@@ -920,12 +929,16 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             outbox_id, rid = candidate["id"], candidate["research_id"]
             try:
                 with self.connect(True) as c:
+                    if scope_guard:
+                        scope_guard(c)
                     current = self._get(c, "outbox", outbox_id)
                     if not current or current.get("status") != "pending":
                         continue
                     candidate = self._put(c, "outbox", outbox_id, {**current, "dispatch_attempted_at": now(),
                         "dispatch_attempts": current.get("dispatch_attempts", 0)+1}, rid)
                 with self.connect() as c:
+                    if scope_guard:
+                        scope_guard(c)
                     cycle, line, report = self._verification_handoff(c, candidate)
                 gate = self._handoff_gate(control, rid, candidate["control_generation"])
                 if gate != "allow":
@@ -940,6 +953,8 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                     cycle_id=cycle["id"], line_id=line_id, edge_id=edge_id, outbox_id=outbox_id,
                     submission_id=submission_id, artifact_refs=[], structured={"transition": payload, "verification": report})
                 with self.connect(True) as c:
+                    if scope_guard:
+                        scope_guard(c)
                     outbox = self._get(c, "outbox", outbox_id)
                     if not outbox or outbox.get("status") != "pending":
                         result["delivered" if outbox and outbox.get("status") == "delivered" else "cancelled"].append(outbox_id)
@@ -1252,7 +1267,10 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             try:
                 allowed = bool(control.allows_progress(rid, receipt.get("control_generation")))
             except Exception:
-                allowed = False
+                # The receipt is durable, but an unavailable gate does not prove
+                # the project stopped. Retry before applying any terminal effects.
+                result["pending"].append(operation["id"])
+                continue
             with self.connect(True) as c:
                 current = c.execute("SELECT status FROM business_operations WHERE id=?", (operation["id"],)).fetchone()
                 if current["status"] != "pending_control_confirmation":
@@ -1332,7 +1350,16 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
             except StoreError:
                 self._put(c, "verification_archive", new_id("late"), {"report": report, "status": "verification_pending"}, research_id)
                 return {"route": "halted"}
-            if type(report.get("passed")) is not bool or not report.get("checks"):
+            version = submission.get("verification_contract_version", 1)
+            if version == 2:
+                from packages.contracts.research import Verification
+                from backend.runtime.evidence import validate_report_facts
+                try:
+                    Verification.model_validate(report)
+                    validate_report_facts(self, research_id, submission, report, cycle.get("line_id"))
+                except ValueError as error:
+                    raise StoreError("invalid_verification", str(error), 422) from error
+            if type(report.get("passed")) is not bool or (version == 1 and not report.get("checks")):
                 raise StoreError("invalid_verification", "验证报告需要通过状态与检查依据", 422)
             if cycle.get("status", "active") not in {"active", "verifying"}:
                 raise StoreError("cycle_inactive", "当前周期不能接受验证")
@@ -1502,7 +1529,9 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
         try:
             dispatch_allowed = bool(control.allows_progress(research_id, candidate["generation"]))
         except Exception:
-            dispatch_allowed = False
+            # Preserve this confirmed candidate for replay. Cancelling its tasks
+            # here would make a transient query failure permanent via the marker.
+            return {"status": "awaiting_confirmation_sync", "operation_id": operation["id"]}
         with self.connect(True) as c:
             marker = self._get(c, "boss_effects", decision_task_id)
             if marker:
@@ -1649,7 +1678,10 @@ class Store(ArbitrationStoreMixin, RuntimeRecoveryStoreMixin, DiscussionStoreMix
                 raise StoreError("artifact_identity_conflict", "产物身份已经绑定其他文件", 409)
             return existing
         # Mutable implementation workspaces are never the backing store for evidence.
-        destination = self.data_dir / "artifacts" / sha[:2] / sha[2:] / file_path.name
+        # Keep the original download name in metadata. Repeating a long run ID
+        # below a full content hash can exceed Windows' rename path limit.
+        # Existing artifact records continue to resolve their saved paths.
+        destination = self.data_dir / "artifacts" / sha[:2] / sha[2:] / ("content" + file_path.suffix)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             temporary = destination.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
@@ -1701,6 +1733,7 @@ def build_topology(team):
         node(f"boss/member-{i:02d}", "boss_member", f"Boss {i}", "boss")
     node("organizer", "organizer", machine_shared=True)
     node("paper", "paper")
+    node("watchdog", "watchdog", "Watch Dog")
     edge("boss", "paper", "报告任务")
     for n in range(1, team["n"]+1):
         line = f"line-{n:02d}"
@@ -1716,4 +1749,4 @@ def build_topology(team):
             (f"{line}/implementation", "organizer", "申请与授权"), (f"{line}/implementation", f"{line}/verify", "送验"),
             (f"{line}/verify", "boss", "验证汇报"), (f"{line}/verify", f"{line}/exploration", "修订意见")):
             edge(source,target,label)
-    return {"nodes": nodes, "edges": edges, "agent_count": team["n"]*(team["m1"]+team["m2"]+2)+team["boss_members"]+2}
+    return {"nodes": nodes, "edges": edges, "agent_count": team["n"]*(team["m1"]+team["m2"]+2)+team["boss_members"]+3}

@@ -9,6 +9,34 @@ from backend.persistence.resilience import is_storage_busy
 from backend.adapters.model_errors import classify_model_failure
 
 
+def execution_process_exited(execution, *, control_finished=False):
+    """Require a complete cleanup snapshot or an independent terminal receipt.
+
+    A disappeared root PID is insufficient after partial tree cleanup: the
+    SDK interpreter or native runtime may still be alive below that launcher.
+    """
+    if execution.get("exit_confirmed") is True or execution.get("exit_reconciled") is True:
+        return True
+    if not execution.get("process_tree_complete") and not control_finished:
+        return False
+    identities = list(execution.get("process_tree") or [])
+    if execution.get("pid"):
+        identities.append(execution)
+    if not identities:
+        return control_finished
+    for identity in identities:
+        try:
+            process = psutil.Process(identity["pid"])
+            created = identity.get("pid_create_time")
+            if created is None or abs(process.create_time() - created) < .1:
+                return False
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.AccessDenied, OSError, TypeError, ValueError, KeyError):
+            return False
+    return True
+
+
 def retryable_failure(error):
     from backend.runtime.control import ControlUnavailable
     if isinstance(error, ControlUnavailable) and error.code == "control_unavailable":
@@ -20,15 +48,17 @@ def retryable_failure(error):
     if getattr(error, "code", None) == "direction_stop_pending":
         return "local_service_unavailable", "等待旧研究方向的执行退出后自动落实新安排"
     if getattr(error, "code", None) == "discussion_technical_failure":
-        return "local_service_unavailable", "当前讨论回复遇到技术故障，保留已收票并在原位置自动重试"
+        return "discussion_output_correction", "当前成员回复未通过字段校验，保留已收票，在原逻辑回合内继续纠正"
     if getattr(error, "code", None) == "stream_recorder_unavailable":
         return "stream_recorder_unavailable", "本机流式记录暂时不可用，确认旧执行退出后自动恢复"
+    if getattr(error, "code", None) == "execution_unknown":
+        return "execution_unknown", "旧模型执行退出尚未确认，继续等待回执后自动恢复"
     return None
 
 
 def legacy_failure(store, task):
     error = task.get("error") or {}
-    if error.get("code") in {"storage_busy", "stream_recorder_unavailable", "local_service_unavailable"}:
+    if error.get("code") in {"storage_busy", "stream_recorder_unavailable", "local_service_unavailable", "discussion_output_correction", "execution_unknown"}:
         return error["code"], error.get("message", "基础设施恢复")
     if error.get("code") == "OperationalError":
         path = store.data_dir / "checkpoints.sqlite"
@@ -55,7 +85,7 @@ def legacy_failure(store, task):
                 # Only the final boundary of this failed task may authorize recovery.
                 failure = classify_model_failure([event["payload"]["notification"]["payload"]["event"]])
                 if failure["code"] == "model_response_invalid":
-                    return "model_response_invalid", "旧记录确认模型响应协议异常，执行退出对账后有限重试"
+                    return "model_response_invalid", "旧记录确认模型响应协议异常，执行退出对账后自动重试"
                 return None
     return None
 
@@ -74,20 +104,14 @@ async def execution_exit_proven(store, control, task):
         execution_id = execution.get("execution_attempt_id", execution["id"])
         registered = next((x for x in status.get("unfinished", []) if x.get("execution_id") == execution_id), None)
         pid = execution.get("pid") or (registered or {}).get("pid")
-        if pid:
-            try:
-                process = psutil.Process(pid)
-                if abs(process.create_time() - execution.get("pid_create_time", (registered or {}).get("create_time", -1))) < .1:
-                    return False
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.AccessDenied:
-                return False
-        elif registered:
+        identity = {**execution, "pid": pid,
+            "pid_create_time": execution.get("pid_create_time", (registered or {}).get("create_time"))}
+        if not execution_process_exited(identity, control_finished=registered is None):
             return False
         # Admission registered with the same live Control before spawning; an
         # absent unfinished entry means no start or a durable finished receipt.
-        store.patch("execution", execution["id"], status="interrupted", exit_reconciled=True)
+        await asyncio.to_thread(control.complete_execution, execution_id)
+        store.patch("execution", execution["id"], status="interrupted", exit_reconciled=True, exit_confirmed=True)
     return True
 
 
@@ -97,7 +121,7 @@ async def recover_infrastructure_tasks(store, control):
         project = store.project(task["research_id"])
         if project["status"] not in {"running", "blocked"} or project.get("stop_reason"):
             continue
-        if project["status"] == "blocked" and project.get("blocked_reason") != "all_lines_blocked" and (project.get("error") or {}).get("code") not in {"OperationalError", "storage_busy", "model_execution_failed", "stream_recorder_unavailable", "local_service_unavailable"}:
+        if project["status"] == "blocked" and project.get("blocked_reason") != "all_lines_blocked" and (project.get("error") or {}).get("code") not in {"OperationalError", "storage_busy", "model_execution_failed", "stream_recorder_unavailable", "local_service_unavailable", "execution_unknown"}:
             continue
         payload = task.get("payload", {})
         if payload.get("line_id"):

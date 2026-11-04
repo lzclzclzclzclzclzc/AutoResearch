@@ -16,14 +16,14 @@ from backend.adapters.demo import DemoRuntimeAdapter
 from backend.adapters.dsh import DshRuntimeAdapter, ResearchStopped, RuntimeBlocked
 from backend.adapters.output_contract import bind_metadata, model_contract
 from backend.adapters.token_limits import MAX_OUTPUT_TOKENS, output_tokens
-from backend.adapters.model_errors import MAX_RESPONSE_ATTEMPTS
 from backend.graphs.discussion import GroupDiscussionGraph
+from backend.graphs.issue_requirements import merge_execution_requirements
 from backend.graphs.tasks import OrganizerGraph, current_task, TaskSuspended, ScopeResolved, recovery_suffix
 from backend.runtime.control import ControlUnavailable
-from backend.runtime.evidence import validate_execution_checks
+from backend.runtime.evidence import validate_execution_checks, validate_report_facts
 from backend.persistence.store import StoreError
 from packages.contracts.research import (BossDecision, ExperimentSpec, Implementation, MessageReply, MonitorDecision, Proposal, ResourceAdvice,
-    Role, RunAssessment, StageReport, Verification, Issue, assert_spec_unchanged, digest, validate_issue_transition)
+    Role, RunAssessment, StageReport, Verification, LegacyVerification, Issue, assert_spec_unchanged, digest, validate_issue_transition)
 from packages.prompts.roles import VERSION, role_prompt, discussion_prompt
 
 
@@ -96,6 +96,8 @@ class LineState(TypedDict, total=False):
     implementation_route: str
     run_route: str
     implementation_recovery_id: str
+    experiment_attempt: int
+    memory_budget_bytes: int
 
 
 class ResearchEngine:
@@ -123,9 +125,9 @@ class ResearchEngine:
         for source, target in (("design", "implement"),
                                ("run_experiment", "assess_run"), ("package", "verify"), ("verify", "route_result")):
             graph.add_edge(source, target)
-        graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement"})
+        graph.add_conditional_edges("organize", lambda state: state.get("allocation_route", "run_experiment"), {"run_experiment": "run_experiment", "implement": "implement", "package": "package"})
         graph.add_conditional_edges("implement", lambda state: state.get("implementation_route", "organize"), {"organize": "organize", "package": "package", "design": "design", "implement": "implement"})
-        graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package"})
+        graph.add_conditional_edges("assess_run", lambda state: state.get("run_route", "package"), {"repair": "implement", "package": "package", "retry_memory": "organize"})
         graph.add_conditional_edges("route_result", lambda state: "design" if state["route"] == "exploration_and_critic" else END,
                                     {"design": "design", END: END})
         self.line_graph = graph.compile(checkpointer=checkpointer)
@@ -137,6 +139,32 @@ class ResearchEngine:
         if not await asyncio.to_thread(self.control.allows_progress, research_id, p["control_generation"]):
             raise ResearchStopped("独立控制门禁已关闭或失联")
         return p
+
+    def _bind_turn_scope(self, research_id, line_id, context):
+        context = dict(context)
+        if line_id:
+            task_scope = (current_task.get() or {}).get("payload", {})
+            if task_scope.get("line_id") == line_id:
+                for field in ("direction_epoch", "cycle_id"):
+                    if field in task_scope:
+                        context.setdefault(field, task_scope[field])
+            line = self.store.get("line", f"{research_id}:{line_id}")
+            if line:
+                context.setdefault("direction_epoch", line["direction_epoch"])
+                context.setdefault("cycle_id", line.get("cycle_id"))
+        return context
+
+    def _assert_turn_scope(self, research_id, line_id, role, context):
+        if not line_id:
+            return
+        line = self.store.get("line", f"{research_id}:{line_id}")
+        direction = context.get("direction_epoch")
+        if (not line or (direction is not None and (line["direction_epoch"] != direction or
+                line.get("direction_stop_epoch") == direction)) or
+                ("cycle_id" in context and line.get("cycle_id") != context["cycle_id"])):
+            raise RuntimeBlocked("task_superseded", "原研究方向或周期已失效，当前回合仅保留历史")
+        if role in {"exploration", "critic", "implementation"} and line.get("finish_requested"):
+            raise RuntimeBlocked("line_finished", "该研究方向已结束，停止生成和接纳新的角色回复")
 
     async def line_open(self, state):
         await self.guard(state["research_id"])
@@ -156,6 +184,15 @@ class ResearchEngine:
         chain_id = kwargs.pop("recovery_chain_id", None)
         original_bound = inspect.signature(self._turn).bind(research_id, agent_id, *args, **kwargs)
         original_bound.apply_defaults()
+        root = current_task.get() or {}
+        watchdog_generation = root.get("watchdog_recovery_generation", 0)
+        if watchdog_generation:
+            original_bound.arguments["turn_id"] += f":watchdog-{watchdog_generation}"
+            context = dict(original_bound.arguments["context"])
+            if context.get("generation_budget"):
+                context["generation_budget"] = {**context["generation_budget"],
+                    "key": [context["generation_budget"]["key"], "watchdog", watchdog_generation]}
+            original_bound.arguments["context"] = context
         if recovery_suffix():
             original_bound.arguments["turn_id"] += recovery_suffix()
             original_bound.arguments["context"] = {**original_bound.arguments["context"],
@@ -188,8 +225,12 @@ class ResearchEngine:
                 reason_code=saved_failure["reason_code"], diagnostic=saved_failure["diagnostic"],
                 recovery_chain_id=chain_id, **values)
         try:
+            # Bind before waiting for the member lock; old work must not adopt
+            # a new cycle that started while this call was queued.
+            call_values = {**original_values, "context": self._bind_turn_scope(
+                research_id, original_values["line_id"], original_values["context"])}
             async with self.agent_turn_locks.setdefault((research_id, agent_id), asyncio.Lock()):
-                return await self._turn(**original_values)
+                return await self._turn(**call_values)
         except RuntimeBlocked as error:
             if original_values["context"].get("no_arbitration"):
                 # Technical recovery must never replace an individual member's vote.
@@ -257,6 +298,9 @@ class ResearchEngine:
                 if actual.get(required["issue_id"]) != Issue.model_validate(required).model_dump():
                     raise ValueError(f"ExperimentSpec must retain execution requirement {required['issue_id']} and its acceptance criteria")
         if schema is Verification:
+            validate_report_facts(self.store, research_id, context.get("submission", {}), result,
+                context.get("line_id") or agent_id.split("/")[0])
+        if schema is LegacyVerification:
             validate_execution_checks(self.store, research_id, context.get("submission", {}), result,
                 context.get("line_id") or agent_id.split("/")[0])
         return result
@@ -296,31 +340,32 @@ class ResearchEngine:
                    conversation_id=None, line_id=None, message_kind="discussion", recipients=None, edge_id=None,
                    publish_message=True, reply_to=None, output_validator=None):
         project = await self.guard(research_id)
-        context = dict(context)
+        context = self._bind_turn_scope(research_id, line_id, context)
+        root_task = current_task.get() or {}
+        task_record = self.store.get("task", root_task.get("id", "")) or {}
+        if task_record.get("watchdog_prompts"):
+            context["watchdog_repair_instructions"] = [instruction for instruction in task_record["watchdog_prompts"]
+                if not (self.store.get("watchdog_action", instruction["operation_id"]) or {}).get("consumed_by")]
         plan = context.get("spec") or context.get("submission", {}).get("spec", {})
         if plan.get("discussion_protocol") == 2:
             context.setdefault("discussion_protocol", 2)
-        if line_id and "direction_epoch" not in context:
-            line = next((line for line in self.store.lines(research_id) if line["line_id"] == line_id), None)
-            if line:
-                context["direction_epoch"] = line["direction_epoch"]
-        if line_id and role in {"exploration", "critic", "implementation"} and not turn_id.startswith("monitor-"):
-            line = next(line for line in self.store.lines(research_id) if line["line_id"] == line_id)
-            if line["direction_epoch"] != context.get("direction_epoch", line["direction_epoch"]) or line.get("direction_stop_epoch") == context.get("direction_epoch"):
-                raise RuntimeBlocked("task_superseded", "旧研究方向已结束，当前回合仅保留历史")
-            if line.get("finish_requested"):
-                raise RuntimeBlocked("line_finished", "Boss 已结束该研究方向，停止发起新角色任务")
+        self._assert_turn_scope(research_id, line_id, role, context)
         conversation_id = conversation_id or f"{research_id}:{task_id}"
         inbox_consumer = digest([research_id, agent_id, task_id, turn_id, "received-messages"])
         if publish_message:
             context["received_messages"] = await asyncio.to_thread(self.store.consume_agent_inbox, research_id,
                 agent_id, inbox_consumer, self.control, context.get("direction_epoch"))
         if publish_message:
+            from backend.persistence.conversation_views import conversation_metadata
+            summary_metadata = conversation_metadata(agent_id, role, task_id, turn_id, context)
+            if role == "verify" and line_id:
+                summary_metadata["verify_round"] = next((line.get("completed_verify_rounds", 0) + 1
+                    for line in self.store.lines(research_id) if line["line_id"] == line_id), None)
             self.store.create_conversation(research_id, conversation_id, kind=message_kind, title=context.get("instruction", role),
-                participants=[{"type": "agent", "id": agent_id}], line_id=line_id)
+                participants=[{"type": "agent", "id": agent_id}], line_id=line_id, summary_metadata=summary_metadata)
         identity = f"你的唯一成员 ID 是 {agent_id}，角色是 {role}。只代表自己，不冒充其他成员。"
         private_score = not publish_message and context.get("discussion_protocol") != 2
-        instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
+        instructions = role_prompt(Role(role), discussion_protocol=context.get("discussion_protocol", 1), verification_contract_version=context.get("verification_contract_version", 1)) if not private_score else "你在进行私下的发言意愿评分。根据当前话题和最新聊天，返回 0 到 100 的整数 score。只有评分 JSON，不发言、不调用工具。"
         if context.get("discussion_protocol") == 2 and schema.__name__ in {"DiscussionTurn", "PollBallot", "OrdinaryBallot", "EndBallot"}:
             mode = {"DiscussionTurn": "discussion", "PollBallot": "ordinary_vote", "OrdinaryBallot": "ordinary_vote", "EndBallot": "end_vote"}[schema.__name__]
             instructions = discussion_prompt(Role(role), mode)
@@ -328,47 +373,89 @@ class ResearchEngine:
         wire_contract = model_contract(schema, context)
         prompt += "\n\n必须返回此 JSON Schema 对应的完整单个对象（系统编号、版本和哈希由程序填写）:\n" + json.dumps(wire_contract.model_json_schema(), ensure_ascii=False)
         adapter = self.demo if project["mode"] == "demo" else self.live
-        delay, last_error = 1.0, None
+        delay = 1.0
         token_limit = output_tokens(private_score)
+        generation_budget = None
+        generation_turn = turn_id
+        base_prompt = prompt
+        correction_number = 0
+        if context.get("generation_budget"):
+            from backend.runtime.generation_budget import GenerationBudget
+            generation_budget = GenerationBudget(self.store, research_id, context["generation_budget"])
+            corrections = generation_budget.corrections()
+            if corrections:
+                prompt += "\n同一逻辑回合的先前尝试未获采纳，请根据具体错误更正完整 JSON：" + json.dumps(corrections[-1:], ensure_ascii=False)
         while True:
+            project = await self.guard(research_id)
+            self._assert_turn_scope(research_id, line_id, role, context)
+            if context.get("generation_budget", {}).get("kind") == "monitor_generation":
+                current_run = await asyncio.to_thread(self.runner.status, context["run"]["experiment_run_id"])
+                if current_run.get("state", "unknown") == "unknown":
+                    raise RuntimeBlocked("runner_unknown", "实验状态未知，保留监控窗口并等待对账")
+                if current_run.get("state") != "running":
+                    raise RuntimeBlocked("monitor_run_finished", "实验已退出，停止当前日志窗口的生成纠错")
+                self._assert_turn_scope(research_id, line_id, role, context)
+            generation_attempt = None
             response_retry_id = digest([research_id, agent_id, task_id, turn_id, project["control_generation"]])
             response_retry = self.store.get("model_response_retry", response_retry_id) or {}
-            if response_retry.get("failures", 0) >= MAX_RESPONSE_ATTEMPTS:
-                raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
-                    provider_error_code=response_retry.get("provider_error_code"))
             try:
-                result = await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
+                cached_generation = None
+                if generation_budget:
+                    generation_attempt, cached_generation = generation_budget.acquire(agent_id, task_id, generation_turn)
+                    turn_id = generation_attempt["turn_id"]
+                result = cached_generation if cached_generation is not None else await adapter.execute_turn(research_id=research_id, agent_id=agent_id, role=role,
                     task_id=task_id, turn_id=turn_id, prompt=prompt, schema=wire_contract, direction_epoch=context.get("direction_epoch", 1),
                     model=project["config_snapshot"]["provider"], context=context,
+                    **({"repaired_validator": lambda value: self.validate_output(research_id, agent_id, schema, value, context, output_validator)}
+                       if adapter is self.live else {}),
                     runtime_context={"conversation_id": conversation_id, "line_id": line_id,
                         "direction_epoch": context.get("direction_epoch"), "suppress_chat": not publish_message,
                         "discussion_protocol": context.get("discussion_protocol", 1), "private_score": private_score,
                         **{key: context[key] for key in ("finalization_id", "snapshot_hash", "context_sections") if key in context},
                         "max_output_tokens": token_limit})
+                if generation_budget:
+                    generation_budget.record(generation_attempt, "returned", output=result)
                 result = self.validate_output(research_id, agent_id, schema, result, context, output_validator)
+                await self.guard(research_id)
+                self._assert_turn_scope(research_id, line_id, role, context)
+                for instruction in context.get("watchdog_repair_instructions", []):
+                    operation = self.store.get("watchdog_action", instruction["operation_id"])
+                    if operation and not operation.get("consumed_by"):
+                        self.store.patch("watchdog_action", operation["id"], consumed_by={"agent_id": agent_id, "task_id": task_id, "turn_id": turn_id})
+                if generation_budget:
+                    generation_budget.record(generation_attempt, "accepted", output=result)
                 break
             except (ConnectionError, TimeoutError) as error:
+                if generation_budget and generation_attempt:
+                    generation_budget.release_unstarted_service_failure(generation_attempt, error)
                 await self.guard(research_id)
                 self.store.emit(research_id, "agent.retry_wait", {"delay_seconds": delay, "code": type(error).__name__}, agent_id=agent_id)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
             except RuntimeBlocked as error:
+                unstarted_service_failure = (generation_budget and generation_attempt and
+                    error.code in {"rate_limited", "model_transport_error", "model_timeout"} and
+                    generation_budget.release_unstarted_service_failure(generation_attempt, error))
+                if generation_budget and generation_attempt and not unstarted_service_failure and error.code != "execution_unknown":
+                    generation_budget.record(generation_attempt, "rejected", error=str(error), error_code=error.code)
+                if error.code == "invalid_output":
+                    prompt = base_prompt + "\n上次输出校验失败，请更正并完整返回 JSON：" + str(error)
+                    correction_number += 1
+                    turn_id = generation_turn + ":repair" + (f"-{correction_number}" if correction_number > 1 else "")
+                    continue
                 if error.code == "model_response_invalid":
                     await self.guard(research_id)
                     failures = response_retry.get("failures", 0) + 1
                     self.store.put("model_response_retry", response_retry_id, {"failures": failures,
                         "agent_id": agent_id, "task_id": task_id, "turn_id": turn_id,
                         "provider_error_code": error.provider_error_code}, research_id)
-                    if failures >= MAX_RESPONSE_ATTEMPTS:
-                        raise RuntimeBlocked("model_response_invalid", "模型响应连续三次异常，已保留现场，请检查模型服务的响应协议后重试。",
-                            http_status=error.http_status, provider_error_code=error.provider_error_code) from error
                     # Adapter admission requires exit proof before a replacement.
                     # Keep the logical turn so completed tools and session history can be reused.
-                    delay = min(2 ** (failures - 1), 4)
+                    delay = 2 ** min(failures - 1, 2)
                     self.store.emit(research_id, "agent.retry_wait", {"delay_seconds": delay,
                         "code": error.code, "provider_error_code": error.provider_error_code,
-                        "attempt": failures, "max_attempts": MAX_RESPONSE_ATTEMPTS}, agent_id=agent_id)
-                    prompt += "\n上次响应的结束协议异常，未被接受。沿用已保存的工具结果，不重复已完成的操作，重新返回完整 JSON。"
+                        "attempt": failures}, agent_id=agent_id)
+                    prompt = base_prompt + "\n上次响应的结束协议异常，未被接受。沿用已保存的工具结果，不重复已完成的操作，重新返回完整 JSON。"
                     until = asyncio.get_running_loop().time() + delay
                     while asyncio.get_running_loop().time() < until:
                         await self.guard(research_id)
@@ -376,14 +463,12 @@ class ResearchEngine:
                     continue
                 if error.code == "model_output_truncated":
                     await self.guard(research_id)
-                    if token_limit >= MAX_OUTPUT_TOKENS:
-                        from backend.graphs.arbitration import ArbitrationRequired
-                        raise ArbitrationRequired("model_output_truncated", f"模型输出在 {token_limit} token 上限下仍被截断", max_output_tokens=token_limit, original_error=str(error)) from error
                     token_limit = min(MAX_OUTPUT_TOKENS, token_limit * 2)
                     self.store.emit(research_id, "agent.retry_wait", {"code": error.code, "max_output_tokens": token_limit,
-                        "message": "输出被截断，已提高额度重新请求完整结果"}, agent_id=agent_id)
-                    prompt += "\n上次输出达到 token 上限，现已增加额度。沿用已完成的工具结果，不重复执行已完成的操作；直接返回完整 JSON 对象。"
-                    turn_id += f":more-output:{token_limit}"
+                        "message": "输出被截断，正在重新请求完整结果"}, agent_id=agent_id)
+                    prompt = base_prompt + f"\n上次输出被截断。本次最多 {token_limit} token，请精简表述并完整返回 JSON。沿用已保存的工具结果，不重复已完成的操作。"
+                    correction_number += 1
+                    turn_id = generation_turn + f":more-output:{token_limit}:{correction_number}"
                     continue
                 if error.code not in {"rate_limited", "model_transport_error", "model_timeout"}:
                     raise
@@ -397,13 +482,12 @@ class ResearchEngine:
                 delay = min(delay * 2, 30)
             except (ValueError, json.JSONDecodeError) as error:
                 signature = str(error)[:500]
-                if signature == last_error:
-                    from backend.graphs.arbitration import ArbitrationRequired
-                    raise ArbitrationRequired("invalid_output", "相同输出校验错误未取得进展：" + signature,
-                        validation_error=signature, source_output=result if "result" in locals() else None) from error
-                last_error = signature
-                prompt += "\n上次输出校验失败，请更正并完整返回 JSON：" + signature
-                turn_id = turn_id + ":repair"
+                if generation_budget and generation_attempt:
+                    generation_budget.record(generation_attempt, "rejected", error=signature,
+                        output=result if "result" in locals() else None)
+                prompt = base_prompt + "\n上次输出校验失败，请更正并完整返回 JSON：" + signature
+                correction_number += 1
+                turn_id = generation_turn + ":repair" + (f"-{correction_number}" if correction_number > 1 else "")
         return await self.accept_turn_output(research_id, agent_id, role, task_id, turn_id, schema, result, context,
             conversation_id=conversation_id, line_id=line_id, message_kind=message_kind, recipients=recipients,
             edge_id=edge_id, publish_message=publish_message, reply_to=reply_to, output_validator=output_validator)
@@ -415,10 +499,7 @@ class ResearchEngine:
         validator = self.validate_recovery_output if decision_source == "god" else self.validate_output
         result = validator(research_id, repaired_for_agent_id or agent_id, schema, result, context, output_validator)
         project = await self.guard(research_id)
-        if line_id and context.get("direction_epoch") is not None:
-            line = self.store.get("line", f"{research_id}:{line_id}")
-            if line and (line["direction_epoch"] != context["direction_epoch"] or line.get("direction_stop_epoch") == context["direction_epoch"]):
-                raise RuntimeBlocked("task_superseded", "旧方向的晚到回复不能推进后继任务")
+        self._assert_turn_scope(research_id, line_id, role, context)
         if not publish_message:
             return result
         conversation_id = conversation_id or f"{research_id}:{task_id}"
@@ -428,7 +509,7 @@ class ResearchEngine:
         message_fields = {"source_system": "demo_fixture" if project["mode"] == "demo" else "dsh",
             "source_event_id": digest([research_id, agent_id, task_id, turn_id]), "kind": message_kind,
             "line_id": line_id, "recipients": recipients or [], "edge_id": edge_id,
-            "authored_by_agent_id": agent_id, "task_id": task_id, "prompt_version": VERSION,
+            "authored_by_agent_id": agent_id, "task_id": task_id, "turn_id": turn_id, "prompt_version": VERSION,
             "demo": project["mode"] == "demo", "structured": result}
         if decision_source:
             message_fields.update(decision_source=decision_source, arbitration_id=arbitration_id,
@@ -783,32 +864,14 @@ class ResearchEngine:
 
     def validate_discussion_output(self, role, final_output, context, next_step=None):
         """Check only the data actually needed to execute a chosen handoff."""
-        from packages.contracts.research import allowed_next_steps
-        from backend.graphs.boss_operations import normalize_operations
-        if not isinstance(final_output, dict) or not str(final_output.get("content_markdown", "")).strip():
-            raise ValueError("结束投票必须绑定一份包含 content_markdown 的完整产物")
-        if next_step is not None and next_step not in allowed_next_steps(role):
-            raise ValueError("推进方向不在当前角色的目录中")
-        if role == "critic" and (next_step == "implementation" or "experiment_spec" in final_output or "fixed" in final_output):
-            raw = final_output.get("experiment_spec", final_output)
-            if not isinstance(raw, dict):
-                raise ValueError("转 Implementation 必须提供 experiment_spec 实验计划")
-            ExperimentSpec.model_validate({**raw, "discussion_protocol": 2,
-                "spec_id": context.get("spec_id", "pending-spec"), "version": context.get("spec_version", 1),
-                "deadline_at": context["deadline_at"]})
-        if role == "boss":
+        from packages.contracts.handoffs import validate_discussion_handoff
+        validate_discussion_handoff(role, final_output, context, next_step)
+        if role == "boss" and next_step is not None:
             from packages.contracts.research import SharedKnowledge
             for update in final_output.get("memory_updates", []):
                 knowledge = SharedKnowledge.model_validate(update)
                 if any(not self.store.source_exists(context["research_id"], source) for source in knowledge.source_ids):
                     raise ValueError("共享知识必须引用本项目实际存在的来源")
-            # Before the vote only explicit operations are checked; shortcuts
-            # become concrete after all members choose the same direction.
-            step = next_step or ("dispatch" if final_output.get("operations") else None)
-            if step:
-                normalize_operations(final_output, step, context["lines"])
-            elif next_step is None and final_output.get("targets") is not None:
-                normalize_operations(final_output, "finish_lines", context["lines"])
         return final_output
 
     async def apply_discussion_boss(self, task, discussion, context):
@@ -883,6 +946,13 @@ class ResearchEngine:
         p = await self.guard(state["research_id"])
         research_id, line_id = state["research_id"], state["line_id"]
         revision = state.get("revision", 1)
+        prefix = f"{state['task_id']}:revision-{revision}"
+        spec_id = prefix + ":spec"
+        if self.store.get("spec", spec_id):
+            # A corrected legacy summary must never rewrite an already frozen
+            # plan or its execution/verification identities during recovery.
+            self.store.update_line(research_id, line_id, phase="implementation", active_spec_id=spec_id)
+            return {"spec_id": spec_id, "revision": revision, "code_attempt": 1}
         self.store.update_line(research_id, line_id, phase="exploration")
         context = {"topic": p["topic"], "description": p.get("description", ""), "workspace_path": p.get("workspace_path"),
             "objective": self.store.get("cycle", state["cycle_id"])["objective"],
@@ -890,7 +960,6 @@ class ResearchEngine:
             "instruction": "设计完整实验，必须包含所有固定设置与允许调整边界", "previous_verifications": self.store.list("verification", research_id, cycle_id=state["cycle_id"])}
         context["implementation_revision_requests"] = self.store.list("spec_revision_request", research_id, line_id=line_id)
         context["line_instructions"] = self.store.list("line_instruction", research_id, line_id=line_id)
-        prefix = f"{state['task_id']}:revision-{revision}"
         exploration_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
             research_id, f"{line_id}/exploration", prefix + ":exploration-inbox", state["cycle_id"], self.control)}
         critic_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,
@@ -906,14 +975,11 @@ class ResearchEngine:
             conversation_id=prefix + ":cross_group", line_id=line_id,
             recipients=[{"type": "group", "id": f"{line_id}/critic"}], edge_id=f"{line_id}/exploration->{line_id}/critic")
         spec_id = prefix + ":spec"
-        execution_requirements = {}
-        for source in (exploration, critic):
-            for issue in source.get("issues", []):
-                if issue.get("acceptance_stage") == "execution":
-                    execution_requirements[issue["issue_id"]] = Issue.model_validate({k: v for k, v in issue.items() if k != "raised_by"}).model_dump()
+        execution_requirements = merge_execution_requirements([(f"{line_id}/{role}", issue)
+            for role, source in (("exploration", exploration), ("critic", critic)) for issue in source.get("issues", [])])
         spec = await self.turn(research_id, self.members(p, "critic", line_id)[0], "critic", prefix, "freeze_spec", ExperimentSpec,
             {**critic_context, "instruction": "根据两组决议和回应冻结可执行 ExperimentSpec；设计必改项均解决，分歧映射到实验；完整原样保留 execution_requirements，交给运行后 Verify 核查", "exploration": exploration, "critic": critic, "exploration_response": response, "spec_id": spec_id, "spec_version": revision,
-                "execution_requirements": list(execution_requirements.values())},
+                "execution_requirements": execution_requirements},
             conversation_id=prefix + ":cross_group", line_id=line_id, message_kind="handoff",
             recipients=[{"type": "agent", "id": f"{line_id}/implementation"}], edge_id=f"{line_id}/critic->{line_id}/implementation")
         if spec["spec_id"] != spec_id or spec["version"] != revision or spec["deadline_at"] != p["deadline_at"]:
@@ -1035,16 +1101,22 @@ class ResearchEngine:
             if (chain.get("source_task_id") == state["task_id"] and chain.get("scope_id") == state["cycle_id"] and
                     chain.get("resume_point") == "line.implement" and chain["status"] not in {"fulfilled", "cancelled"}):
                 self.store.close_recovery_chain(chain["id"])
-        return {"implementation_id": implementation_id, "implementation_route": "organize", "implementation_recovery_id": ""}
+        return {"implementation_id": implementation_id, "implementation_route": "organize", "implementation_recovery_id": "",
+            "experiment_attempt": 1, "memory_budget_bytes": 0}
 
     async def organize(self, state):
         await self.line_open(state)
         p = await self.guard(state["research_id"])
         self.store.update_line(state["research_id"], state["line_id"], phase="organizer")
         spec, impl = self.spec(state), self.store.get("implementation", state["implementation_id"])
-        request = {"resource_request_id": state["implementation_id"] + ":resources", "research_id": state["research_id"], "line_id": state["line_id"],
+        line = self.store.get("line", f"{state['research_id']}:{state['line_id']}")
+        attempt = state.get("experiment_attempt", 1)
+        request_id = state["implementation_id"] + (":resources" if attempt == 1 else f":attempt-{attempt}:resources")
+        request = {"resource_request_id": request_id, "research_id": state["research_id"], "line_id": state["line_id"],
             "implementation_agent_id": f"{state['line_id']}/implementation", "spec_id": spec.spec_id, "spec_version": spec.version,
-            "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"], "memory_bytes": impl["memory_mb"] * 1024 * 1024,
+            "spec_hash": digest(spec.model_dump()), "cpu_cores": impl["cpu_cores"],
+            "memory_bytes": state.get("memory_budget_bytes") or impl["memory_mb"] * 1024 * 1024, "experiment_attempt": attempt,
+            "direction_epoch": state.get("direction_epoch", line["direction_epoch"]), "cycle_id": state.get("cycle_id", line.get("cycle_id")),
             "gpu_count": impl["gpu_count"], "gpu_uuids": [], "gpu_memory_bytes": 0, "control_generation": p["control_generation"],
             "deadline_at": p["deadline_at"], "estimated_seconds": impl["estimated_seconds"]}
         async with self.organizer_lock:
@@ -1053,6 +1125,10 @@ class ResearchEngine:
         request["priority"] = advice["priority"]
         allocation = await self.wait_for_allocation(state, request)
         if allocation["state"] == "unsatisfiable":
+            if attempt > 1:
+                self.store.put("memory_retry_stop", state["run_id"], {"reason": "capacity_changed",
+                    "allocation": allocation, "implementation_id": state["implementation_id"], "spec_id": state["spec_id"]}, state["research_id"])
+                return {"allocation_route": "package"}
             self.store.put("resource_feedback", state["spec_id"], allocation, state["research_id"])
             return {"allocation_route": "implement", "code_attempt": state.get("code_attempt", 1) + 1}
         return {"allocation_id": allocation["allocation_id"], "allocation_route": "run_experiment"}
@@ -1103,33 +1179,90 @@ class ResearchEngine:
 
     async def monitor_run(self, state, run):
         run_id, rid = run["experiment_run_id"], state["research_id"]
+        await self.apply_monitor_stop(state, run_id)
         cursor = self.store.get("run_monitor_cursor", run_id) or {"round_no": 0, "next_offset": 0}
-        round_no = cursor["round_no"] + 1
+        observer = self.store.get("run_monitor_observer", run_id) or {"round_no": cursor["round_no"]}
+        round_no = max(cursor["round_no"] + 1, observer["round_no"])
         window_id = f"{run_id}:monitor-window:{round_no}"
         window = self.store.get("run_monitor_window", window_id)
+        if window and window.get("status") in {"accepted", "late"}:
+            logs = await self.collect_run_logs(run_id, cursor["next_offset"])
+            if window.get("status") == "late" and logs["next_offset"] <= window["next_offset"]:
+                return None
+            round_no += 1
+            window_id = f"{run_id}:monitor-window:{round_no}"
+            window = self.store.get("run_monitor_window", window_id)
         if not window:
             logs = await self.collect_run_logs(run_id, cursor["next_offset"])
-            window = self.store.put("run_monitor_window", window_id, {"logs": logs, "log_hash": digest(logs),
-                "round_no": round_no, "from_offset": cursor["next_offset"], "next_offset": logs["next_offset"]}, rid)
+            with self.store.connect(True) as c:
+                window = self.store._put(c, "run_monitor_window", window_id, {"logs": logs, "log_hash": digest(logs),
+                    "round_no": round_no, "status": "pending", "from_offset": cursor["next_offset"], "next_offset": logs["next_offset"]}, rid)
+                self.store._put(c, "run_monitor_observer", run_id, {"round_no": round_no}, rid)
         spec = self.spec(state)
-        monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
-            f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
-            "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
-            "rule_ids": [str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)]},
-            conversation_id=run_id + ":monitor", line_id=state["line_id"])
+        allowed = sorted({str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)} | {"execution_unusable"})
+        def validate_monitor(value):
+            if value["request_early_stop"] and (not isinstance(value.get("rule_id"), str) or value["rule_id"] not in allowed):
+                raise ValueError(f"rule_id={value.get('rule_id')!r}: request_early_stop=true 时必须填写合法编号 {allowed}；"
+                    "请结合固定日志窗口的真实观察证据重新输出完整 JSON，不能只在正文说明停止原因。")
+        try:
+            monitor = await self.turn(rid, f"{state['line_id']}/implementation", "implementation", run_id,
+                f"monitor-{round_no}", MonitorDecision, {"instruction": "根据冻结监控规则与真实增量日志判断是否继续，不擅改科学设置。text_truncated=true 时正文仅保留本窗口末尾，不代表完整日志。若请求停止必须引用规则编号和观察证据；未预见但确实不可继续的执行问题可使用 execution_unusable",
+                "spec": spec.model_dump(), "run": run, "logs": window["logs"], "evidence_log_hash": window["log_hash"],
+                **{field: state[field] for field in ("direction_epoch", "cycle_id") if field in state},
+                "rule_ids": allowed, "no_arbitration": True, "generation_budget": {"kind": "monitor_generation", "key": window_id}},
+                conversation_id=run_id + ":monitor", line_id=state["line_id"], output_validator=validate_monitor)
+        except RuntimeBlocked as error:
+            if error.code not in {"monitor_run_finished", "task_superseded", "line_finished"}:
+                raise
+            self.store.patch("run_monitor_window", window_id, status="late")
+            return None
+        except (ResearchStopped, asyncio.CancelledError):
+            self.store.patch("run_monitor_window", window_id, status="late")
+            raise
         monitor["evidence_log_hash"] = window["log_hash"]
-        if monitor["request_early_stop"]:
-            allowed = {str(rule.get("rule_id", i)) for i, rule in enumerate(spec.early_stop_rules)} | {"execution_unusable"}
-            if monitor["rule_id"] not in allowed:
-                raise RuntimeBlocked("invalid_early_stop", "提前终止意见未绑定冻结规则与真实运行证据")
-            await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
-        await self.guard(rid)
+        validate_monitor(monitor)
+        current = await asyncio.to_thread(self.runner.status, run_id)
+        project = self.store.project(rid)
+        line = self.store.get("line", f"{rid}:{state['line_id']}")
+        if (current.get("state") != "running" or project["status"] != "running" or
+                (line and (line.get("finish_requested") or line.get("direction_stop_epoch") == line["direction_epoch"] or
+                    state.get("direction_epoch", line["direction_epoch"]) != line["direction_epoch"] or
+                    ("cycle_id" in state and state["cycle_id"] != line.get("cycle_id"))))):
+            self.store.patch("run_monitor_window", window_id, status="late", late_decision=monitor)
+            return None
+        await self.guard(rid, allow_paused=True)
         # The cursor advances only with the accepted monitoring decision. A lost response
         # reuses this stored window and logical model turn, even if the log keeps growing.
         with self.store.connect(True) as c:
             self.store._put(c, "run_monitor", f"{run_id}:{round_no}", {**monitor, "window_id": window_id}, rid)
             self.store._put(c, "run_monitor_cursor", run_id, {"round_no": round_no, "next_offset": window["next_offset"]}, rid)
+            self.store._put(c, "run_monitor_window", window_id, {**window, "status": "accepted"}, rid)
+            if monitor["request_early_stop"]:
+                self.store._put(c, "run_stop_intent", f"{run_id}:monitor-stop:{round_no}", {"run_id": run_id,
+                    "round_no": round_no, "window_id": window_id, "direction_epoch": line["direction_epoch"],
+                    "line_id": state["line_id"], "status": "pending"}, rid)
+        await self.apply_monitor_stop(state, run_id)
         return monitor
+
+    async def apply_monitor_stop(self, state, run_id):
+        """Dispatch a committed stop intent; an acknowledgement loss reuses its receipt."""
+        rid = state["research_id"]
+        for intent in self.store.list("run_stop_intent", rid, run_id=run_id):
+            if intent["status"] != "pending":
+                continue
+            project = self.store.project(rid)
+            line = self.store.get("line", f"{rid}:{intent['line_id']}")
+            current = await asyncio.to_thread(self.runner.status, run_id)
+            if (project["status"] != "running" or current.get("state") != "running" or not line or
+                    line["direction_epoch"] != intent["direction_epoch"] or line.get("finish_requested") or
+                    line.get("direction_stop_epoch") == line["direction_epoch"]):
+                self.store.patch("run_stop_intent", intent["id"], status="cancelled", observed_state=current.get("state"))
+                continue
+            await self.guard(rid)
+            receipt = await asyncio.to_thread(self.runner.stop_receipt, intent["id"])
+            if receipt.get("state") == "unknown":
+                await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped", intent["id"])
+            self.store.patch("run_stop_intent", intent["id"], status="applied")
 
     async def run_experiment(self, state):
         await self.line_open(state)
@@ -1140,9 +1273,27 @@ class ResearchEngine:
             allocation = await self.wait_for_allocation(state, allocation)
         self.store.update_line(state["research_id"], state["line_id"], phase="running")
         impl = self.store.get("implementation", state["implementation_id"])
-        run_id = state["implementation_id"] + ":run-1"
+        attempt = state.get("experiment_attempt", 1)
+        run_id = state["implementation_id"] + f":run-{attempt}"
+        # Every new attempt has its own outputs. Replayed/admitted runs retain
+        # their actual original cwd, including pre-upgrade run-1 identities.
+        prior = await asyncio.to_thread(self.runner.status, run_id) if allocation.get("bound_run_id") else {}
+        workspace = Path(prior.get("cwd") or (Path(impl["cwd"]).parent / (Path(impl["cwd"]).name + "-runs") / f"attempt-{attempt}"))
+        if not prior.get("cwd"):
+            workspace.mkdir(parents=True, exist_ok=True)
+            for relative, source in impl["files"].items():
+                target = (workspace / relative).resolve()
+                if not target.is_relative_to(workspace.resolve()):
+                    raise RuntimeBlocked("unsafe_code_path", "实验尝试源文件越出工作区")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    if target.read_bytes() != source.encode("utf-8"):
+                        raise RuntimeBlocked("attempt_source_changed", "实验尝试源文件与原实现不一致")
+                else:
+                    target.write_bytes(source.encode("utf-8"))
         payload = {**allocation, "experiment_run_id": run_id, "start_operation_id": run_id + ":start", "command": [sys.executable, "-u", impl["entrypoint"], *impl["arguments"]],
-                   "cwd": impl["cwd"], "code_version": impl["code_version"]}
+                   "cwd": str(workspace), "code_version": impl["code_version"]}
+        await self.line_open(state)
         try:
             run = await asyncio.to_thread(self.runner.start, payload)
         except Exception:
@@ -1169,18 +1320,36 @@ class ResearchEngine:
             run = recovered
         self.store.put("run", run_id, run, state["research_id"])
         last_monitor = asyncio.get_running_loop().time()
-        while run.get("state", run.get("status")) not in {"completed", "succeeded", "failed", "execution_failed", "early_stopped", "cancelled", "terminated", "interrupted", "unknown"}:
-            await self.guard(state["research_id"], allow_paused=True)
-            await asyncio.sleep(0.5)
-            run = await asyncio.to_thread(self.runner.status, run_id)
-            self.store.put("run", run_id, run, state["research_id"])
-            current_project = self.store.project(state["research_id"])
-            line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
-            if line.get("finish_requested") and run.get("state") == "running":
-                await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
-            if not line.get("finish_requested") and current_project["status"] == "running" and run.get("state") == "running" and asyncio.get_running_loop().time() - last_monitor >= 5:
-                await self.monitor_run(state, run)
-                last_monitor = asyncio.get_running_loop().time()
+        monitor_task = None
+        try:
+            while run.get("state", run.get("status")) not in {"completed", "succeeded", "failed", "execution_failed", "early_stopped", "cancelled", "terminated", "interrupted", "unknown"}:
+                await asyncio.sleep(0.5)
+                run = await asyncio.to_thread(self.runner.status, run_id)
+                self.store.put("run", run_id, run, state["research_id"])
+                await self.guard(state["research_id"], allow_paused=True)
+                current_project = self.store.project(state["research_id"])
+                line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
+                if line.get("finish_requested") and run.get("state") == "running":
+                    await asyncio.to_thread(self.runner.request_stop, run_id, "early_stopped")
+                if monitor_task is not None and monitor_task.done():
+                    try:
+                        await monitor_task
+                    except ResearchStopped:
+                        pass
+                    except Exception as error:
+                        # A failed observation never transfers ownership of the process.
+                        self.store.emit(state["research_id"], "monitor.deferred", {"run_id": run_id,
+                            "code": getattr(error, "code", type(error).__name__), "message": str(error)}, line_id=state["line_id"])
+                    monitor_task = None
+                    last_monitor = asyncio.get_running_loop().time()
+                if (monitor_task is None and not line.get("finish_requested") and current_project["status"] == "running"
+                        and run.get("state") == "running" and asyncio.get_running_loop().time() - last_monitor >= 5):
+                    monitor_task = asyncio.create_task(self.monitor_run(state, run))
+        finally:
+            if monitor_task is not None:
+                if not monitor_task.done():
+                    monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
         if run.get("state") == "unknown":
             raise RuntimeBlocked("runner_unknown", "正式实验状态未知，保留资源并等待对账，禁止重复启动")
         return {"run_id": run_id}
@@ -1191,6 +1360,9 @@ class ResearchEngine:
         line = next(line for line in self.store.lines(state["research_id"]) if line["line_id"] == state["line_id"])
         if run.get("state") in {"completed", "succeeded"} or line.get("finish_requested"):
             return {"run_route": "package"}
+        memory_retry = await self.memory_retry_decision(state, run)
+        if memory_retry:
+            return memory_retry
         logs = await self.collect_run_logs(state["run_id"])
         assessment = await self.turn(state["research_id"], f"{state['line_id']}/implementation", "implementation", state["run_id"], "assess_failure", RunAssessment,
             {"instruction": "保留全部失败与提前停止证据。仅实现错误可在固定科学设置内修复并重新申请资源；科学方案需修订则封包送验，不能偷改计划。无有用修复也封包送验。",
@@ -1198,6 +1370,36 @@ class ResearchEngine:
             conversation_id=state["run_id"] + ":assessment", line_id=state["line_id"])
         self.store.put("run_assessment", state["run_id"], {**assessment, "spec_id": state["spec_id"]}, state["research_id"])
         return {"run_route": "repair" if assessment["action"] == "repair_implementation" else "package", "code_attempt": state.get("code_attempt", 1) + 1}
+
+    async def memory_retry_decision(self, state, run):
+        evidence = run.get("oom_evidence") or {}
+        if (run.get("state") != "execution_failed" or evidence.get("kind") != "host_memory_limit" or
+                evidence.get("experiment_run_id") != state["run_id"] or evidence.get("approved_memory_bytes") != run.get("memory_bytes")):
+            return None
+        await self.line_open(state)
+        proof = run.get("terminal_proof") or {}
+        resources = await asyncio.to_thread(self.runner.resources)
+        allocation = next((a for a in resources.get("allocations", []) if a["allocation_id"] == run.get("allocation_id")), None)
+        if not proof.get("process_tree_exited") or not proof.get("start_operation_terminal") or not allocation or allocation["state"] != "released":
+            raise RuntimeBlocked("runner_unknown", "内存扩容等待前次进程树退出及旧授权释放证明")
+        current = int(run["memory_bytes"])
+        attempt = int(run.get("experiment_attempt") or state.get("experiment_attempt", 1))
+        cap = int(resources["capacity"]["memory_total_bytes"])
+        target = min(current * 2, cap)
+        reason = "retry_limit_reached" if attempt >= 3 else "capacity_limit_reached" if target <= current else None
+        proposed = {"implementation_id": state["implementation_id"], "spec_id": state["spec_id"],
+            "from_run_id": state["run_id"], "attempt": attempt, "approved_memory_bytes": current, "oom_evidence": evidence,
+            "target_attempt": attempt + 1, "target_memory_bytes": target, "stop_reason": reason,
+            "run_route": "package" if reason else "retry_memory"}
+        with self.store.connect(True) as c:
+            decision = self.store._get(c, "memory_retry", state["run_id"])
+            if not decision:
+                decision = self.store._put(c, "memory_retry", state["run_id"], proposed, state["research_id"])
+                self.store._emit(c, state["research_id"], "experiment.memory_retry_decided", proposed, line_id=state["line_id"])
+        if decision["run_route"] == "package":
+            return {"run_route": "package"}
+        return {"run_route": "retry_memory", "experiment_attempt": decision["target_attempt"],
+            "memory_budget_bytes": decision["target_memory_bytes"]}
 
     async def package(self, state):
         await self.guard(state["research_id"])
@@ -1218,18 +1420,23 @@ class ResearchEngine:
             log = await self.collect_run_logs(attempt_id)
             run_logs[attempt_id] = log
             for reference in log.get("artifacts", []):
-                if reference.get("kind") == "stdout_stderr" and reference.get("path"):
+                if reference.get("path"):
                     log_path = Path(reference["path"])
                     if log_path.is_file():
-                        artifacts.append(self.store.register_artifact(state["research_id"], log_path, "text/plain",
-                            line_id=state["line_id"], run_id=attempt_id, kind="experiment_log"))
+                        artifacts.append(self.store.register_artifact(state["research_id"], log_path,
+                            "application/json" if log_path.suffix == ".json" else "text/plain", line_id=state["line_id"],
+                            run_id=attempt_id, code_version=attempt_run["code_version"],
+                            kind="experiment_log" if reference.get("kind") == "stdout_stderr" else "experiment_artifact"))
         collected = run_logs[state["run_id"]]
         spec = self.spec(state)
         submission = {"cycle_id": state["cycle_id"], "line_id": state["line_id"], "spec_id": spec.spec_id, "spec_version": spec.version,
             "code_version": impl["code_version"], "code_versions": [item["code_version"] for item in implementations], "run_ids": [item.get("experiment_run_id", item["id"]) for item in runs], "runs": runs, "spec": spec.model_dump(), "run": run,
             "actual_config": impl["actual_config"], "artifacts": artifacts, "logs": collected, "run_logs": run_logs, "status": "awaiting_verification",
-            "runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"])}
-        final_metrics = Path(impl["cwd"]) / "metrics.json"
+            "runtime_assessments": self.store.list("run_assessment", state["research_id"], spec_id=state["spec_id"]),
+            "verification_contract_version": 2,
+            "memory_retries": [d for d in self.store.list("memory_retry", state["research_id"]) if d.get("spec_id") == state["spec_id"]],
+            "memory_retry_stops": self.store.list("memory_retry_stop", state["research_id"], spec_id=state["spec_id"])}
+        final_metrics = Path(run.get("cwd") or impl["cwd"]) / "metrics.json"
         if final_metrics.is_file():
             try:
                 from backend.runtime.scientific_json import loads as scientific_loads
@@ -1243,12 +1450,18 @@ class ResearchEngine:
         p = await self.guard(state["research_id"])
         self.store.update_line(state["research_id"], state["line_id"], phase="verify")
         submission = self.store.get("submission", state["submission_id"])
-        report = await self.turn(state["research_id"], f"{state['line_id']}/verify", "verify", state["submission_id"], "verify", Verification,
-            {"instruction": "核查冻结计划和已有结果，不复跑正式实验。有效负结果可以通过，边界与缺口必须明确", "submission": submission},
+        version = submission.get("verification_contract_version", 1)
+        schema = Verification if version == 2 else LegacyVerification
+        report = await self.turn(state["research_id"], f"{state['line_id']}/verify", "verify", state["submission_id"], "verify", schema,
+            {"instruction": "核查冻结计划和已有结果，不复跑正式实验。有效负结果可以通过，边界与缺口必须明确", "submission": submission,
+             "verification_contract_version": version},
             conversation_id=state["submission_id"] + ":verify", line_id=state["line_id"], message_kind="verification",
             edge_id=f"{state['line_id']}/implementation->{state['line_id']}/verify")
-        report = {**report, "checks": [report["content_markdown"]], "supported_conclusions": [e["claim"] for e in report["evidence"]],
-                  "unsupported_conclusions": report["limitations"], **{k: submission[k] for k in ("spec_id", "spec_version", "code_version", "run_ids")}}
+        if version == 1:
+            report = {**report, "checks": [report["content_markdown"]], "supported_conclusions": [e["claim"] for e in report["evidence"]],
+                      "unsupported_conclusions": report["limitations"]}
+        report = {**report, "verification_contract_version": version,
+                  **{k: submission[k] for k in ("spec_id", "spec_version", "code_version", "run_ids")}}
         transition = await asyncio.to_thread(self.store.commit_verification, state["cycle_id"], state["submission_id"], report, p["control_generation"], self.control)
         if transition["route"] == "awaiting_confirmation_sync":
             raise RuntimeBlocked("confirmation_pending", "验证等待控制确认，稍后自动重试")

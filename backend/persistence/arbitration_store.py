@@ -176,9 +176,6 @@ class ArbitrationStoreMixin:
                 # A timed-out lease is not proof that the previous model process exited.
                 if not processes_reconciled or (request.get("lease_expires_at") and current < _time(request["lease_expires_at"])):
                     return None
-            if request.get("generation_attempts", request.get("attempt", 0)) >= 3 and not recovered:
-                self._arbitration_event(c, request, "exhausted", reason="God 输出修复次数已耗尽")
-                return None
             epoch = request.get("lease_epoch", 0) + 1
             attempt = request.get("attempt", 0) if recovered else request.get("attempt", 0) + 1
             lease_boundary = request["expires_at"] if recovered else request["judge_deadline_at"]

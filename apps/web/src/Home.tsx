@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, ArrowUpRight, Check, ChevronRight, Clock3, FlaskConical, Network, Plus, Search, Square, KeyRound, Trash2, Undo2 } from 'lucide-react';
+import { ArrowRight, ArrowUpRight, Check, Clock3, Network, Plus, Search, Square, KeyRound, Trash2, Undo2 } from 'lucide-react';
 import { api, items, projectId, time, terminal, write } from './api';
 import type { Data } from './api';
 import { Empty, ErrorNotice, Status } from './App';
@@ -42,9 +42,7 @@ export default function Home() {
   return <div className="page home-page">
     <div className="page-title"><div><h1>全部研究</h1><p>从一个问题开始，让研究有序向前。</p></div><Link to="/research/new" className="button primary"><Plus size={15}/>新建研究</Link></div>
     <section className="start-panel">
-      <div className="start-copy"><span className="section-kicker"><FlaskConical size={16}/>研究起点</span><h2>下一个值得探索的问题是什么？</h2><p>多条研究线并行探索，从方案讨论到本机实验，保留每一步依据。</p></div>
       <form className="topic-entry" onSubmit={e => { e.preventDefault(); navigate('/research/new', { state: { topic } }); }}><label htmlFor="topic-home" className="sr-only">研究题目</label><input id="topic-home" value={topic} onChange={e => setTopic(e.target.value)} placeholder="输入研究题目，例如：比较不同优化器的收敛行为" maxLength={1000} /><button type="submit" aria-label="创建研究"><ArrowRight size={20}/></button></form>
-      <div className="research-route"><span>提出假设</span><ChevronRight size={13}/><span>交叉审查</span><ChevronRight size={13}/><span>本机实验</span><ChevronRight size={13}/><span>证据验证</span><ChevronRight size={13}/><span>阶段报告</span></div>
     </section>
     {records.length === 0 && <section className="setup-strip"><Link to="/settings/providers"><span className="step-number">{ready ? <Check size={15}/> : '1'}</span><div><strong>连接研究模型</strong><span>{ready ? '模型凭据已配置' : '配置 DeepSeek API Key'}</span></div><ArrowUpRight size={15}/></Link><Link to="/settings/team"><span className="step-number">2</span><div><strong>组建研究团队</strong><span>研究线、成员与汇报周期</span></div><ArrowUpRight size={15}/></Link><Link to="/settings/resources"><span className="step-number">3</span><div><strong>检查本机资源</strong><span>CPU、内存与实验环境</span></div><ArrowUpRight size={15}/></Link></section>}
     <section className="research-list">
