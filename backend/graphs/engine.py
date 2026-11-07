@@ -954,10 +954,19 @@ class ResearchEngine:
             self.store.update_line(research_id, line_id, phase="implementation", active_spec_id=spec_id)
             return {"spec_id": spec_id, "revision": revision, "code_attempt": 1}
         self.store.update_line(research_id, line_id, phase="exploration")
+        line_cycle_ids = {
+            cycle["id"]
+            for cycle in self.store.list("cycle", research_id, line_id=line_id)
+        }
+        previous_verifications = [
+            report
+            for report in self.store.list("verification", research_id)
+            if report.get("cycle_id") in line_cycle_ids
+        ]
         context = {"topic": p["topic"], "description": p.get("description", ""), "workspace_path": p.get("workspace_path"),
             "objective": self.store.get("cycle", state["cycle_id"])["objective"],
             "deadline_at": p["deadline_at"], "direction_epoch": state["direction_epoch"],
-            "instruction": "设计完整实验，必须包含所有固定设置与允许调整边界", "previous_verifications": self.store.list("verification", research_id, cycle_id=state["cycle_id"])}
+            "instruction": "设计完整实验，必须包含所有固定设置与允许调整边界。previous_verifications 包含本线所有周期的历史验证，可按其中的 artifact_id 读取本线历史证据；历史结果仍需判断是否适用于当前计划。", "previous_verifications": previous_verifications}
         context["implementation_revision_requests"] = self.store.list("spec_revision_request", research_id, line_id=line_id)
         context["line_instructions"] = self.store.list("line_instruction", research_id, line_id=line_id)
         exploration_context = {**context, "received_handoffs": await asyncio.to_thread(self.store.consume_inbox,

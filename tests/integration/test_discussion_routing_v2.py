@@ -66,6 +66,62 @@ async def test_critic_returns_to_new_exploration_then_delivers_exact_plan_withou
 
 
 @pytest.mark.asyncio
+async def test_design_shares_raw_verifications_from_all_line_cycles_only(engine):
+    runtime, project = engine
+    store, rid = runtime.store, project["id"]
+    for cycle_id, epoch in (("old-cycle-1", 1), ("old-cycle-2", 2), ("current-cycle", 3)):
+        store.put("cycle", cycle_id, {"line_id": "line-01", "objective": "historical evidence",
+            "direction_epoch": epoch, "completed_verify_rounds": 1, "k": 3}, rid)
+    store.update_line(rid, "line-01", cycle_id="current-cycle", direction_epoch=3, completed_verify_rounds=1)
+    evidence_path = store.data_dir / "folds.csv"
+    evidence_path.write_text("fold,accuracy\n1,0.8\n", encoding="utf-8")
+    artifact = store.register_artifact(rid, evidence_path, "text/csv",
+        line_id="line-01", cycle_id="old-cycle-1")
+    reports = []
+    for report_id, cycle_id, passed in (("old-verify-1", "old-cycle-1", False),
+            ("old-verify-2", "old-cycle-2", True), ("current-verify", "current-cycle", False)):
+        # Persist the legacy report shape: cycle_id is its only line association.
+        reports.append(store.put("verification", report_id, {"cycle_id": cycle_id, "passed": passed,
+            "content_markdown": f"{report_id}: inspect folds.csv artifact_id={artifact['id']}",
+            "source_ids": [artifact["id"]], "evidence": [{"artifact_id": artifact["id"]}],
+            "discussion_id": f"{report_id}:verify-discussion", "round_no": 1}, rid))
+    store.put("cycle", "other-line-cycle", {"line_id": "line-02", "objective": "unrelated line"}, rid)
+    store.put("verification", "other-line-verify", {"cycle_id": "other-line-cycle",
+        "passed": True, "content_markdown": "other line evidence"}, rid)
+    other_rid = store.create_project({"topic": "other project", "mode": "demo",
+        "client_request_id": "other-project"})["id"]
+    store.put("cycle", "other-project-cycle", {"line_id": "line-01", "objective": "unrelated project"}, other_rid)
+    store.put("verification", "other-project-verify", {"cycle_id": "other-project-cycle",
+        "passed": True, "content_markdown": "other project evidence"}, other_rid)
+    before_reports = store.list("verification")
+    before_cycles = store.list("cycle")
+    contexts = {}
+
+    async def discuss(research_id, did, role, members, context, line_id):
+        contexts[role] = context
+        if role == "exploration":
+            return result("critic", {"content_markdown": "design using historical evidence"}, did + ":group-v3")
+        return result("implementation", {"content_markdown": "final plan",
+            "experiment_spec": {"question": "Does the historical result apply?",
+                "fixed": {"seed": 73}, "metrics": ["accuracy"]}}, did + ":group-v3")
+
+    runtime.discussions.run = discuss
+    output = await runtime.design({"research_id": rid, "line_id": "line-01",
+        "task_id": "history-task", "cycle_id": "current-cycle", "direction_epoch": 3, "revision": 1})
+
+    assert set(contexts) == {"exploration", "critic"}
+    for context in contexts.values():
+        visible = {report["id"]: report for report in context["previous_verifications"]}
+        assert set(visible) == {"old-verify-1", "old-verify-2", "current-verify"}
+        assert visible == {report["id"]: report for report in reports}
+        assert all("line_id" not in report for report in visible.values())
+    assert store.list("verification") == before_reports
+    assert store.list("cycle") == before_cycles
+    assert store.get("line", f"{rid}:line-01")["completed_verify_rounds"] == 1
+    assert store.get("spec", output["spec_id"])["question"] == "Does the historical result apply?"
+
+
+@pytest.mark.asyncio
 async def test_boss_mixed_operations_reuse_active_work_and_apply_once(engine):
     runtime, project = engine
     rid, store = project["id"], runtime.store
