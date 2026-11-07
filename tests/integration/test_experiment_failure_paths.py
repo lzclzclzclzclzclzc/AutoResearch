@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -203,3 +204,107 @@ async def test_incremental_monitor_reads_past_64k_and_reuses_window_after_failed
         assert "LATEST_ONLY_SIGNAL" in final["text"] and final["text_truncated"]
         assert len(store.list("run_monitor", rid)) == 2
         await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_isolates_source_and_run_directories_between_cycles(runtime, tmp_path, monkeypatch):
+    store, p, control, runner = runtime
+    rid = p["id"]
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
+        engine = ResearchEngine(store, control, runner, CredentialService(tmp_path, store), saver)
+        try:
+            await engine.supervisor(next(t for t in store.pending_tasks() if t["kind"] == "supervisor"))
+            task = next(t for t in store.pending_tasks() if t["kind"] == "line")
+            first = {"research_id": rid, "task_id": task["id"], "revision": 1, **task["payload"]}
+            first.update(await engine.design(first))
+            produce = engine.demo._produce_turn
+
+            async def cycle_code(**arguments):
+                output = await produce(**arguments)
+                if arguments["schema"].__name__ == "Implementation":
+                    label = "first" if arguments["context"]["spec"]["spec_id"] == first["spec_id"] else "second"
+                    output["files"] = {"experiment.py": "from pathlib import Path\n"
+                        f"Path('result.txt').write_text('{label}', encoding='utf-8')\nprint('{label}', flush=True)\n"}
+                return output
+
+            monkeypatch.setattr(engine.demo, "_produce_turn", cycle_code)
+            for method in (engine.implement, engine.organize, engine.run_experiment):
+                first.update(await method(first))
+            first_impl = store.get("implementation", first["implementation_id"])
+            first_run = store.get("run", first["run_id"])
+            first_source = Path(first_impl["cwd"], "experiment.py").read_bytes()
+            # Retry the same cycle without changing its attempt identity.
+            first.update(await engine.implement(first))
+            assert store.get("implementation", first["implementation_id"])["cwd"] == first_impl["cwd"]
+            first.update(await engine.run_experiment(first))
+            assert store.get("run", first["run_id"])["cwd"] == first_run["cwd"]
+
+            old_cycle = store.get("cycle", first["cycle_id"])
+            next_cycle_id = first["cycle_id"] + ":next"
+            store.patch("cycle", old_cycle["id"], status="closed")
+            store.put("cycle", next_cycle_id, {**old_cycle, "id": next_cycle_id, "status": "active", "completed_verify_rounds": 0}, rid)
+            store.update_line(rid, first["line_id"], cycle_id=next_cycle_id, phase="exploration", completed_verify_rounds=0)
+            next_task = store.add_task(rid, "line", {**task["payload"], "cycle_id": next_cycle_id}, next_cycle_id + ":line")
+            second = {"research_id": rid, "task_id": next_task["id"], "revision": 1, **next_task["payload"]}
+            second.update(await engine.design(second))
+            second.update(await engine.implement(second))
+            second_impl = store.get("implementation", second["implementation_id"])
+            assert second_impl["cwd"] != first_impl["cwd"]
+            assert Path(first_impl["cwd"], "experiment.py").read_bytes() == first_source
+            assert second["direction_epoch"] == first["direction_epoch"]
+            assert second["revision"] == first["revision"] == 1
+            assert second["code_attempt"] == first["code_attempt"] == 1
+            for method in (engine.organize, engine.run_experiment):
+                second.update(await method(second))
+            second_run = store.get("run", second["run_id"])
+            assert second_run["cwd"] != first_run["cwd"]
+            assert Path(first_run["cwd"], "result.txt").read_text() == "first"
+            assert Path(second_run["cwd"], "result.txt").read_text() == "second"
+            assert len(store.list("experiment_run", rid)) == 2
+        finally:
+            await engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_implement_replay_keeps_saved_cwd_and_admitted_run_cwd(runtime, tmp_path, admitted):
+    store, p, control, runner = runtime
+    rid = p["id"]
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
+        engine = ResearchEngine(store, control, runner, CredentialService(tmp_path, store), saver)
+        try:
+            await engine.supervisor(next(t for t in store.pending_tasks() if t["kind"] == "supervisor"))
+            task = next(t for t in store.pending_tasks() if t["kind"] == "line")
+            state = {"research_id": rid, "task_id": task["id"], "revision": 1, **task["payload"]}
+            for method in (engine.design, engine.implement):
+                state.update(await method(state))
+            implementation = store.get("implementation", state["implementation_id"])
+            # Existing records can carry a cwd allocated before this naming scheme.
+            saved_cwd = tmp_path / "legacy-source"
+            saved_cwd.mkdir()
+            for relative, content in implementation["files"].items():
+                (saved_cwd / relative).write_text(content, encoding="utf-8")
+            store.patch("implementation", state["implementation_id"], cwd=str(saved_cwd))
+            state.update(await engine.organize(state))
+            run_id = state["implementation_id"] + ":run-1"
+            if admitted:
+                allocation = store.get("allocation", state["allocation_id"])
+                runner.start({**allocation, "experiment_run_id": run_id, "start_operation_id": run_id + ":start",
+                    "cwd": str(saved_cwd), "command": [sys.executable, "-u", implementation["entrypoint"], *implementation["arguments"]],
+                    "code_version": implementation["code_version"]})
+                await eventually(lambda: runner.status(run_id)["state"] == "completed")
+                saved_run = runner.status(run_id)
+            state.update(await engine.implement(state))
+            assert store.get("implementation", state["implementation_id"])["cwd"] == str(saved_cwd)
+            state.update(await engine.run_experiment(state))
+            run = store.get("run", state["run_id"])
+            if admitted:
+                assert run["cwd"] == saved_run["cwd"] == str(saved_cwd)
+                assert run["start_operation_id"] == saved_run["start_operation_id"]
+                assert not (tmp_path / "legacy-source-runs").exists()
+            else:
+                assert Path(run["cwd"]) == tmp_path / "legacy-source-runs" / "attempt-1"
+            assert run["state"] == "completed"
+            assert len(store.list("experiment_run", rid)) == 1
+        finally:
+            await engine.close()

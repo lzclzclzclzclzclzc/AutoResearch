@@ -1092,7 +1092,17 @@ class ResearchEngine:
                     return {"implementation_route": "design", "revision": state["revision"] + 1}
                 await self.recover_action(request, resolution, context={"spec": spec.model_dump()}, line_id=state["line_id"])
             return {"implementation_route": "design", "revision": state["revision"] + 1}
-        workspace = self.store.data_dir / "projects" / state["research_id"] / "workspaces" / state["line_id"] / f"epoch-{state['direction_epoch']}" / f"revision-{state['revision']}" / f"code-{state.get('code_attempt', 1)}"
+        saved = self.store.get("implementation", implementation_id)
+        if saved and saved.get("cwd"):
+            workspace = Path(saved["cwd"])
+        else:
+            cycle_key = digest(state["cycle_id"])[:16]
+            workspace = (
+                self.store.data_dir / "projects" / state["research_id"]
+                / "workspaces" / state["line_id"] / f"cycle-{cycle_key}"
+                / f"epoch-{state['direction_epoch']}" / f"revision-{state['revision']}"
+                / f"code-{state.get('code_attempt', 1)}"
+            )
         workspace.mkdir(parents=True, exist_ok=True)
         for relative, content in implementation.files.items():
             target = (workspace / relative).resolve()
